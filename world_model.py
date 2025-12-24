@@ -113,16 +113,22 @@ class WorldModel:
             self.last_control_u = np.array([dx, dy])
 
     def get_best_target(self) -> Optional[Dict]:
-        """获取最佳目标 - 使用 Kalman 滤波后的位置（更稳定）"""
         with self._lock:
             if not self.current_detections:
                 return None
 
-            # 使用 Kalman 滤波后的位置（更稳定）
-            # 这可以减少噪声和抖动，提供更平滑的目标跟踪
-            kf_pos = self.kf.x[:2].flatten()
-            best = self.current_detections[0]
-            best["screen_x"] = kf_pos[0]
-            best["screen_y"] = kf_pos[1]
+            kf_pos = self.kf.x[:2].flatten()  # Kalman 平滑位置作为准星参考
+            # 选离准星最近的目标
+            best = min(
+                self.current_detections,
+                key=lambda d: (
+                                      (d["screen_x"] - kf_pos[0]) ** 2 +
+                                      (d["screen_y"] - kf_pos[1]) ** 2
+                              ) ** 0.5
+            )
+
+            # 可选：用 Kalman 平滑值覆盖（更稳，但可能略慢）
+            # best["screen_x"] = kf_pos[0]
+            # best["screen_y"] = kf_pos[1]
 
             return best

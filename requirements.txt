@@ -12,8 +12,8 @@ pycuda>=2024.1
 # BetterCam（推荐从 Git 安装最新版）
 git+https://github.com/ZCban/BetterCam.git@main
 
-# YOLOv13 / Ultralytics（包含 NMS 等工具）
--e git+https://github.com/iMoonLab/yolov13.git@main#egg=ultralytics
+# YOLOv13 / Ultralytics（包含 NMS 等工具）手动复制文件夹
+
 
 # 卡尔曼滤波（filterpy）
 filterpy>=1.4.5

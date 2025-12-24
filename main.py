@@ -1,19 +1,27 @@
-# main.py - YOLOv13 Aimbot 主控制模块
-# 
+# main.py - YOLOv13 Aimbot + Triggerbot 主控制模块
+#
 # 核心职责：
 # 1. 系统初始化（创建各模块实例）
 # 2. 多线程管理（捕获、推理、输出线程）
 # 3. 主控制循环（目标检测、瞄准计算、触发控制）
 # 4. 优雅关闭（信号处理、资源清理）
-# 
+#
 # 系统架构：完全异步 + 状态驱动 + 世界模型 + 独立高频控制环
-# 
+#
+# 重要优化（2025.12.24改动记录）：
+#   - 射击游戏中鼠标位置恒等于屏幕中心（十字准星）
+#   - 删除实时 get_current_mouse_pos()，统一使用固定 screen_center
+#   - 避免采集→推理延迟导致的坐标误差（15~35ms 内鼠标可能移动 5~20px）
+#   - 瞄准 & Triggerbot 均以屏幕中心为参考点，更准确、更稳定
+#   - 删除所有预测逻辑（按需求：只要映射，不需要预测）
+#   - 增强 Triggerbot 随机延迟（更像人）
+
 import threading
 import time
 import signal
 import sys
+import random
 from typing import Tuple
-import win32api
 from config import config
 from perception.capture import CaptureThread
 from perception.bus import FrameBus
@@ -21,125 +29,142 @@ from inference import InferenceThread
 from world_model import WorldModel
 from controllers.controller_factory import get_controller
 from aim_strategies.factory import create_aim_strategy
-from output_ghub import GHUBOutput, gHub  # 使用你提供的全局 gHub
+from output_ghub import GHUBOutput, gHub  # 使用全局 gHub 实例（DLL 原生调用）
 from controllers.humanize.reaction_delay import ReactionDelay
 from controllers.humanize.noise import Noise
 from controllers.humanize.fatigue import Fatigue
 from controllers.humanize.overshoot import Overshoot
 from controllers.humanize.curve import Curve
+import keyboard  # 新增：全局键盘监听
 
 
-# 全局控制变量 - 用于控制整个系统的运行状态
+# 全局控制变量
 running = True
 shutdown_event = threading.Event()
+paused = False  # 新增：暂停状态
 
 
 def signal_handler(sig, frame):
-    """信号处理器 - 处理 Ctrl+C 退出信号"""
     global running
     print("\n[Main] 收到退出信号，正在优雅关闭...")
     shutdown_event.set()
     running = False
 
 
-# 注册信号处理器
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-def get_current_mouse_pos() -> Tuple[int, int]:
-    """获取当前鼠标屏幕绝对坐标"""
-    return win32api.GetCursorPos()
+def toggle_pause():
+    """P 键切换暂停/恢复"""
+    global paused
+    paused = not paused
+    if paused:
+        print("[Main] 项目已暂停 (按 P 恢复)")
+    else:
+        print("[Main] 项目已恢复")
 
 
 def main():
-    """主函数 - 系统入口点"""
-    global running
+    global running, paused
 
     print("[Main] YOLOv13 Aimbot + Triggerbot 启动 (2025.12.26版) ... Ctrl+C 退出")
+    print("[Main] 快捷键：P = 暂停/恢复")
 
-    # 初始化核心模块
-    frame_bus = FrameBus()  # 帧状态总线 - 实现状态驱动架构
-    world_model = WorldModel(frame_bus)  # 世界模型 - 状态融合、预测、裁判
-    controller = get_controller()  # 控制器 - 决策、控制、拟人化
-    strategy = create_aim_strategy()  # 瞄准策略 - 游戏专用预测
-    output = GHUBOutput(world_model)  # 输出模块 - 执行层（命令 → 鼠标移动）
+    # 计算屏幕中心（射击游戏中鼠标位置恒等于此点，使用整数）
+    screen_center = (
+        int(config.getint("General", "screen_width", 1920) / 2),
+        int(config.getint("General", "screen_height", 1080) / 2)
+    )
 
-    # humanize 模块（即使全关闭也零开销）
-    h_reaction = ReactionDelay()  # 反应延迟 - 模拟人类反应时间
-    h_noise = Noise()  # 随机噪声 - 模拟手抖
-    h_fatigue = Fatigue()  # 疲劳累积 - 长时间瞄准精度下降
-    h_overshoot = Overshoot()  # 过冲回正 - 快速移动后的过冲效应
-    h_curve = Curve()  # 曲线形状 - 鼠标移动轨迹曲线
+    # 初始化核心模块（保持不变）
+    frame_bus = FrameBus()
+    world_model = WorldModel(frame_bus)
+    controller = get_controller()
+    strategy = create_aim_strategy()
+    output = GHUBOutput(world_model)
 
-    prev_dx, prev_dy = 0.0, 0.0  # 上一帧移动量，用于过冲计算
+    # humanize 模块实例
+    h_reaction = ReactionDelay()
+    h_noise = Noise()
+    h_fatigue = Fatigue()
+    h_overshoot = Overshoot()
+    h_curve = Curve()
 
-    # 启动各工作线程
-    capture = CaptureThread(frame_bus, shutdown_event)  # 捕获线程 - BetterCam 抓取画面
-    inference = InferenceThread(frame_bus, world_model, shutdown_event)  # 推理线程 - YOLOv13 异步推理
-    output.start()  # 启动输出线程
-    capture.start()  # 启动捕获线程
-    inference.start()  # 启动推理线程
+    prev_dx, prev_dy = 0.0, 0.0
 
-    last_time = time.perf_counter()  # 上一帧时间戳
+    # 启动线程
+    capture = CaptureThread(frame_bus, shutdown_event)
+    inference = InferenceThread(frame_bus, world_model, shutdown_event)
+    output.start()
+    capture.start()
+    inference.start()
+
+    # 注册 P 键监听（全局热键）
+    keyboard.add_hotkey('p', toggle_pause)
+
+    last_time = time.perf_counter()
 
     try:
-        # 主控制循环 - 高频执行瞄准和触发逻辑
         while running and not shutdown_event.wait(timeout=0.003):
+            if paused:
+                time.sleep(0.1)  # 暂停时降低 CPU 占用
+                continue
+
             now = time.perf_counter()
-            dt = max(now - last_time, 1e-6)  # 时间差，防止除零错误
+            dt = max(now - last_time, 1e-6)
             last_time = now
 
-            current_pos = get_current_mouse_pos()  # 获取当前鼠标位置
-            target = world_model.get_best_target()  # 从世界模型获取最佳目标
+            target = world_model.get_best_target()
 
-            # Aimbot 逻辑 - 自动瞄准功能
+            # Aimbot 处理（保持原逻辑）
             if target and config.getbool("General", "enable_aimbot", False):
-                # 预测计算 - 根据目标运动预测未来位置
-                pred_x, pred_y = strategy.calculate_prediction(
-                    target["screen_x"], target["screen_y"], dt
+                dx, dy = strategy.calculate_mouse_move(
+                    target["screen_x"],
+                    target["screen_y"],
+                    screen_center[0],
+                    screen_center[1],
+                    dt
                 )
-                target["screen_x"] = pred_x  # 更新目标位置为预测位置
-                target["screen_y"] = pred_y
 
-                # 计算瞄准移动量 - 使用控制器计算 dx, dy
-                dx, dy = controller.compute(target, current_pos, dt)
+                dx, dy = controller.compute(target, screen_center, dt)
 
-                # Humanize 完整管道 - 应用拟人化处理
-                h_reaction.apply_delay()  # 应用反应延迟
-                dx, dy = h_noise.apply(dx, dy)  # 添加随机噪声
-                dx, dy = h_fatigue.apply(dx, dy)  # 应用疲劳效应
-                dx, dy = h_overshoot.apply(dx, dy, prev_dx, prev_dy)  # 应用过冲回正
+                h_reaction.apply_delay()
+                dx, dy = h_noise.apply(dx, dy)
+                dx, dy = h_fatigue.apply(dx, dy)
+                dx, dy = h_overshoot.apply(dx, dy, prev_dx, prev_dy)
 
-                # 曲线整形 - 应用移动轨迹曲线
-                t = min(1.0, (abs(dx) + abs(dy)) / 50.0)  # 计算曲线参数
-                dx *= h_curve.apply(t)  # 应用 x 轴曲线
-                dy *= h_curve.apply(t)  # 应用 y 轴曲线
+                t = min(1.0, (abs(dx) + abs(dy)) / 50.0)
+                dx *= h_curve.apply(t)
+                dy *= h_curve.apply(t)
 
-                prev_dx, prev_dy = dx, dy  # 更新上一帧移动量
+                prev_dx, prev_dy = dx, dy
 
-                output.send_move(dx, dy)  # 发送移动命令
+                output.send_move(dx, dy)
 
-            # Triggerbot 逻辑 - 自动触发功能
-            if config.getbool("General", "enable_triggerbot", False) and controller.should_trigger(target, current_pos):
-                # 添加随机触发延迟
-                delay = config.getfloat("Triggerbot", "trigger_delay_min_ms", 15) / 1000
+            # Triggerbot 处理
+            if config.getbool("General", "enable_triggerbot", False) and controller.should_trigger(target, screen_center):
+                min_delay = config.getfloat("Triggerbot", "trigger_delay_min_ms", 15) / 1000
+                max_delay = config.getfloat("Triggerbot", "trigger_delay_max_ms", 80) / 1000
+                delay = random.uniform(min_delay, max_delay)
                 time.sleep(delay)
-                gHub.mouse_down(1)  # 按下鼠标左键
-                time.sleep(config.getfloat("Triggerbot", "trigger_hold_time_ms", 40) / 1000)  # 按住时间
-                gHub.mouse_up(1)  # 释放鼠标左键
+                gHub.mouse_down(1)
+                hold_time = config.getfloat("Triggerbot", "trigger_hold_time_ms", 40) / 1000
+                time.sleep(hold_time)
+                gHub.mouse_up(1)
 
     except Exception as e:
         print(f"[Main] 主循环异常: {e}")
 
     finally:
-        print("[Main] 正在关闭...")
-        shutdown_event.set()  # 设置关闭事件
-        time.sleep(0.5)  # 等待线程响应
-        capture.join(timeout=2)  # 等待捕获线程结束
-        inference.join(timeout=2)  # 等待推理线程结束
-        output.join(timeout=2)  # 等待输出线程结束
-        print("[Main] 已安全退出")
+        print("[Main] 正在关闭所有线程...")
+        shutdown_event.set()
+        time.sleep(0.5)
+        capture.join(timeout=5.0)
+        inference.join(timeout=5.0)
+        output.join(timeout=5.0)
+        keyboard.unhook_all()  # 清理热键
+        print("[Main] 系统已安全退出")
 
 
 if __name__ == "__main__":
