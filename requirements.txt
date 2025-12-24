@@ -1,19 +1,24 @@
-# 先不写 index-url
-
+# 核心依赖
 opencv-python>=4.10.0
 numpy>=1.26.0
-supervision>=0.24.0
 pillow>=10.0.0
 pywin32>=306
-tk>=0.1.0
-tqdm
-psutil
+psutil>=5.9.0
+tqdm>=4.66.0
 
-# YOLOv13 专用（这个会先装）
--e git+https://github.com/iMoonLab/yolov13.git@main#egg=ultralytics
+# TensorRT 推理相关（需自行安装 TensorRT Python 绑定）
+tensorrt>=10.0.0
+pycuda>=2024.1
 
-# 最后单独装 torch（用自己的 index）
+# BetterCam（推荐从 Git 安装最新版）
 git+https://github.com/ZCban/BetterCam.git@main
 
+# YOLOv13 / Ultralytics（包含 NMS 等工具）
+-e git+https://github.com/iMoonLab/yolov13.git@main#egg=ultralytics
 
+# 卡尔曼滤波（filterpy）
+filterpy>=1.4.5
+
+# 其他实用工具
+supervision>=0.24.0
 #pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128

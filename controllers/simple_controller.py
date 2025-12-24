@@ -1,22 +1,39 @@
 # controllers/simple_controller.py
 from .base_controller import BaseController
+from typing import Tuple, Dict, Optional, Any
 
 
 class SimpleController(BaseController):
-    """最基础的比例控制器"""
+    """
+    简单比例控制器 - 直接线性映射误差
+    最基础、最可预测的实现，适合调试和低灵敏度场景
+    """
 
     def __init__(self):
-        from config import config
-        self.sensitivity = config.getfloat("Controller", "sensitivity", 0.42)
-        self.center = (
-            config.getint("General", "screen_width", 1920) / 2,
-            config.getint("General", "screen_height", 1080) / 2
-        )
+        super().__init__()
+        self.sensitivity = self.config.getfloat("Controller", "sensitivity", 0.42)
 
-    def compute(self, target: Dict, current_pos: Tuple[float, float], dt: float) -> Tuple[float, float]:
+    def compute(
+        self,
+        target: Optional[Dict[str, Any]],
+        current_mouse_pos: Tuple[float, float],
+        dt: float
+    ) -> Tuple[float, float]:
         if not target:
             return 0.0, 0.0
-        cx, cy = target["center"]
-        error_x = cx - self.center[0]
-        error_y = cy - self.center[1]
-        return error_x * self.sensitivity, error_y * self.sensitivity
+
+        tx = target.get("screen_x", self.screen_center[0])
+        ty = target.get("screen_y", self.screen_center[1])
+
+        error_x = tx - current_mouse_pos[0]
+        error_y = ty - current_mouse_pos[1]
+
+        # 应用死区
+        if abs(error_x) <= self.deadzone and abs(error_y) <= self.deadzone:
+            return 0.0, 0.0
+
+        # 比例映射
+        move_x = error_x * self.sensitivity
+        move_y = error_y * self.sensitivity
+
+        return move_x, move_y

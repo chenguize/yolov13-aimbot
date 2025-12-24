@@ -1,38 +1,61 @@
-# controllers/pid_controller.py （预留高级 PID，当前实现简单版）
+# controllers/pid_controller.py
 from .base_controller import BaseController
-from typing import Tuple
+from typing import Tuple, Dict, Optional, Any
 
 
 class PIDController(BaseController):
-    """PID + 前馈（当前只实现比例部分，高级功能靠开关控制）"""
+    """
+    完整PID控制器实现（主力控制器）
+    包含比例、积分、微分项 + 积分限幅
+    """
 
     def __init__(self):
-        from config import config
-        self.kp = config.getfloat("Controller", "sensitivity", 0.42) * 2.2  # 粗调
-        self.ki = 0.0
-        self.kd = 0.0
+        super().__init__()
+        self.kp = self.config.getfloat("Controller", "pid_kp", 2.2)
+        self.ki = self.config.getfloat("Controller", "pid_ki", 0.08)
+        self.kd = self.config.getfloat("Controller", "pid_kd", 0.35)
+
+        # 状态
         self.integral_x = 0.0
         self.integral_y = 0.0
         self.prev_error_x = 0.0
         self.prev_error_y = 0.0
-        self.use_desired_vel = config.getbool("Controller", "use_desired_velocity", False)
-        # ... 更多高级参数可后续加
 
-    def compute(self, target: Dict, current_pos: Tuple[float, float], dt: float) -> Tuple[float, float]:
-        if not target or dt <= 0:
+        self.integral_limit = self.config.getfloat("Controller", "pid_integral_limit", 60.0)
+
+    def compute(
+        self,
+        target: Optional[Dict[str, Any]],
+        current_mouse_pos: Tuple[float, float],
+        dt: float
+    ) -> Tuple[float, float]:
+        if not target or dt <= 1e-6:
+            # 目标丢失时清空积分，防止持续漂移
+            self.integral_x = self.integral_y = 0.0
             return 0.0, 0.0
 
-        cx, cy = target["center"]
-        error_x = cx - current_pos[0]
-        error_y = cy - current_pos[1]
+        tx = target.get("screen_x", self.screen_center[0])
+        ty = target.get("screen_y", self.screen_center[1])
 
-        # 简单比例（后续可扩展 I/D/前馈/非线性区）
-        output_x = error_x * self.kp
-        output_y = error_y * self.kp
+        error_x = tx - current_mouse_pos[0]
+        error_y = ty - current_mouse_pos[1]
 
-        # 预留高级模式（目前不生效）
-        if self.use_desired_vel:
-            # 未来实现期望速度模式
-            pass
+        # 积分（带抗饱和）
+        self.integral_x += error_x * dt
+        self.integral_y += error_y * dt
+        self.integral_x = max(-self.integral_limit, min(self.integral_limit, self.integral_x))
+        self.integral_y = max(-self.integral_limit, min(self.integral_limit, self.integral_y))
+
+        # 微分项
+        derivative_x = (error_x - self.prev_error_x) / dt
+        derivative_y = (error_y - self.prev_error_y) / dt
+
+        # PID 输出
+        output_x = self.kp * error_x + self.ki * self.integral_x + self.kd * derivative_x
+        output_y = self.kp * error_y + self.ki * self.integral_y + self.kd * derivative_y
+
+        # 更新上一帧误差
+        self.prev_error_x = error_x
+        self.prev_error_y = error_y
 
         return output_x, output_y

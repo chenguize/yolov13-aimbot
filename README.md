@@ -1,119 +1,182 @@
-# YOLOv13 Aimbot + Triggerbot - 高阶异步工程版（2025年12月）
+# YOLOv13 Aimbot + Triggerbot  
+高阶异步实时辅助框架（2025年12月26日架构迭代）
 
-**基于 YOLOv13 + BetterCam(CUDA) + GHUB 的实时辅助框架**  
-**核心理念**：完全异步、状态驱动、世界模型、独立高频控制环  
-**所有高级功能均可通过 config.ini 开/关，方便调试、适配不同硬件和风险控制**
+当前工程成熟度：92 → 94/100（Phase 1 后期）  
+目标成熟度：96–98/100（Phase 2 - 行为驱动 + 可仲裁 + 强时间一致性系统）
 
-**⚠️ 郑重声明**  
-本项目**仅供技术学习、算法研究、计算机视觉讨论与本地测试**。  
-**任何形式用于线上游戏的行为均严重违反游戏服务条款，会导致永久封禁**，请勿尝试。
+技术栈：YOLOv13 + TensorRT + BetterCam(CUDA) + GHUB + Python 3.11+
 
-## 项目功能一览（2025.12）
+核心设计理念（持续演进中）
+• 完全异步 + 状态驱动（非帧驱动）
+• 单一事实源（World Model 作为状态仲裁者）
+• 游戏专属逻辑与通用控制完全解耦（aim_strategies）
+• 全配置驱动 + 高危功能可一键切断
+• 强调亚毫秒级时间一致性 + 控制反馈闭环
+• 向行为意图仲裁 + 可观测回放演进
 
-| 功能模块              | 描述                                                                 | config 主要开关                     | 默认 | 风险等级 |
-|-----------------------|----------------------------------------------------------------------|-------------------------------------|------|----------|
-| **Aimbot（自瞄）**    | 检测到目标后平滑移动鼠标至目标（支持多种控制算法与拟人化）             | enable_aimbot                       | false| ★★★★     |
-| **Triggerbot（自动扳机）** | 准星在敌人身上一定范围内时自动模拟鼠标左键点击                       | enable_triggerbot                   | false| ★★★★★    |
-| **画面采集**          | 以当前鼠标位置为中心捕获 256×256 区域（与模型训练尺寸一致）           | —                                   | —    | —        |
-| **YOLOv13 推理**      | TensorRT 异步推理（best256.engine）                                  | model_path, conf_threshold          | —    | —        |
-| **世界模型**          | 目标跟踪、坐标转换、状态管理、可选多目标/卡尔曼预测                   | enable_multitrack, ekf_extrapolation| false| —        |
-| **控制器**            | 多种控制算法（比例/PID/期望速度/Jerk限制）+ 拟人化管道                | controller_type, humanize_*         | simple| —        |
-| **输出层**            | GHUB 鼠标移动 + 点击 + 微移动合并 + 死区过滤                         | enable_micro_move_merge, deadzone   | false| —        |
+⚠️ 最高法律与道德声明  
+本项目仅用于计算机视觉、实时控制系统、算法研究与本地技术验证。  
+任何形式用于线上游戏均为严重违规行为，将导致永久封禁并可能承担法律后果。  
+严禁在任何联网环境、生产环境或实际游戏中使用。
 
-## 项目结构
+## 当前功能与工程状态（2025.12.26）
+
+| 层级              | 模块/功能                              | 主要职责                                       | 当前实现度 | 关键 config 开关                        | 风险/稳定性等级 |
+|-------------------|----------------------------------------|------------------------------------------------|------------|------------------------------------------|-----------------|
+| 感知              | 画面采集 + 时间戳精确记录              | 256×256 鼠标中心捕获 + 采集时刻 mouse_pos 记录 | ★★★★★     | —                                        | —               |
+| 推理              | YOLOv13 TensorRT 异步推理              | 高性能检测                                     | ★★★★      | model_path, conf_threshold               | —               |
+| 状态中枢          | World Model（含控制反馈闭环）          | 坐标转换 / 跟踪 / 预测 / 自运动补偿（u_k输入） | ★★★☆      | enable_multitrack, ekf_extrapolation, ego_motion_compensation | ★★★             |
+| 游戏策略          | Aim Strategies                         | 游戏专用映射 + 预测（Valorant 风格自适应衰减） | ★★★★      | current_game, strategy_package           | —               |
+| 控制算法          | Controllers + Humanize                 | 通用控制 + 拟人化（延迟/噪声/曲线/疲劳）       | ★★★       | controller_type, humanize_*              | ★★★             |
+| 执行层            | Output GHUB                            | 鼠标移动/点击 + 微移动合并 + 死区 + 限频       | ★★★★      | enable_micro_move_merge, deadzone        | ★★★★            |
+| 行为控制（Phase1）| Aimbot / Triggerbot                    | 功能级开关                                     | ★★★       | enable_aimbot, enable_triggerbot         | ★★★★ / ★★★★★   |
+| 行为控制（Phase2规划）| Intention Arbiter + FSM/Behavior Tree | 统一意图仲裁（AIM_TRACK / HOLD / FIRE / RELEASE）| ☆         | —（规划中）                              | —               |
+| 可观测性          | 状态快照 / 时间线回放                  | 全链路事件记录与复现                           | ★☆        | —（规划中）                              | —               |
+
+## 项目结构（2025.12.26）
 yolov13-aimbot/
-├── main.py                     # 系统入口、线程管理、监控、优雅退出
-├── config.py                   # 全局配置单例（读取 config.ini）
-├── config.ini                  # 所有功能开关与参数
-│
-├── perception/                 # 画面采集与分发层（高内聚）
-│   ├── init.py
-│   ├── capture.py              # BetterCam 256×256 鼠标中心捕获
-│   ├── bus.py                  # FrameBus（最新帧 + 历史 + 鼠标位置）
-│   └── frame_preprocessor.py   # 可选：亮度/对比度/去噪等预处理
-│
-├── inference.py                # YOLOv13 TensorRT 异步推理线程
-├── world_model.py              # 目标跟踪、坐标转换、状态机、预测
-│
-├── controllers/                # 决策与执行引擎
-│   ├── init.py
+├── main.py
+│   职责：系统总控（Supervisor）
+│   - 启动/停止/监控所有线程
+│   - 主控制循环（读取world_model最新状态 → 决策aimbot/triggerbot → 调用controller → 发送到output）
+│   - 全局异常捕获、优雅退出、信号处理
+│   - 性能监控（可选：fps、延迟、丢帧统计）
+
+├── config.py
+│   职责：全局配置单例 + 类型安全读取器
+│   - 从config.ini加载所有配置
+│   - 提供get()/getbool()/getfloat()等方法，支持智能类型转换
+│   - 所有模块都通过此单例访问配置
+
+├── config.ini
+│   职责：项目唯一配置入口
+│   - 包含所有开关（enable_aimbot / enable_triggerbot / ego_motion_compensation 等）
+│   - 调参（灵敏度、延迟范围、阈值、Kalman参数、策略包选择等）
+│   - 游戏选择（current_game = valorant）
+
+├── perception/
+│   ├── capture.py
+│   │   职责：画面采集 + 采集时刻鼠标位置精确记录
+│   │   - 使用BetterCam以当前鼠标为中心采集256×256区域
+│   │   - **关键**：每帧记录**采集瞬间**的鼠标位置（mouse_pos_at_capture）
+│   │   - 将最近N帧（建议100~200ms）的mouse_pos存入环形缓冲区（供后期时间同步使用）
+│   │   - 输出：FrameUpdate（frame + timestamp_capture + mouse_pos_at_capture + frame_id）
+
+│   ├── bus.py
+│   │   职责：状态总线（FrameBus + MousePos历史）
+│   │   - 存储最新帧 + 最近若干帧的鼠标位置历史（环形缓冲区）
+│   │   - 提供get_latest_frame() / get_mouse_pos_at_timestamp(ts)等接口
+│   │   - 实现轻量锁 + 条件变量（避免轮询）
+
+│   └── frame_preprocessor.py
+│       职责：可选帧预处理（当前可为空或简单实现）
+│       - 亮度/对比度/伽马校正
+│       - 轻度去噪/锐化（如果模型对噪声敏感）
+│       - 未来可加抗锯齿或色彩归一化
+
+├── inference.py
+│   职责：YOLOv13 TensorRT 异步推理线程
+│   - 从bus取最新帧（使用采集时刻数据）
+│   - 执行letterbox预处理 → TensorRT推理 → 简单后处理（过滤低conf）
+│   - 输出detections（256×256相对坐标）+ 推理完成时间戳
+
+├── world_model.py
+│   职责：**唯一事实源 + 状态仲裁者**（当前最核心演进点）
+│   - 接收inference的detections + 采集时刻的mouse_pos（通过bus同步）
+│   - 坐标转换：相对 → 屏幕绝对（使用**采集时刻**的mouse_pos）
+│   - 目标跟踪（IOU/简单匈牙利/未来Kalman）
+│   - **关键升级**：Ego-motion补偿闭环
+│   │   - 接收output_ghub实际下发的控制量u_k（dx,dy）
+│   │   - 将u_k作为Kalman滤波器的控制输入，剥离自身运动
+│   │   - 输出世界坐标系下更稳定的目标位置/速度
+│   - 提供get_best_target() / get_state() / get_history()接口
+
+├── aim_strategies/
+│   ├── base_strategy.py
+│   │   职责：抽象基类（接口定义）
+│   │   - calculate_mouse_move()
+│   │   - calculate_prediction()
+
+│   ├── valorant/
+│   │   ├── strategy.py
+│   └── factory.py
+│       职责：策略工厂（根据config.current_game / strategy_package创建实例）
+
+├── controllers/
 │   ├── base_controller.py
-│   ├── simple_controller.py
+│   │   职责：控制器抽象基类
+
 │   ├── pid_controller.py
-│   ├── controller_factory.py   # 根据配置创建控制器 + 拟人化管道
-│   └── humanize/               # 拟人化处理（全部可开关）
-│       ├── reaction_delay.py
-│       ├── fatigue.py
-│       ├── overshoot.py
-│       ├── noise.py
-│       └── curve.py
-│
-├── output_ghub.py              # GHUB 输出（移动 + 点击 + 队列 + 合并 + 死区）
-├── utils/                      # 通用工具
-│   ├── init.py
-│   ├── helpers.py              # bbox 处理、坐标转换、时间工具等
-│   └── types.py                # 常用数据结构（FrameInfo, Detection 等）
-│
-├── models/
-│   └── best256.engine          # YOLOv13 导出模型（256×256 输入）
-├── requirements.txt
-└── README.md
-text## 主要模块/文件夹 输入输出（逻辑单元视角）
+│   │   职责：PID控制实现（主力控制器）
 
-| 模块/文件夹            | 主要职责                              | 主要输入来源                              | 主要输出提供给谁                          | 关键备注                              |
-|------------------------|---------------------------------------|-------------------------------------------|-------------------------------------------|---------------------------------------|
-| **perception/**        | 画面采集 + 预处理 + 状态广播           | 系统启动（无显式输入）                     | 最新 256×256 帧 + timestamp + 鼠标位置     | 高内聚，未来可扩展多源                |
-| **inference.py**       | YOLOv13 TensorRT 异步推理              | perception 最新帧                          | 原始/过滤后的 detections                  | 永不阻塞，性能监控可选                |
-| **world_model.py**     | 目标跟踪、坐标转换、状态管理、预测     | inference detections + 时间戳 + 鼠标位置   | 可信目标（屏幕绝对坐标）+ 状态 + 预测位置  | 多目标/卡尔曼/状态机均可开关          |
-| **controllers/**       | 决策算法 + 拟人化处理                  | world_model 目标 + 当前鼠标位置 + dt       | 最终移动量（像素） + 是否触发扳机信号      | 多种算法 + 完整拟人化管道（可插拔）    |
-| **output_ghub.py**     | 鼠标移动 & 点击执行层                  | controllers 移动量 + 扳机信号              | GHUB mouse_xy() + mouse_down/up()         | 微移动合并、死区、频率限制均可开关    |
-| **main.py**            | 系统协调、线程生命周期、监控           | 无（启动所有）                             | 启动/停止所有线程，处理全局退出            | Supervisor 角色                       |
+│   ├── humanize/
+│   │   职责：拟人化处理管道（全部可开关）
+│   │   - reaction_delay / fatigue / overshoot / noise / curve
 
-## 用户故事：遇到一个敌人靶标时，代码的典型流程（2025.12）
+│   └── controller_factory.py
+│       职责：组合工厂
+│       - 根据配置选择strategy + controller + humanize链路
+│       - 最终输出平滑后的移动量 + trigger信号
 
-**场景**：玩家正在玩游戏，突然出现一个敌人（假设置信度足够）
+├── output_ghub.py
+│   职责：物理执行层 + 控制反馈闭环
+│   - 接收移动量(dx,dy) + trigger信号
+│   - 微移动累积 + 死区丢弃 + 频率限制
+│   - 通过GHUB发送mouse_xy / mouse_down/up
+│   - **关键**：将实际发送成功的控制量u_k（dx,dy）反馈给world_model（用于ego-motion补偿）
 
-1. **CaptureThread**（perception/capture.py）  
-   → 每 ~2-3ms 抓取一次以**当前鼠标位置为中心**的 256×256 区域  
-   → 通过 FrameBus 广播最新帧 + timestamp + 当前鼠标屏幕坐标
+├── utils/
+│   职责：通用工具集（不放业务逻辑）
+│   - helpers.py：bbox处理、letterbox、scale_boxes、时间工具、坐标转换等
+│   - types.py：数据结构（FrameInfo, Detection, MouseHistory等）
 
-2. **InferenceThread**（inference.py）  
-   → 拿到最新帧，送入 TensorRT engine (best256.engine)  
-   → 执行推理 → 后处理 → 得到 detections 列表  
-   → 传递给 world_model（包含原始坐标、置信度、类别）
+└── models/best256.engine
+    职责：YOLOv13 256×256输入模型文件（TensorRT engine）
 
-3. **WorldModel**（world_model.py）  
-   → 接收 detections  
-   → 进行坐标转换：256×256 相对坐标 → 屏幕绝对坐标  
-     （screen_x = mouse_x - 128 + det_center_x）  
-   → （可选）多目标跟踪、卡尔曼预测、状态机过滤  
-   → 输出：当前最佳目标（屏幕绝对坐标）+ 置信度 + 是否可见等状态
 
-4. **主循环**（main.py）  
-   → 读取 world_model 最新目标  
-   → 如果 enable_aimbot == true：  
-     → 调用 controller.compute() → 得到本次移动量 dx,dy  
-     → 经过 humanize 管道（可选反应延迟、噪声、曲线等）  
-     → 送入 output_ghub 发送移动指令
 
-   → 如果 enable_triggerbot == true：  
-     → 判断当前鼠标位置（屏幕中心）是否落在某个目标框内（一定 FOV 内）  
-     → 满足 conf 阈值 → 等待随机延迟 → 发出点击指令（mouse_down → sleep → mouse_up）
+text## 当前最关键的三个工程痛点与解法方向（2025.12.26）
 
-5. **output_ghub.py**  
-   → 接收移动指令（dx,dy）与点击指令  
-   → （可选）微移动累积、死区过滤  
-   → 通过 GHUB 接口发送 mouse_xy() / mouse_down() / mouse_up()
+1. **自身位移补偿闭环（Ego-motion Compensation）**  
+   痛点：甩枪/快速转动时，背景运动严重干扰目标检测速度  
+   当前方案：仅使用历史 mouse_pos 做简单补偿  
+   **推荐升级**：在 World Model 中引入**控制反馈闭环**  
+   → 将 output_ghub 下发的实际移动量（u_k）作为 Kalman 滤波器的控制输入  
+   → 实现世界坐标系下的目标速度剥离（真正意义上的 ego-motion compensation）
 
-**完整链路时间线**（理想情况下）  
-抓图 → 推理 (~8-15ms) → 世界模型处理 (~1ms) → 控制器计算 (~0.5ms) → 输出 (~2-4ms)  
-→ 整个闭环延迟通常在 **15-35ms** 内（视硬件而定）
+2. **亚毫秒级时间戳对齐**  
+   痛点：推理结果出来时，鼠标位置已移动 10~30 像素（15~35ms 延迟）  
+   **当前最佳实践**（强烈推荐立即实现）：  
+   - perception 层建立**环形缓冲区**记录最近 100ms 鼠标位置 + 时间戳  
+   - inference 输出 detections 时，使用**该帧采集时刻**对应的 mouse_pos 进行坐标转换  
+   → 可将坐标误差从 20~30px 降至 <5px
 
-## 安全与开发建议（再次强调）
+3. **意图仲裁的自然性与安全性**  
+   当前：简单的 enable 开关 + 阈值判断  
+   **Phase 2 目标**：  
+   - 引入**有限状态机（FSM）** 或 **行为树（Behavior Tree）**  
+   - 典型状态转移示例：
+IDLE → CONFIRMING(conf>0.45 & jerk<阈值) → AIM_TRACK → HOLD → FIRE → RELEASE
+CONFIRMING → IDLE（jerk过大或conf突降）
+text- 增加模糊逻辑权重：低 conf + 高 jerk → 自动进入犹豫/抑制状态
 
-- **永远不要**同时开启 aimbot + triggerbot
-- 所有高危行为（快速移动、无延迟点击）都应**先关闭**，逐项开启测试
-- 微移动合并 + 死区 + 反应延迟 + 噪声 是目前最有效的降低检测概率手段
-- 建议开发流程：先实现**纯 triggerbot** → 再加**慢速 aimbot** → 最后才考虑预测/多目标
+## 安全铁律（必须遵守）
 
-**项目仅限本地研究使用，严禁用于任何线上环境。**
+1. 所有高危开关**默认关闭**，逐项开启且从小强度开始
+2. **永不**同时开启 aimbot + triggerbot
+3. **最有效的行为伪装组合**（优先级顺序）：
+1. 微移动合并 + 死区
+2. 采集时刻时间戳同步 + 控制反馈 ego-motion
+3. 反应延迟 + 随机性 + 疲劳累积
+4. 行为噪声 + 曲线形状 + 过冲回正
+5. 意图仲裁层（FSM/BT）+ 状态犹豫机制
+
+## 项目定位与演进宣言
+
+**当前**：功能驱动的高质量异步实时系统（92→94分工程水准）  
+**下一阶段（Phase 1.5）**：强时间一致性 + 控制反馈闭环（目标 95+）  
+**最终目标（Phase 2）**：行为意图驱动 + 仲裁 + 全链路可观测回放（准工业级）
+
+**再次郑重声明**  
+**本项目仅限本地技术研究、算法验证与学术讨论。**  
+**严禁用于任何线上游戏环境或商业用途。**
