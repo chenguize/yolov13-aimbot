@@ -1,7 +1,19 @@
-# inference.py
+# inference.py - YOLOv13 TensorRT 异步推理模块
+#
+# 核心职责：
+# 1. TensorRT 引擎封装（高性能推理）
+# 2. 图像预处理（letterbox、归一化）
+# 3. 异步推理线程（不阻塞主流程）
+# 4. 检测结果后处理（NMS、置信度过滤）
+#
+# 架构特点：永不阻塞，异步处理，GPU 加速
+#
+
 import time
 import threading
 import numpy as np
+import torch
+from torchvision.ops import nms
 from typing import List, Optional, Tuple
 import tensorrt as trt
 import pycuda.driver as cuda
@@ -16,9 +28,10 @@ TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 
 class TensorRTEngine:
-    """TensorRT 引擎封装 - 专门用于 best256.engine"""
+    """TensorRT 引擎封装类 - 专门用于 best256.engine"""
 
     def __init__(self):
+        """初始化 TensorRT 引擎"""
         model_path = config.getstr("Inference", "model_path", "models/best256.engine")
         self.logger = TRT_LOGGER
 
@@ -50,7 +63,7 @@ class TensorRTEngine:
         print(f"  Output shape: {self.output_shape}")
 
     def infer(self, frame: np.ndarray) -> np.ndarray:
-        """单帧推理"""
+        """执行单帧推理"""
         # 预处理：letterbox 到 256x256
         img, ratio, pad = letterbox(frame, (256, 256))
         img = img.transpose(2, 0, 1).astype(np.float32) / 255.0
@@ -76,11 +89,12 @@ class InferenceThread(threading.Thread):
     """
 
     def __init__(self, bus: FrameBus, world_model: WorldModel, shutdown_event: threading.Event):
+        """初始化推理线程"""
         super().__init__(name="InferenceThread", daemon=True)
         self.bus = bus
         self.world_model = world_model
         self.shutdown_event = shutdown_event
-        self.last_processed_id = -1
+        self.last_processed_id = -1  # 记录最后处理的帧 ID，避免重复处理
 
         try:
             self.engine = TensorRTEngine()
@@ -89,6 +103,7 @@ class InferenceThread(threading.Thread):
             self.engine = None
 
     def run(self):
+        """推理线程主循环"""
         if self.engine is None:
             print("[Inference] TensorRT 引擎不可用，线程空转")
             while not self.shutdown_event.is_set():
@@ -100,14 +115,15 @@ class InferenceThread(threading.Thread):
         while not self.shutdown_event.is_set():
             frame_info: Optional[FrameInfo] = self.bus.get_latest()
 
+            # 检查是否有新帧需要处理
             if frame_info is None or frame_info.frame_id <= self.last_processed_id:
-                time.sleep(0.001)
+                time.sleep(0.001)  # 短暂休眠避免 CPU 占用过高
                 continue
 
             try:
                 start = time.perf_counter()
 
-                # 推理
+                # 执行推理
                 raw_output = self.engine.infer(frame_info.frame)
 
                 # 简单后处理（实际项目建议把 NMS 移到 world_model）
@@ -115,7 +131,7 @@ class InferenceThread(threading.Thread):
 
                 inference_time = time.perf_counter() - start
 
-                # 传递给 world_model（包含采集时刻信息）
+                # 将检测结果传递给 world_model（包含采集时刻信息）
                 self.world_model.update_detections(
                     detections=detections,
                     frame_id=frame_info.frame_id,
@@ -124,18 +140,19 @@ class InferenceThread(threading.Thread):
 
                 self.last_processed_id = frame_info.frame_id
 
+                # 每 60 帧输出一次性能信息
                 if frame_info.frame_id % 60 == 0:
                     print(f"[Inference] #{frame_info.frame_id} | {inference_time*1000:.1f}ms")
 
             except Exception as e:
                 print(f"[Inference] 单帧异常: {e}")
 
-            time.sleep(0.0005)
+            time.sleep(0.0005)  # 短暂休眠以平衡性能
 
         print("[Inference] 线程退出")
 
     def _postprocess(self, output: np.ndarray) -> List[List[float]]:
-        """完整后处理：置信度过滤 + NMS"""
+        """推理结果后处理：置信度过滤 + NMS"""
         boxes = []
         scores = []
         classes = []
@@ -144,6 +161,7 @@ class InferenceThread(threading.Thread):
         iou_thres = config.getfloat("Inference", "iou_threshold", 0.45)
         max_det = config.getint("Inference", "max_det", 20)
 
+        # 解析模型输出
         for pred in output[0]:
             conf = pred[4]
             if conf < conf_thres:
@@ -163,6 +181,7 @@ class InferenceThread(threading.Thread):
         boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
         scores_tensor = torch.tensor(scores, dtype=torch.float32)
 
+        # 执行非极大值抑制
         keep = nms(boxes_tensor, scores_tensor, iou_threshold=iou_thres)
 
         detections = []

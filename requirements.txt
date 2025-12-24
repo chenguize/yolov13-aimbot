@@ -7,7 +7,6 @@ psutil>=5.9.0
 tqdm>=4.66.0
 
 # TensorRT 推理相关（需自行安装 TensorRT Python 绑定）
-tensorrt>=10.0.0
 pycuda>=2024.1
 
 # BetterCam（推荐从 Git 安装最新版）
@@ -22,3 +21,4 @@ filterpy>=1.4.5
 # 其他实用工具
 supervision>=0.24.0
 #pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#pip install tensorrt==10.1.0 --extra-index-url https://pypi.nvidia.com
