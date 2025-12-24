@@ -1,0 +1,19 @@
+# 先不写 index-url
+
+opencv-python>=4.10.0
+numpy>=1.26.0
+supervision>=0.24.0
+pillow>=10.0.0
+pywin32>=306
+tk>=0.1.0
+tqdm
+psutil
+
+# YOLOv13 专用（这个会先装）
+-e git+https://github.com/iMoonLab/yolov13.git@main#egg=ultralytics
+
+# 最后单独装 torch（用自己的 index）
+git+https://github.com/ZCban/BetterCam.git@main
+
+
+#pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
