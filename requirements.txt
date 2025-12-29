@@ -1,0 +1,24 @@
+# 核心依赖
+opencv-python>=4.10.0
+numpy>=1.26.0
+pillow>=10.0.0
+pywin32>=306
+psutil>=5.9.0
+tqdm>=4.66.0
+huggingface_hub
+# TensorRT 推理相关（需自行安装 TensorRT Python 绑定）
+pycuda>=2024.1
+cupy-cuda12x
+# BetterCam（推荐从 Git 安装最新版）
+git+https://github.com/ZCban/BetterCam.git@main
+
+# YOLOv13 / Ultralytics（包含 NMS 等工具）手动复制文件夹
+
+
+# 卡尔曼滤波（filterpy）
+filterpy>=1.4.5
+
+# 其他实用工具
+supervision>=0.24.0
+#pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#pip install tensorrt==10.13.2.6 --extra-index-url https://pypi.nvidia.com
