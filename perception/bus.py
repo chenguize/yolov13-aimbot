@@ -1,4 +1,3 @@
-# perception/bus.py
 import threading
 from typing import Optional, Tuple
 from dataclasses import dataclass
@@ -6,35 +5,30 @@ import numpy as np
 
 @dataclass
 class FrameInfo:
-    """包含单帧及其捕获时刻的状态"""
-    frame: np.ndarray
-    frame_id: int
-    timestamp: float
-    mouse_pos_at_capture: Tuple[int, int]
+    """
+    不可拆分的帧原子单位
+    Phase 3 强调：Frame 必须携带 t_cap，否则没有任何意义。
+    """
+    frame: np.ndarray       # 图像数据 (BGR)
+    frame_id: int          # 序列号
+    t_cap: float           # 关键：截图完成时的时间戳 (Time Anchor)
+    center_pos: Tuple[int, int] # 截图时的屏幕中心坐标
 
 class FrameBus:
-    """轻量化帧总线：去除了 FPS 模式下的冗余插值逻辑"""
+    """
+    轻量级帧总线
+    只保留最新的一帧，丢弃旧帧 (Drop-Oldest)。
+    """
     def __init__(self):
         self._lock = threading.Lock()
         self._latest: Optional[FrameInfo] = None
 
-    def publish_frame(self, frame, frame_id, timestamp, mouse_pos_at_capture):
-        """更新最新帧状态"""
-        info = FrameInfo(frame, frame_id, timestamp, mouse_pos_at_capture)
+    def publish(self, info: FrameInfo):
+        """写入最新帧"""
         with self._lock:
             self._latest = info
 
     def get_latest(self) -> Optional[FrameInfo]:
-        """获取最新检测目标"""
+        """获取最新帧 (非阻塞)"""
         with self._lock:
             return self._latest
-
-    def get_mouse_pos_at_timestamp(self, target_ts: float) -> Tuple[int, int]:
-        """
-        在 FPS 模式下，直接返回屏幕中心
-        保留此接口是为了兼容后续 world_model 的坐标转换逻辑
-        """
-        # 这里的返回值应从 config 读取或由初始化传入
-        from config import config
-        return (config.getint("General", "screen_width") // 2,
-                config.getint("General", "screen_height") // 2)

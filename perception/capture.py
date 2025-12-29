@@ -1,76 +1,91 @@
-# perception/capture.py
 import time
 import threading
 import numpy as np
 import bettercam
 from config import config
-from perception.bus import FrameBus
+from perception.bus import FrameBus, FrameInfo
+
 
 class CaptureThread(threading.Thread):
     """
-    针对 FPS 优化的 BetterCam 采集线程
-    特点：固定屏幕中心 256x256 采样，不再实时获取鼠标坐标
+    Phase 3 专用采集线程
+    特点：
+    1. 极速：固定 256x256 中心区域，无动态计算开销。
+    2. 精准：在 camera.grab() 返回的瞬间记录 t_cap。
     """
+
     def __init__(self, bus: FrameBus, shutdown_event: threading.Event):
         super().__init__(name="CaptureThread", daemon=True)
         self.bus = bus
         self.shutdown_event = shutdown_event
 
-        # 基础配置
-        self.capture_size = config.getint("General", "capture_size", 256)
-        self.target_fps = config.getint("General", "capture_fps_target", 360)
+        # 配置参数
+        self.target_fps = config.getint("General", "capture_fps_target", 200)
+        self.capture_size = config.getint("General", "capture_size", 320)
         self.frame_interval = 1.0 / self.target_fps
 
-        # 获取屏幕中心
+        # 屏幕几何
         sw = config.getint("General", "screen_width", 1920)
         sh = config.getint("General", "screen_height", 1080)
         self.center_x, self.center_y = sw // 2, sh // 2
 
-        # 预先计算固定的采集区域 (left, top, right, bottom)
+        # 计算固定的 ROI (Region of Interest)
+        # left, top, right, bottom
         half = self.capture_size // 2
-        self.fixed_region = (
+        self.roi = (
             self.center_x - half,
             self.center_y - half,
             self.center_x + half,
             self.center_y + half
         )
 
-        # BetterCam 初始化 - 强制使用 GPU 加速
+        # BetterCam 初始化 (强制 GPU)
         self.camera = bettercam.create(
             device_idx=0,
             output_idx=0,
-            region=self.fixed_region, # 直接绑定固定区域
+            region=self.roi,  # 固定区域
             output_color="BGR",
             nvidia_gpu=True,
-            max_buffer_len=8
+            max_buffer_len=4  # 缓冲不用太大，我们要的是实时性
         )
 
     def run(self):
-        print(f"[Capture] FPS 模式启动: 固定中心 {self.capture_size}x{self.capture_size}")
-        frame_id = 0
+        print(f"[Capture] Started. Region: {self.capture_size}x{self.capture_size} @ Center")
+        frame_count = 0
 
         while not self.shutdown_event.is_set():
-            loop_start = time.perf_counter()
+            t_start = time.perf_counter()
 
             try:
-                # 执行高速捕获
-                frame = self.camera.grab() # 无需再传入 region
+                # 1. 抓取 (阻塞直到有帧)
+                frame = self.camera.grab()
+
+                # 2. 关键：立即打上时间戳
+                # 这是这一帧"光子到达传感器"的最接近时间估算
+                t_cap = time.perf_counter()
 
                 if frame is not None:
-                    # 发布到总线，mouse_pos 直接传中心点
-                    self.bus.publish_frame(
+                    # 3. 封装并广播
+                    info = FrameInfo(
                         frame=frame,
-                        frame_id=frame_id,
-                        timestamp=loop_start,
-                        mouse_pos_at_capture=(self.center_x, self.center_y)
+                        frame_id=frame_count,
+                        t_cap=t_cap,
+                        center_pos=(self.center_x, self.center_y)
                     )
-                    frame_id += 1
+                    self.bus.publish(info)
+                    frame_count += 1
 
             except Exception as e:
-                print(f"[Capture] 异常: {e}")
+                print(f"[Capture] Error: {e}")
+                time.sleep(0.1)
 
-            # 频率控制
-            elapsed = time.perf_counter() - loop_start
-            time.sleep(max(0.0, self.frame_interval - elapsed))
+            # 4. 软限频 (虽然 BetterCam 内部有限制，这里做个双保险)
+            # 避免在显卡负载极低时跑出 1000FPS 烧 CPU
+            elapsed = time.perf_counter() - t_start
+            wait = self.frame_interval - elapsed
+            if wait > 0:
+                time.sleep(wait)
 
-        print("[Capture] 线程退出")
+        # 清理资源
+        self.camera.stop()
+        print("[Capture] Stopped.")
