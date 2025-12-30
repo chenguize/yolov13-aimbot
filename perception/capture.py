@@ -8,10 +8,8 @@ from perception.bus import FrameBus, FrameInfo
 
 class CaptureThread(threading.Thread):
     """
-    Phase 3 专用采集线程
-    特点：
-    1. 极速：固定 256x256 中心区域，无动态计算开销。
-    2. 精准：在 camera.grab() 返回的瞬间记录 t_cap。
+    Phase 3 专用采集线程 (稳定版)
+    修复：关闭 nvidia_gpu 防止画面冻结
     """
 
     def __init__(self, bus: FrameBus, shutdown_event: threading.Event):
@@ -19,18 +17,15 @@ class CaptureThread(threading.Thread):
         self.bus = bus
         self.shutdown_event = shutdown_event
 
-        # 配置参数
-        self.target_fps = config.getint("General", "capture_fps_target", 200)
-        self.capture_size = config.getint("General", "capture_size", 320)
-        self.frame_interval = 1.0 / self.target_fps
+        self.target_fps = config.getint("General", "capture_fps_target", 240)
+        self.capture_size = config.getint("General", "capture_size", 256)
+        # 限制最高帧率，防止 CPU 空转
+        self.frame_interval = 1.0 / self.target_fps if self.target_fps > 0 else 0.002
 
-        # 屏幕几何
         sw = config.getint("General", "screen_width", 1920)
         sh = config.getint("General", "screen_height", 1080)
         self.center_x, self.center_y = sw // 2, sh // 2
 
-        # 计算固定的 ROI (Region of Interest)
-        # left, top, right, bottom
         half = self.capture_size // 2
         self.roi = (
             self.center_x - half,
@@ -39,33 +34,35 @@ class CaptureThread(threading.Thread):
             self.center_y + half
         )
 
-        # BetterCam 初始化 (强制 GPU)
-        self.camera = bettercam.create(
-            device_idx=0,
-            output_idx=0,
-            region=self.roi,  # 固定区域
-            output_color="BGR",
-            nvidia_gpu=True,
-            max_buffer_len=4  # 缓冲不用太大，我们要的是实时性
-        )
+        # [关键修复] 必须显式设置 nvidia_gpu=False
+        try:
+            self.camera = bettercam.create(
+                device_idx=0,
+                output_idx=0,
+                region=self.roi,
+                output_color="BGR",
+                nvidia_gpu=False,  # <--- 这里的 False 是防止飞天的关键
+                max_buffer_len=2
+            )
+        except Exception as e:
+            print(f"[Capture] ❌ BetterCam 初始化失败: {e}")
+            self.camera = None
 
     def run(self):
-        print(f"[Capture] Started. Region: {self.capture_size}x{self.capture_size} @ Center")
+        if not self.camera:
+            return
+
+        print(f"[Capture] 采集已启动 (ROI: {self.capture_size}x{self.capture_size}, GPU=False)")
         frame_count = 0
 
         while not self.shutdown_event.is_set():
             t_start = time.perf_counter()
 
             try:
-                # 1. 抓取 (阻塞直到有帧)
                 frame = self.camera.grab()
-
-                # 2. 关键：立即打上时间戳
-                # 这是这一帧"光子到达传感器"的最接近时间估算
-                t_cap = time.perf_counter()
+                t_cap = time.perf_counter() # 立即打戳
 
                 if frame is not None:
-                    # 3. 封装并广播
                     info = FrameInfo(
                         frame=frame,
                         frame_id=frame_count,
@@ -74,18 +71,17 @@ class CaptureThread(threading.Thread):
                     )
                     self.bus.publish(info)
                     frame_count += 1
+                else:
+                    time.sleep(0.001)
 
-            except Exception as e:
-                print(f"[Capture] Error: {e}")
-                time.sleep(0.1)
+            except Exception:
+                time.sleep(0.01)
 
-            # 4. 软限频 (虽然 BetterCam 内部有限制，这里做个双保险)
-            # 避免在显卡负载极低时跑出 1000FPS 烧 CPU
             elapsed = time.perf_counter() - t_start
             wait = self.frame_interval - elapsed
             if wait > 0:
                 time.sleep(wait)
 
-        # 清理资源
-        self.camera.stop()
+        if self.camera:
+            self.camera.stop()
         print("[Capture] Stopped.")

@@ -1,23 +1,19 @@
-# output_system.py
-# Phase 3: 纯 Win32 API 版 (SendInput)
-# 核心特性：支持 dwExtraInfo 水印，用于 RingBuffer 的敌我识别
-
+# output.py - 64-bit Compatible Fix
 import ctypes
-from ctypes import c_long, c_ulong, Structure, Union, POINTER, sizeof, byref
-from typing import Optional
-
-# 避免循环导入
-from typing import TYPE_CHECKING
+from ctypes import c_long, c_ulong, c_ulonglong, Structure, Union, sizeof, byref
+from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from perception.ring_buffer import RingBuffer
 
 # ============================================================================
-# Win32 API 常量与结构定义
+# Win32 API 常量与结构定义 (64-bit Safe)
 # ============================================================================
 LONG = c_long
 DWORD = c_ulong
-ULONG_PTR = POINTER(DWORD)
+# [关键修复] 在64位Python中，ULONG_PTR 必须是64位整数，而不是指针对象
+# 否则 SendInput 会因为结构体大小不对或数据截断而拒绝执行
+ULONG_PTR = c_ulonglong
 
 INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
@@ -26,9 +22,7 @@ MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_ABSOLUTE = 0x8000
 
 # [关键] 魔法数字：用于标记这是 AI 发出的指令
-# 你的 Input Listener 必须检查 dwExtraInfo 是否等于这个值
 AI_SIGNATURE = 0xFFC0FFEE
-
 
 class MOUSEINPUT(Structure):
     _fields_ = (
@@ -40,14 +34,11 @@ class MOUSEINPUT(Structure):
         ('dwExtraInfo', ULONG_PTR)
     )
 
-
 class _INPUTunion(Union):
     _fields_ = (('mi', MOUSEINPUT),)
 
-
 class INPUT(Structure):
     _fields_ = (('type', DWORD), ('union', _INPUTunion))
-
 
 # ============================================================================
 # SystemMouse 类实现
@@ -56,10 +47,9 @@ class INPUT(Structure):
 class SystemMouse:
     def __init__(self):
         self.ring_buffer: Optional['RingBuffer'] = None
-        print("[SystemMouse] 初始化完成 (SendInput Mode)")
-        print(f"[SystemMouse] AI 指令水印已配置: {hex(AI_SIGNATURE)}")
+        print("[SystemMouse] 初始化完成 (SendInput Mode - 64bit Fix)")
 
-    def set_ring_buffer(self, ring_buffer: 'RingBuffer'):
+    def set_ring_buffer(self, ring_buffer):
         """
         依赖注入：传入全局唯一的 RingBuffer 实例，用于闭环反馈
         """
@@ -70,15 +60,13 @@ class SystemMouse:
         底层发送函数：封装 SendInput 并注入水印
         """
         mi = MOUSEINPUT()
-        mi.dx = dx
-        mi.dy = dy
+        mi.dx = int(dx)
+        mi.dy = int(dy)
         mi.mouseData = 0
         mi.dwFlags = flags
         mi.time = 0
-
-        # [Phase 3 核心] 注入水印
-        # 这让监听器知道：这条指令是自己人发的，别当成人类操作记录
-        mi.dwExtraInfo = ctypes.cast(AI_SIGNATURE, ULONG_PTR)
+        # [关键] 注入水印 (现在可以直接赋值，因为 ULONG_PTR 是整数类型)
+        mi.dwExtraInfo = AI_SIGNATURE
 
         inp = INPUT()
         inp.type = INPUT_MOUSE
@@ -94,39 +82,18 @@ class SystemMouse:
         if x == 0 and y == 0:
             return
 
-        ix, iy = int(x), int(y)
-
         # 1. 物理执行 (带水印)
-        self._send_input(ix, iy, MOUSEEVENTF_MOVE)
+        self._send_input(x, y, MOUSEEVENTF_MOVE)
 
         # 2. 逻辑回写 (闭环反馈)
-        # 主动告诉 RingBuffer："我动了，这是 AI 行为"
         if self.ring_buffer:
-            self.ring_buffer.add_event(ix, iy, is_ai=True)
-        else:
-            # 开发调试期容错
-            pass
+            self.ring_buffer.add_event(int(x), int(y), is_ai=True)
 
     def mouse_down(self, key=1):
-        """
-        按下鼠标 (目前默认左键)
-        """
-        if key == 1:
-            self._send_input(0, 0, MOUSEEVENTF_LEFTDOWN)
+        if key == 1: self._send_input(0, 0, MOUSEEVENTF_LEFTDOWN)
 
     def mouse_up(self, key=1):
-        """
-        抬起鼠标
-        """
-        if key == 1:
-            self._send_input(0, 0, MOUSEEVENTF_LEFTUP)
+        if key == 1: self._send_input(0, 0, MOUSEEVENTF_LEFTUP)
 
-    def mouse_close(self):
-        """
-        资源清理 (API 模式无需清理)
-        """
-        pass
-
-
-# 为了保持 main.py 兼容性，变量名依然叫 gHub
+# 单例导出
 gHub = SystemMouse()
