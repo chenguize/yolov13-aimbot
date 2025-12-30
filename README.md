@@ -132,11 +132,10 @@ text复制yolov13-aimbot/
 │
 ├── controllers/
 │   ├── base_controller.py
-│   ├── simple_controller.py
+│   ├── simple_controller.py        #一帧拉枪，调试用
 │   ├── pid_controller.py
-│   └── advanced_controller.py
+│   └── pro_controller.py           #仿生控制
 │
-├── controllers/humanize/       # 拟人化（默认全关）
 │
 ├── output_ghub.py              # 执行层 + u_k 回写
 │
