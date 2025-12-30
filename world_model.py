@@ -18,6 +18,8 @@ from config import config
 # 引入项目内依赖
 from perception.ring_buffer import RingBuffer
 from utils.types import Detection, InferenceContext
+# [新增] 引入工厂方法以创建 Strategy
+from aim_strategies.factory import create_aim_strategy
 
 
 @dataclass
@@ -30,7 +32,7 @@ class TargetState:
     last_seen: float
 
     # Kalman State: [x, y, vx, vy]
-    # x, y: 屏幕绝对像素坐标
+    # x, y: 屏幕绝对像素坐标 (经过位移对冲后的“当前时刻”坐标)
     state: np.ndarray = field(default_factory=lambda: np.zeros(4))
 
     # Covariance Matrix: P
@@ -55,34 +57,36 @@ class SimpleKalman:
             [0, 1, 0, 0]
         ])
 
-        # 测量噪声 R (YOLO 的抖动幅度)
+        # 测量噪声 R
         noise_pos = config.getfloat("WorldModel", "kalman_R_pos", 5.0)
         self.R = np.eye(2) * noise_pos
 
-        # 过程噪声 Q (目标运动的不确定性)
+        # 过程噪声 Q
         noise_proc = config.getfloat("WorldModel", "kalman_Q_proc", 0.5)
         self.Q = np.eye(4) * noise_proc
 
-        # 预分配单位矩阵
         self.I = np.eye(4)
 
     def predict(self, state_obj: TargetState, dt: float):
-        """预测步骤: X = F * X"""
         if dt <= 0: return
+
+        # x = x + vx * dt
         self.F[0, 2] = dt
         self.F[1, 3] = dt
+
         state_obj.state = self.F @ state_obj.state
         state_obj.covariance = self.F @ state_obj.covariance @ self.F.T + self.Q
 
     def update(self, state_obj: TargetState, measurement: np.ndarray):
-        """更新步骤: 融合观测值"""
         z = measurement
         y = z - (self.H @ state_obj.state)
         S = self.H @ state_obj.covariance @ self.H.T + self.R
+
         try:
             K = state_obj.covariance @ self.H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
             return
+
         state_obj.state = state_obj.state + (K @ y)
         state_obj.covariance = (self.I - K @ self.H) @ state_obj.covariance
 
@@ -96,7 +100,7 @@ class WorldModel:
         self.kalman = SimpleKalman()
         self.current_target: Optional[TargetState] = None
 
-        # --- 数据缓冲 (线程安全) ---
+        # --- 数据缓冲 ---
         self._data_lock = threading.Lock()
         self._latest_detection_data: Optional[Dict] = None
 
@@ -104,13 +108,8 @@ class WorldModel:
         self.fov_x = config.getfloat("Triggerbot", "trigger_fov_x", 150.0)
         self.fov_y = config.getfloat("Triggerbot", "trigger_fov_y", 150.0)
         self.max_coast_frames = 5
-
-        # [Phase 3] 预测开关与延迟参数
-        # 建议先设为 False，跑通后再开
         self.enable_prediction = config.getbool("WorldModel", "enable_prediction", False)
         self.system_latency = config.getfloat("WorldModel", "system_latency", 0.045)
-
-        # 屏幕中心
         self.screen_w = config.getint("General", "screen_width", 1920)
         self.screen_h = config.getint("General", "screen_height", 1080)
         self.center_x = self.screen_w / 2
@@ -118,12 +117,14 @@ class WorldModel:
 
         self.last_t_cap = 0.0
 
-        # 灵敏度系数 (Counts per Pixel) - 用于位移对冲
-        self.k_factor_x = config.getfloat("AimStrategy", "k_factor_x", 1.9)
-        self.k_factor_y = config.getfloat("AimStrategy", "k_factor_y", 1.2)
+        # [Phase 3 修改]
+        # 持有 Strategy 实例，确保"瞄准"和"对冲"使用同一套数学逻辑
+        self.strategy = create_aim_strategy()
 
     def update_detections(self, detections: List[list], frame_id: int, t_cap: float, t_done: float):
-        """[Inference Thread 调用]"""
+        """
+        [Inference Thread 调用]
+        """
         with self._data_lock:
             self._latest_detection_data = {
                 "dets": detections,
@@ -133,7 +134,10 @@ class WorldModel:
             }
 
     def step(self, context: InferenceContext, ring_buffer: RingBuffer):
-        """[Main Thread 调用]"""
+        """
+        [Main Thread 调用]
+        主循环步进函数
+        """
 
         # 1. 提取数据
         data = None
@@ -164,76 +168,93 @@ class WorldModel:
         # 3. 目标仲裁
         best_det = self._select_target(current_dets)
 
-        current_time = context.t_cap
+        # 计算 dt
+        current_time = time.perf_counter()
         dt = current_time - self.last_t_cap
-
         if dt <= 0: dt = 0.001
         if dt > 0.5: dt = 0.1
 
-        # --- A. Reset ---
+        # =========================================================
+        # [核心] 因果位移对冲 (Causal Hedging) - 使用 Strategy 映射
+        # =========================================================
+
+        # 1. 查账：获取鼠标计数 (Mickeys)
+        mouse_counts_x, mouse_counts_y = ring_buffer.get_cursor_delta_sum(context.t_cap, current_time)
+
+        # 2. 逆向映射：Mickeys -> Pixels (利用 Strategy 的逆函数)
+        pixel_shift_x, pixel_shift_y = self.strategy.reverse_map(mouse_counts_x, mouse_counts_y)
+
+        # 3. 计算视觉反向偏移 (Visual Shift)
+        # 物理规律：鼠标右移(+)，摄像机右转，物体在屏幕上相对左移(-)
+        # 所以视觉偏移量 = - (物理位移量)
+        vis_shift_x = -pixel_shift_x
+        vis_shift_y = -pixel_shift_y
+
+        # =========================================================
+        # 逻辑分支 A: 重置 (Reset)
+        # =========================================================
         if not self.current_target and not best_det:
             context.is_valid = False
             self.last_t_cap = current_time
             return
 
-        # --- B. Init ---
+        # =========================================================
+        # 逻辑分支 B: 初始化 (Init) - 立即应用对冲
+        # =========================================================
         if best_det and (not self.current_target or self.current_target.id != best_det.class_id):
             self.current_target = TargetState(
                 id=best_det.class_id,
-                first_seen=current_time,
-                last_seen=current_time
+                first_seen=context.t_cap,
+                last_seen=context.t_cap
             )
-            self.current_target.state[:2] = [best_det.x, best_det.y]
-            context.is_valid = False
+            # [修正] 即使是第一帧，也要把"过去"的坐标拉到"现在"
+            current_x = best_det.x + vis_shift_x
+            current_y = best_det.y + vis_shift_y
+
+            self.current_target.state[:2] = [current_x, current_y]
+
+            # 第一帧直接给预测坐标 (无速度)
+            context.p_predict = (current_x, current_y)
+            context.is_valid = True
             context.selected_id = best_det.class_id
+
             self.last_t_cap = current_time
             return
 
-        # --- C. Tracking & Hedging ---
+        # =========================================================
+        # 逻辑分支 C: 追踪与对冲 (Tracking & Hedging)
+        # =========================================================
         if self.current_target and best_det:
             target = self.current_target
 
-            # 1. 因果位移对冲 (Hedging)
-            # 计算这一帧之间，鼠标动了多少，并转换回像素
-            mouse_counts_x, mouse_counts_y = ring_buffer.get_cursor_delta_sum(self.last_t_cap, current_time)
-
-            kx = self.k_factor_x if self.k_factor_x > 0.1 else 1.0
-            ky = self.k_factor_y if self.k_factor_y > 0.1 else 1.0
-
-            pixel_shift_x = mouse_counts_x / kx
-            pixel_shift_y = mouse_counts_y / ky
-
-            # 还原真实世界坐标：观测值 + 鼠标位移导致的视觉反向偏移
+            # [修正] 喂给 Kalman 的观测值 = 旧观测 + 视觉偏移
             z_measured = np.array([
-                best_det.x + pixel_shift_x,
-                best_det.y + pixel_shift_y
+                best_det.x + vis_shift_x,
+                best_det.y + vis_shift_y
             ])
 
-            # 2. Kalman 更新
+            # --- Kalman 迭代 ---
             self.kalman.predict(target, dt)
             self.kalman.update(target, z_measured)
 
-            target.last_seen = current_time
+            target.last_seen = context.t_cap
             target.hit_streak += 1
 
             vx, vy = target.state[2], target.state[3]
 
-            # 熔断机制
+            # 稳定性熔断
             if target.hit_streak < 3:
-                context.is_valid = False
+                context.is_valid = True
             else:
                 context.is_valid = True
 
             context.v_real = (vx, vy)
             context.selected_id = target.id
 
-            # --- D. 时延预测 (Latency Prediction) [可开关] ---
+            # --- 时延预测 (Latency Prediction) ---
             if self.enable_prediction:
-                # 开启预测：P_final = P_curr + V * Latency
                 t_predict_total = self.system_latency
-                # 这里还可以加上 (time.perf_counter() - t_cap) 来补偿计算耗时
             else:
-                # 关闭预测：只瞄准当前 Kalman 滤波后的位置
                 t_predict_total = 0.0
 
             pred_x = target.state[0] + vx * t_predict_total
@@ -241,13 +262,18 @@ class WorldModel:
 
             context.p_predict = (pred_x, pred_y)
 
-        # --- E. Coasting ---
+        # =========================================================
+        # 逻辑分支 D: 惯性导航 (Coasting)
+        # =========================================================
         elif self.current_target and not best_det:
-            time_since_lost = current_time - self.current_target.last_seen
+            # 使用真实流逝时间判断丢失时长
+            time_since_lost = current_time - self.last_t_cap
+
             if time_since_lost < (self.max_coast_frames * 0.02):
                 target = self.current_target
                 self.kalman.predict(target, dt)
-                context.is_valid = False  # 盲预测暂时不瞄准
+                # 盲预测时不建议瞄准
+                context.is_valid = False
             else:
                 self.current_target = None
                 context.is_valid = False
@@ -255,15 +281,23 @@ class WorldModel:
         self.last_t_cap = current_time
 
     def _select_target(self, targets: List[Detection]) -> Optional[Detection]:
-        if not targets: return None
+        """简单的最近邻策略"""
+        if not targets:
+            return None
+
         best_target = None
         min_dist = float('inf')
+
         for t in targets:
             dx = t.x - self.center_x
             dy = t.y - self.center_y
-            if abs(dx) > self.fov_x or abs(dy) > self.fov_y: continue
+
+            if abs(dx) > self.fov_x or abs(dy) > self.fov_y:
+                continue
+
             dist = dx * dx + dy * dy
             if dist < min_dist:
                 min_dist = dist
                 best_target = t
+
         return best_target

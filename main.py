@@ -3,6 +3,7 @@
 # 1. 启动并编排所有异步子系统
 # 2. 维护 RingBuffer 因果闭环
 # 3. 全速执行 "感知 -> 决策 -> 控制 -> 执行" 循环 (无人工限速)
+# 4. 实现自动调参 (Auto-Tune) 闭环反馈
 
 import random
 import time
@@ -164,12 +165,17 @@ def main():
     ctx = InferenceContext()
     last_loop_time = time.perf_counter()
 
-    # 缓存配置，避免循环内查字典
+    # [Auto-Tune] 自动调参专用状态记忆
+    last_target_id = -1
+    last_target_xy = (0, 0)
+    last_frame_time = 0.0
+
+    # 缓存配置
     enable_trigger = config.getbool("General", "enable_triggerbot", False)
 
     while not shutdown_event.is_set():
         if paused:
-            time.sleep(0.1)  # 暂停时必须休眠，节省CPU
+            time.sleep(0.1)  # 暂停时必须休眠
             continue
 
         loop_start = time.perf_counter()
@@ -183,8 +189,8 @@ def main():
             # 2. Decision
             if not ctx.is_valid:
                 recorder.record_frame(ctx)
-                # [性能优化] 移除无效时的 sleep，直接进入下一轮
-                # 如果 CPU 占用过高 (100%)，可在此处仅加 time.sleep(0) 让出时间片
+                # 丢失目标时重置调参状态
+                last_target_id = -1
                 continue
 
             pred_x, pred_y = ctx.p_predict
@@ -211,38 +217,71 @@ def main():
                 "screen_y": pred_y,
                 "conf": 1.0
             }
-            # 注意：BaseController 里的 should_trigger 包含冷却逻辑
             should_fire = controller.should_trigger(trigger_target, (sc_x, sc_y))
 
             # 5. Output (IO Bound)
             # 移动
             if abs(final_x) > 0.5 or abs(final_y) > 0.5:
                 output_device.mouse_xy(final_x, final_y)
-                if hasattr(strategy, 'feedback_update'):
-                    pass
+
+                # --- [Auto-Tune] 自校准闭环反馈 ---
+                if config.getbool("AimStrategy", "enable_auto_calibration", False):
+
+                    # 只有当连续锁定同一个目标时，才能计算有效位移
+                    if ctx.selected_id == last_target_id and last_target_id != -1:
+
+                        # 获取当前帧目标的原始检测坐标 (不使用预测值)
+                        curr_det = next((t for t in ctx.targets if t.class_id == ctx.selected_id), None)
+
+                        if curr_det:
+                            curr_x, curr_y = curr_det.x, curr_det.y
+                            prev_x, prev_y = last_target_xy
+
+                            # [果] 目标在屏幕上的实际位移 (Pixels)
+                            actual_pixel_dx = curr_x - prev_x
+                            actual_pixel_dy = curr_y - prev_y
+
+                            # [因] 查询上一帧到现在的鼠标指令 (Counts)
+                            # 必须使用 t_cap 对齐时间轴
+                            ai_counts_x, ai_counts_y = ring_buffer.get_cursor_delta_sum(last_frame_time, ctx.t_cap)
+
+                            # 只有发生显著移动时才校准，避免静止噪声
+                            if abs(ai_counts_x) > 5 or abs(ai_counts_y) > 5:
+                                if hasattr(strategy, 'feedback_update'):
+                                    # 喂给 Strategy：鼠标发了 +Counts，导致物体移了 -Pixels
+                                    # Strategy 内部会处理绝对值，这里直接传原始差值
+                                    strategy.feedback_update(
+                                        ai_counts_x, -actual_pixel_dx,
+                                        ai_counts_y, -actual_pixel_dy
+                                    )
+
+                            # 更新状态
+                            last_target_xy = (curr_x, curr_y)
+                            last_frame_time = ctx.t_cap
+
+                    # 状态维护：初始化或切换目标
+                    elif ctx.selected_id != -1:
+                        curr_det = next((t for t in ctx.targets if t.class_id == ctx.selected_id), None)
+                        if curr_det:
+                            last_target_id = ctx.selected_id
+                            last_target_xy = (curr_det.x, curr_det.y)
+                            last_frame_time = ctx.t_cap
+                    else:
+                        last_target_id = -1
 
             # 开火
-            # [关于休眠的说明]
-            # 这里必须保留 sleep，因为 output_device.mouse_down 是瞬发的。
-            # 如果不 sleep，指令会是 Down -> Up 在 0ms 内完成，游戏检测不到按键。
-            # 如果希望完全无阻塞，需要将开火逻辑移入独立线程。
             if should_fire and enable_trigger:
                 output_device.mouse_down(1)
-                # 模拟按下耗时 (物理必要)
                 time.sleep(random.uniform(0.015, 0.03))
                 output_device.mouse_up(1)
-                # 射速限制 (物理必要，防止枪支过热或被判定为宏)
                 time.sleep(0.04)
 
-                # 6. Trace
+            # 6. Trace
             recorder.record_frame(ctx)
 
         except Exception as e:
             print(f"[Loop] 异常: {e}")
-            time.sleep(0.01)  # 异常保护 sleep 必须保留
-
-        # [性能优化] 移除循环末尾的 sleep(0.0005)
-        # 现在循环频率将仅受限于 Python GIL 和 WorldModel 计算速度
+            time.sleep(0.01)
 
     # --- 退出 ---
     print("[System] 正在关闭...")
