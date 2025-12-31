@@ -33,18 +33,18 @@ class ControllerFactory:
         controllers_map = {
             "simple": SimpleController,  # 简单比例控制器
             "pid": PIDController,   # PID控制器
-            "advanced": PROController,# PID控制器
+            "pro": PROController,   # PRO控制器
         }
 
         # 获取对应控制器类
         controller_class = controllers_map.get(controller_type)
 
-        if controller_class is None:
+        if not controller_class:
             print(f"[ControllerFactory] 未知控制器类型: {controller_type}，回退使用 simple")
             return SimpleController()
 
-        return controller_class()
-
+        print(f"[ControllerFactory] 加载控制器: {controller_type.upper()}Controller")
+        return controller_class()  # 直接实例化
 
 def get_controller() -> BaseController:
     """

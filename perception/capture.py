@@ -40,8 +40,7 @@ class CaptureThread(threading.Thread):
                 device_idx=0,
                 output_idx=0,
                 region=self.roi,
-                output_color="BGR",
-                nvidia_gpu=False,  # <--- 这里的 False 是防止飞天的关键
+                output_color="BGR",  # <--- 这里的 False 是防止飞天的关键
                 max_buffer_len=2
             )
         except Exception as e:
@@ -52,7 +51,7 @@ class CaptureThread(threading.Thread):
         if not self.camera:
             return
 
-        print(f"[Capture] 采集已启动 (ROI: {self.capture_size}x{self.capture_size}, GPU=False)")
+        print(f"[Capture] 采集已启动 (ROI: {self.capture_size}x{self.capture_size})")
         frame_count = 0
 
         while not self.shutdown_event.is_set():
