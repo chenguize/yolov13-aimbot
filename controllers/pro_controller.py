@@ -42,7 +42,7 @@ class PROController(BaseController):
 
         # [状态机重置]
         # 如果距离变大 (>80px)，或者当前规划已结束，立即重新规划
-        if not self.is_planning or dist_remaining > 80.0:
+        if not self.is_planning or dist_remaining > 512.0:
             self._plan_trajectory(intent_dx, intent_dy)
             self.start_time = current_time
             self.executed_pos = np.array([0.0, 0.0])

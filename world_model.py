@@ -212,7 +212,7 @@ class WorldModel:
 
         current_search_radius = self.search_fov
         if self.current_target:
-            current_search_radius = min(self.search_fov, 80.0)
+            current_search_radius = min(self.search_fov, 512.0)
 
         for d in dets_raw:
             if int(d[5]) != 7: continue  # 必须是头
