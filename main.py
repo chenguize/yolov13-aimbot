@@ -20,6 +20,7 @@ from utils.recorder import TraceRecorder
 # --- 全局控制 ---
 shutdown_event = threading.Event()
 paused = False
+enable_aimbot = True  # 控制 AI 是否输出指令
 
 
 # ==============================================================================
@@ -60,6 +61,7 @@ class InputMonitor(threading.Thread):
             if nCode >= 0 and wParam == self.WM_MOUSEMOVE:
                 try:
                     struct = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                    # 仅记录非 AI 生成的物理移动
                     if struct.dwExtraInfo != AI_SIGNATURE:
                         if first_run:
                             last_x, last_y = struct.pt.x, struct.pt.y
@@ -89,18 +91,22 @@ class InputMonitor(threading.Thread):
         if self.hook: self._UnhookWindowsHookEx(self.hook)
 
 
-# --- 保留原版功能函数 ---
 def signal_handler(sig, frame): shutdown_event.set()
 
 
 def toggle_pause(): global paused; paused = not paused; print(f"PAUSE: {paused}")
 
 
+def toggle_aimbot():
+    global enable_aimbot
+    enable_aimbot = not enable_aimbot
+    print(f"[Aimbot] {'ENABLED' if enable_aimbot else 'DISABLED (Calibration Mode)'}")
+
+
 def main():
-    global paused
+    global paused, enable_aimbot
     signal.signal(signal.SIGINT, signal_handler)
 
-    # 初始化 (保留 recorder)
     ring_buffer = RingBuffer(max_duration=2.0)
     frame_bus = FrameBus()
     recorder = TraceRecorder(save_path="debug_trace.pkl")
@@ -110,11 +116,12 @@ def main():
     input_monitor = InputMonitor(ring_buffer)
     world_model = WorldModel()
 
-    # 启动所有线程
     input_monitor.start()
     CaptureThread(frame_bus, shutdown_event).start()
     InferenceThread(frame_bus, world_model, shutdown_event).start()
+
     keyboard.add_hotkey('p', toggle_pause)
+    keyboard.add_hotkey('alt+f1', toggle_aimbot)  # 绑定快捷键用于“离线校准”
 
     ctx = InferenceContext()
     last_processed_t_cap = 0.0
@@ -127,34 +134,33 @@ def main():
         loop_start = time.perf_counter()
         loop_counter += 1
 
-        # 耦合架构核心：直接拿到控制器计算结果
+        # 核心：WorldModel 始终运行 step 以进行延迟观测和灵敏度校准
         final_move = world_model.step(ctx, ring_buffer)
 
         if not final_move or ctx.t_cap == last_processed_t_cap:
-            time.sleep(0.0005);
+            time.sleep(0.0005)
             continue
 
         last_processed_t_cap = ctx.t_cap
         final_x, final_y = final_move
 
-        # 立即执行
-        if abs(final_x) > 0.5 or abs(final_y) > 0.5:
-            output_device.mouse_xy(final_x, final_y)
+        # 仅在 enable_aimbot 为 True 时执行 AI 移动
+        if enable_aimbot:
+            if abs(final_x) > 0.5 or abs(final_y) > 0.5:
+                output_device.mouse_xy(final_x, final_y)
 
-        # Triggerbot (保留原版逻辑)
-        if enable_trigger:
-            trigger_target = {"screen_x": ctx.p_predict[0], "screen_y": ctx.p_predict[1], "conf": ctx.conf}
-            if world_model.controller.should_trigger(trigger_target,
-                                                     (world_model.crop_center, world_model.crop_center)):
-                output_device.mouse_down(1)
-                time.sleep(random.uniform(0.015, 0.03))
-                output_device.mouse_up(1)
+            if enable_trigger:
+                trigger_target = {"screen_x": ctx.p_predict[0], "screen_y": ctx.p_predict[1], "conf": ctx.conf}
+                if world_model.controller.should_trigger(trigger_target,
+                                                         (world_model.crop_center, world_model.crop_center)):
+                    output_device.mouse_down(1)
+                    time.sleep(random.uniform(0.015, 0.03))
+                    output_device.mouse_up(1)
 
-        # 性能打印
         if loop_counter % 100 == 0:
             total_ms = (time.perf_counter() - loop_start) * 1000
             print(
-                f"[Main] FPS: {1000 / total_ms:.1f} | DynLag: {ctx.dynamic_lag_ms:.1f}ms | K: {world_model.strategy.calib.k_x:.2f}")
+                f"[Main] FPS: {1000 / total_ms:.1f} | DynLag: {ctx.dynamic_lag_ms:.1f}ms | K: {world_model.strategy.calib.k_x:.2f} | Aim:{enable_aimbot}")
 
         recorder.record_frame(ctx)
 

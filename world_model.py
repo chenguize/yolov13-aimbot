@@ -58,12 +58,10 @@ class WorldModel:
         self.crop_center = self.capture_size / 2
         self.search_fov = config.getfloat("WorldModel", "search_fov", 100.0)
 
-        # 耦合架构下，lag_queue 主要用于 TraceRecorder 记录，不再阻塞执行
         self.lag_queue = deque()
         self.last_t_cap = 0.0
         self.last_processed_fid = -1
 
-        # 内部集成策略与控制器
         self.strategy = create_aim_strategy()
         from controllers.controller_factory import get_controller
         self.controller = get_controller()
@@ -78,9 +76,6 @@ class WorldModel:
             self._latest_detection_data = {"dets": detections, "fid": frame_id, "t_cap": t_cap}
 
     def step(self, context: InferenceContext, ring_buffer: RingBuffer) -> Optional[Tuple[float, float]]:
-        """
-        耦合版 step: 直接返回需要执行的 (final_x, final_y)
-        """
         current_time = time.perf_counter()
         with self._data_lock:
             data = self._latest_detection_data
@@ -100,13 +95,22 @@ class WorldModel:
         best_det = self._select_target(data['dets'])
         dt = max(0.001, min(current_time - self.last_t_cap, 0.1))
 
-        # 2. 自动校准灵敏度
+        # 2. 方案 A：人机分离自动校准
         if is_new_frame and best_det and self.current_target and self.current_target.id == best_det.class_id:
             if self.last_raw_pos is not None:
                 raw_dx, raw_dy = best_det.x - self.last_raw_pos[0], best_det.y - self.last_raw_pos[1]
-                total_cx, total_cy = ring_buffer.get_cursor_delta_sum(self.last_calib_t, data['t_cap'])
-                self.strategy.feedback_update(total_cx, -raw_dx, total_cy, -raw_dy)
+
+                # 仅获取该时间段内人类手动的位移量
+                human_cx, human_cy = ring_buffer.get_human_delta_sum(self.last_calib_t, data['t_cap'])
+
+                # 只有当人类手动产生了足够大的位移（例如 > 5 脉冲）时才学习
+                # 这样可以保证 K 值是基于真实物理反馈学习的，不受 AI 动作干扰
+                if abs(human_cx) > 5 or abs(human_cy) > 5:
+                    self.strategy.feedback_update(human_cx, -raw_dx, human_cy, -raw_dy)
+
             self.last_raw_pos, self.last_calib_t = (best_det.x, best_det.y), data['t_cap']
+        elif not best_det:
+            self.last_raw_pos = None
 
         # 3. 跟踪计算
         active_data, last_residual = self._process_tracking(best_det, vis_shift[0], vis_shift[1], dt, data['t_cap'],
@@ -120,7 +124,7 @@ class WorldModel:
                 delta_tau = -(last_residual[0] * v[0] + last_residual[1] * v[1]) / v_sq
                 self.dynamic_lag = np.clip(self.dynamic_lag + delta_tau * self.lag_lr, 0.005, 0.150)
 
-        # 5. 深度耦合执行：立即计算控制器输出
+        # 5. 深度耦合执行
         final_move = None
         if active_data["is_valid"]:
             pred_x, pred_y = active_data["p_predict"]
@@ -128,14 +132,12 @@ class WorldModel:
                                                                     pred_y - self.crop_center)
             final_move = self.controller.compute(intent_x, intent_y, dt)
 
-            # 将结果写入 context 供 Main 打印和 Recorder 记录
             self._apply_to_context(context, active_data)
             context.dynamic_lag_ms = self.dynamic_lag * 1000
-            context.final_move = final_move  # 新增字段
+            context.final_move = final_move
 
         self.last_t_cap = current_time
         if is_new_frame: self.last_processed_fid = data['fid']
-
         return final_move
 
     def _process_tracking(self, best_det, vs_x, vs_y, dt, t_cap, is_new_frame):

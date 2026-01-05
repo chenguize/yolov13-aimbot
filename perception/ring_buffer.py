@@ -91,3 +91,24 @@ class RingBuffer:
         if total_moves == 0:
             return 0.0
         return ai_moves / total_moves
+
+    def get_human_delta_sum(self, t_start: float, t_end: float) -> Tuple[int, int]:
+        """
+        专门为自调参设计的接口：只返回人类手动操作的累积位移。
+        """
+        sum_x, sum_y = 0, 0
+        if t_start >= t_end:
+            return 0, 0
+
+        with self._lock:
+            for event in reversed(self._buffer):
+                if event.timestamp > t_end:
+                    continue
+                if event.timestamp < t_start:
+                    break
+
+                # 关键：只统计非 AI 事件，避免 AI 的位移污染校准基准
+                if not event.is_ai:
+                    sum_x += event.dx
+                    sum_y += event.dy
+        return sum_x, sum_y
