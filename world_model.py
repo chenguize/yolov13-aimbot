@@ -1,12 +1,9 @@
-# world_model.py
-# Phase 4 最终版：动态延迟补偿 + 智能搜索
 import time
-import math
 import threading
 import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, Dict, Tuple
 from config import config
 
 from perception.ring_buffer import RingBuffer
@@ -27,10 +24,8 @@ class TargetState:
 class SimpleKalman:
     def __init__(self):
         self.F = np.eye(4)
-        self.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
         self.R = np.eye(2) * config.getfloat("WorldModel", "kalman_R_pos", 5.0)
         self.Q = np.eye(4) * config.getfloat("WorldModel", "kalman_Q_proc", 0.5)
-        self.I = np.eye(4)
 
     def predict(self, state_obj: TargetState, dt: float):
         if dt <= 0: return
@@ -39,16 +34,17 @@ class SimpleKalman:
         state_obj.state = self.F @ state_obj.state
         state_obj.covariance = self.F @ state_obj.covariance @ self.F.T + self.Q
 
-    def update(self, state_obj: TargetState, measurement: np.ndarray):
-        z = measurement
-        y = z - (self.H @ state_obj.state)
-        S = self.H @ state_obj.covariance @ self.H.T + self.R
-        try:
-            K = state_obj.covariance @ self.H.T @ np.linalg.inv(S)
-        except np.linalg.LinAlgError:
-            return
+    def update(self, state_obj: TargetState, measurement: np.ndarray) -> np.ndarray:
+        y = measurement - state_obj.state[:2]
+        P = state_obj.covariance
+        S = P[:2, :2] + self.R
+        det = S[0, 0] * S[1, 1] - S[0, 1] * S[1, 0]
+        if abs(det) < 1e-9: return y
+        S_inv = np.array([[S[1, 1] / det, -S[0, 1] / det], [-S[1, 0] / det, S[0, 0] / det]])
+        K = P[:, :2] @ S_inv
         state_obj.state = state_obj.state + (K @ y)
-        state_obj.covariance = (self.I - K @ self.H) @ state_obj.covariance
+        state_obj.covariance = P - (K @ P[:2, :])
+        return y
 
 
 class WorldModel:
@@ -59,173 +55,128 @@ class WorldModel:
         self._latest_detection_data: Optional[Dict] = None
 
         self.capture_size = config.getint("General", "capture_size", 256)
-        self.crop_center_x = self.capture_size / 2
-        self.crop_center_y = self.capture_size / 2
-        self.search_fov = config.getfloat("WorldModel", "search_fov", 256.0)
+        self.crop_center = self.capture_size / 2
+        self.search_fov = config.getfloat("WorldModel", "search_fov", 100.0)
 
-        self.k_x = config.getfloat("AimStrategy", "k_factor_x", 1.0)
-        self.k_y = config.getfloat("AimStrategy", "k_factor_y", 1.0)
-
-        # [动态延迟配置]
-        self.enable_prediction = config.getbool("WorldModel", "enable_prediction", True)
-        # 硬件延迟是物理死值 (USB + 显示器响应)，通常 10-20ms，不会变
-        self.hardware_latency = config.getfloat("WorldModel", "hardware_latency", 0.015)
-
-        # 平均延迟平滑器 (防止某一帧波动太大)
-        self.avg_pipeline_latency = 0.02
-
+        # 耦合架构下，lag_queue 主要用于 TraceRecorder 记录，不再阻塞执行
         self.lag_queue = deque()
         self.last_t_cap = 0.0
         self.last_processed_fid = -1
+
+        # 内部集成策略与控制器
         self.strategy = create_aim_strategy()
+        from controllers.controller_factory import get_controller
+        self.controller = get_controller()
 
-    def update_detections(self, detections: List[list], frame_id: int, t_cap: float, t_done: float):
+        self.last_raw_pos: Optional[Tuple[float, float]] = None
+        self.last_calib_t: float = 0.0
+        self.dynamic_lag = config.getfloat("WorldModel", "perception_lag_ms", 20.0) / 1000.0
+        self.lag_lr = 0.01
+
+    def update_detections(self, detections: np.ndarray, frame_id: int, t_cap: float, t_done: float):
         with self._data_lock:
-            self._latest_detection_data = {
-                "dets": detections,
-                "fid": frame_id,
-                "t_cap": t_cap
-            }
+            self._latest_detection_data = {"dets": detections, "fid": frame_id, "t_cap": t_cap}
 
-    def step(self, context: InferenceContext, ring_buffer: RingBuffer):
+    def step(self, context: InferenceContext, ring_buffer: RingBuffer) -> Optional[Tuple[float, float]]:
+        """
+        耦合版 step: 直接返回需要执行的 (final_x, final_y)
+        """
         current_time = time.perf_counter()
-
-        data = None
         with self._data_lock:
             data = self._latest_detection_data
 
-        if not data:
+        if not data or (current_time - data['t_cap'] > 0.1):
             context.is_valid = False
-            return
-
-        # [核心逻辑] 动态计算这一帧处理了多久
-        # Latency = 当前时刻 - 截图时刻
-        current_pipeline_latency = current_time - data['t_cap']
-
-        # 熔断：如果延迟超过 200ms，说明卡死了，不要预测了
-        if current_pipeline_latency > 0.2:
-            current_pipeline_latency = 0.0
-            context.is_valid = False
-            return
-
-        # 平滑处理 (EMA)
-        self.avg_pipeline_latency = 0.8 * self.avg_pipeline_latency + 0.2 * current_pipeline_latency
-
-        # 总预测时间 = 动态软件延迟 + 静态硬件延迟
-        total_latency = current_pipeline_latency + self.hardware_latency
+            return None
 
         is_new_frame = (data['fid'] != self.last_processed_fid)
-        if is_new_frame:
-            self.last_processed_fid = data['fid']
 
-        mouse_x, mouse_y = ring_buffer.get_cursor_delta_sum(data['t_cap'], current_time)
-        px_shift_x = mouse_x / max(0.1, self.k_x)
-        px_shift_y = mouse_y / max(0.1, self.k_y)
-        vis_shift_x, vis_shift_y = -px_shift_x, -px_shift_y
+        # 1. 因果对冲
+        corrected_t_cap = data['t_cap'] - self.dynamic_lag
+        mouse_x, mouse_y = ring_buffer.get_cursor_delta_sum(corrected_t_cap, current_time)
+        px_shift_x, px_shift_y = self.strategy.reverse_map(mouse_x, mouse_y)
+        vis_shift = (-px_shift_x, -px_shift_y)
 
         best_det = self._select_target(data['dets'])
         dt = max(0.001, min(current_time - self.last_t_cap, 0.1))
 
-        # 将计算好的 total_latency 传进去
-        active_context_data = self._process_tracking(
-            best_det, vis_shift_x, vis_shift_y, dt,
-            data['t_cap'], is_new_frame, total_latency
-        )
-        active_context_data["raw_dets"] = data["dets"]
+        # 2. 自动校准灵敏度
+        if is_new_frame and best_det and self.current_target and self.current_target.id == best_det.class_id:
+            if self.last_raw_pos is not None:
+                raw_dx, raw_dy = best_det.x - self.last_raw_pos[0], best_det.y - self.last_raw_pos[1]
+                total_cx, total_cy = ring_buffer.get_cursor_delta_sum(self.last_calib_t, data['t_cap'])
+                self.strategy.feedback_update(total_cx, -raw_dx, total_cy, -raw_dy)
+            self.last_raw_pos, self.last_calib_t = (best_det.x, best_det.y), data['t_cap']
 
-        self.lag_queue.append({"timestamp": current_time, "data": active_context_data})
+        # 3. 跟踪计算
+        active_data, last_residual = self._process_tracking(best_det, vis_shift[0], vis_shift[1], dt, data['t_cap'],
+                                                            is_new_frame)
 
-        # 既然我们已经手动做了延迟补偿，Perception Lag 就可以设为 0 了
-        lag_seconds = 0.0
-        ready_context = None
-        while self.lag_queue and (current_time - self.lag_queue[0]["timestamp"]) >= lag_seconds:
-            ready_context = self.lag_queue.popleft()["data"]
+        # 4. 延迟观测器
+        if is_new_frame and self.current_target and last_residual is not None:
+            v = self.current_target.state[2:4]
+            v_sq = v[0] ** 2 + v[1] ** 2
+            if v_sq > 25.0:
+                delta_tau = -(last_residual[0] * v[0] + last_residual[1] * v[1]) / v_sq
+                self.dynamic_lag = np.clip(self.dynamic_lag + delta_tau * self.lag_lr, 0.005, 0.150)
 
-        if ready_context:
-            self._apply_to_context(context, ready_context)
-        else:
-            context.is_valid = False
+        # 5. 深度耦合执行：立即计算控制器输出
+        final_move = None
+        if active_data["is_valid"]:
+            pred_x, pred_y = active_data["p_predict"]
+            intent_x, intent_y = self.strategy.calculate_mouse_move(pred_x - self.crop_center,
+                                                                    pred_y - self.crop_center)
+            final_move = self.controller.compute(intent_x, intent_y, dt)
+
+            # 将结果写入 context 供 Main 打印和 Recorder 记录
+            self._apply_to_context(context, active_data)
+            context.dynamic_lag_ms = self.dynamic_lag * 1000
+            context.final_move = final_move  # 新增字段
 
         self.last_t_cap = current_time
+        if is_new_frame: self.last_processed_fid = data['fid']
 
-    def _process_tracking(self, best_det: Optional[Detection], vs_x: float, vs_y: float, dt: float,
-                          t_cap: float, is_new_frame: bool, pred_dt: float) -> Dict:
+        return final_move
+
+    def _process_tracking(self, best_det, vs_x, vs_y, dt, t_cap, is_new_frame):
         res = {"is_valid": False, "p_predict": (0, 0), "v_real": (0, 0), "conf": 0.0, "id": -1, "t_cap": t_cap}
-
         if not best_det:
             if self.current_target:
                 self.kalman.predict(self.current_target, dt)
-                if (time.perf_counter() - self.current_target.last_seen) > 0.1:
-                    self.current_target = None
-            return res
+                if (time.perf_counter() - self.current_target.last_seen) > 0.1: self.current_target = None
+            return res, None
 
         if not self.current_target or self.current_target.id != best_det.class_id:
-            self.current_target = TargetState(
-                id=best_det.class_id, first_seen=t_cap, last_seen=t_cap,
-                confidence=0.3
-            )
+            self.current_target = TargetState(id=best_det.class_id, first_seen=t_cap, last_seen=t_cap)
             self.current_target.state[:2] = [best_det.x + vs_x, best_det.y + vs_y]
 
         target = self.current_target
         self.kalman.predict(target, dt)
+        residual = self.kalman.update(target,
+                                      np.array([best_det.x + vs_x, best_det.y + vs_y])) if is_new_frame else None
+        if is_new_frame: target.last_seen = t_cap
 
-        if is_new_frame:
-            z = np.array([best_det.x + vs_x, best_det.y + vs_y])
-            self.kalman.update(target, z)
-            target.last_seen = t_cap
-
-        # --- 真正的动态预测 ---
-        curr_x, curr_y = target.state[0], target.state[1]
-        vel_x, vel_y = target.state[2], target.state[3]
-
-        if self.enable_prediction:
-            # 这里的 pred_dt 就是刚才动态算出来的 (软件耗时 + 硬件耗时)
-            pred_x = curr_x + vel_x * pred_dt
-            pred_y = curr_y + vel_y * pred_dt
-        else:
-            pred_x, pred_y = curr_x, curr_y
-
-        res.update({"is_valid": True, "p_predict": (pred_x, pred_y),
-                    "v_real": (vel_x, vel_y), "conf": 1.0, "id": target.id})
-        return res
+        res.update({"is_valid": True, "p_predict": (target.state[0], target.state[1]),
+                    "v_real": (target.state[2], target.state[3]), "conf": 1.0, "id": target.id})
+        return res, residual
 
     def _apply_to_context(self, context, data):
-        context.is_valid = data["is_valid"]
-        context.p_predict = data["p_predict"]
-        context.v_real = data["v_real"]
-        context.selected_id = data["id"]
-        context.t_cap = data["t_cap"]
-        context.conf = data["conf"]
-        if "raw_dets" in data and data["raw_dets"]:
-            context.targets = []
-            for d in data["raw_dets"]:
-                cx, cy = (d[0] + d[2]) / 2, (d[1] + d[3]) / 2
-                context.targets.append(
-                    Detection(x=cx, y=cy, w=d[2] - d[0], h=d[3] - d[1], conf=d[4], class_id=int(d[5]),
-                              xyxy=(d[0], d[1], d[2], d[3])))
-        else:
-            context.targets = []
+        context.is_valid, context.p_predict, context.v_real = data["is_valid"], data["p_predict"], data["v_real"]
+        context.selected_id, context.t_cap, context.conf = data["id"], data["t_cap"], data["conf"]
+        context.targets = [Detection(x=(d[0] + d[2]) / 2, y=(d[1] + d[3]) / 2, w=d[2] - d[0], h=d[3] - d[1], conf=d[4],
+                                     class_id=int(d[5]), xyxy=d[:4]) for d in data["raw_dets"]] if data.get(
+            "raw_dets") is not None else []
 
-    def _select_target(self, dets_raw: List[list]) -> Optional[Detection]:
-        if not dets_raw: return None
-        best_det, min_dist_sq = None, float('inf')
-
-        current_search_radius = self.search_fov
-        if self.current_target:
-            current_search_radius = min(self.search_fov, 512.0)
-
-        for d in dets_raw:
-            if int(d[5]) != 7: continue  # 必须是头
-
-            cx, cy = (d[0] + d[2]) / 2, (d[1] + d[3]) / 2
-            dx, dy = cx - self.crop_center_x, cy - self.crop_center_y
-
-            if abs(dx) > current_search_radius or abs(dy) > current_search_radius: continue
-
-            dist_sq = dx ** 2 + dy ** 2
-            if dist_sq < min_dist_sq:
-                min_dist_sq = dist_sq
-                best_det = Detection(x=cx, y=cy, w=d[2] - d[0], h=d[3] - d[1], conf=d[4], class_id=int(d[5]),
-                                     xyxy=(d[0], d[1], d[2], d[3]))
-
-        return best_det
+    def _select_target(self, dets: np.ndarray) -> Optional[Detection]:
+        if dets is None or len(dets) == 0: return None
+        candidates = dets[dets[:, 5] == 7]
+        if len(candidates) == 0: return None
+        cxs, cys = (candidates[:, 0] + candidates[:, 2]) * 0.5, (candidates[:, 1] + candidates[:, 3]) * 0.5
+        dxs, dys = cxs - self.crop_center, cys - self.crop_center
+        fov_mask = (np.abs(dxs) <= self.search_fov) & (np.abs(dys) <= self.search_fov)
+        if not np.any(fov_mask): return None
+        best_idx = np.argmin(dxs[fov_mask] ** 2 + dys[fov_mask] ** 2)
+        idx = np.where(fov_mask)[0][best_idx]
+        return Detection(x=float(cxs[idx]), y=float(cys[idx]), w=float(candidates[idx, 2] - candidates[idx, 0]),
+                         h=float(candidates[idx, 3] - candidates[idx, 1]), conf=float(candidates[idx, 4]),
+                         class_id=int(candidates[idx, 5]), xyxy=candidates[idx, :4])

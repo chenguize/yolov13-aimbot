@@ -41,24 +41,33 @@ class PROController(BaseController):
         dist_remaining = math.hypot(intent_dx, intent_dy)
 
         # [状态机重置]
-        # 如果距离变大 (>80px)，或者当前规划已结束，立即重新规划
-        if not self.is_planning or dist_remaining > 512.0:
+        # 增加灵敏度：如果目标剧烈移动（距离变化超过 30px），立即重置规划，重新爆发
+        # 原来的 512px 太大了，导致长距离跟枪时一直在这个慢速周期里
+        if not self.is_planning or dist_remaining > 512.0 or abs(dist_remaining - self.last_dist) > 30.0:
             self._plan_trajectory(intent_dx, intent_dy)
             self.start_time = current_time
             self.executed_pos = np.array([0.0, 0.0])
 
+        self.last_dist = dist_remaining  # 记录上一帧距离用于检测突变
+
         elapsed = current_time - self.start_time
 
-        # 防止除零错误
+        # [核心优化 1: 热启动]
+        # 欺骗算法，让它以为已经过了 15% 的时间。
+        # 这样起步就是最大速度，跳过了 Min-Jerk 的"墨迹"阶段
+        hot_start_offset = self.duration * 0.15
+        effective_elapsed = elapsed + hot_start_offset
+
         if self.duration <= 0.0001:
             tau = 1.0
         else:
-            tau = min(elapsed / self.duration, 1.0)
+            tau = min(effective_elapsed / self.duration, 1.0)
 
-        # [核心加速]
-        # 使用更激进的 5 次多项式，或者直接线性插值
-        # 这里保留 MinJerk 但时间被压缩了，所以看起来会很快
-        s_tau = 10 * (tau ** 3) - 15 * (tau ** 4) + 6 * (tau ** 5)
+        # [核心优化 2: 爆发曲线]
+        # 抛弃 S 曲线 (Slow-Fast-Slow)，改用 Ease-Out (Fast-Slow)
+        # s_tau = 1 - (1 - tau)^4
+        # 这种曲线起步极快，后段平滑吸附，像磁铁一样
+        s_tau = 1.0 - (1.0 - tau) ** 4
 
         # 动态终点更新
         current_total_goal_x = (self.executed_pos[0] + intent_dx) * self.current_overshoot_factor
@@ -70,22 +79,22 @@ class PROController(BaseController):
         step_x = ideal_x - self.executed_pos[0]
         step_y = ideal_y - self.executed_pos[1]
 
-        # 极速模式下减少抖动，只在轨迹中段轻微抖动
-        if self.enable_noise and 0.3 < tau < 0.7:
+        # 极速模式下只保留极微小的微调抖动
+        if self.enable_noise and 0.5 < tau < 0.9:
             nx, ny = self._generate_biometric_noise(tau)
-            step_x += nx
-            step_y += ny
+            # 降低抖动权重，避免影响吸附
+            step_x += nx * 0.3
+            step_y += ny * 0.3
 
         self.executed_pos[0] += step_x
         self.executed_pos[1] += step_y
 
         if tau >= 1.0:
             self.is_planning = False
-            # 结束时给予更强的吸附力 (0.5 -> 0.8)
-            return intent_dx * 0.8, intent_dy * 0.8
+            # 结束时给予 100% 的吸附力，不要 0.8，直接锁死
+            return intent_dx, intent_dy
 
         return self._apply_safety_limits(step_x, step_y)
-
     def _plan_trajectory(self, dx: float, dy: float):
         distance = math.hypot(dx, dy)
 
