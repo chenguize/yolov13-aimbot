@@ -1,143 +1,93 @@
-# controllers/pro_controller.py
-# Phase 4 仿生弹道规划器 (Turbo Edition / 极速解限版)
-# 专为 256x256 小范围截图优化，追求极致的锁敌速度
-
-import math
 import time
-import random
+import threading
 import numpy as np
 from typing import Tuple
 from .base_controller import BaseController
-from config import config
 
 
 class PROController(BaseController):
     """
-    PROController Turbo: 牺牲部分拟人化特征，换取极致的响应速度
+    PROController: 纯粹的轨迹规划器 (Motion Planner)
+    职责：
+    1. 接收目标位移 (intent)
+    2. 计算符合生物力学的速度曲线 (Minimum Jerk)
+    3. 处理动量融合 (Momentum Blending)
+
+    [变更] 不再包含任何 Trigger/开火判断逻辑
     """
 
     def __init__(self):
         super().__init__()
+        self.snap_duration = 0.08
+        self._lock = threading.Lock()
 
-        # --- 极速版默认参数 ---
-        # 正常人: a=0.12, b=0.05
-        # 职业哥: a=0.06, b=0.03
-        # 挂:     a=0.02, b=0.01 (几乎瞬移)
-        self.fitts_a = config.getfloat("Controller", "fitts_a", 0.02)
-        self.fitts_b = config.getfloat("Controller", "fitts_b", 0.01)
-
-        # 震颤幅度减小，因为速度太快了不需要太多抖动掩盖
-        self.enable_noise = config.getbool("Controller", "enable_biometric_noise", True)
-        self.noise_intensity = 0.02
-
-        self.is_planning = False
+        # 运动状态
         self.start_time = 0.0
-        self.duration = 0.0
-        self.executed_pos = np.array([0.0, 0.0])
-        self.current_overshoot_factor = 1.0
+        self.is_moving = False
+
+        # 轨迹控制 (float64 高精度)
+        self.start_counts = np.array([0.0, 0.0])
+        self.target_counts = np.array([0.0, 0.0])
+        self.current_counts = np.array([0.0, 0.0])
 
     def compute(self, intent_dx: float, intent_dy: float, dt: float) -> Tuple[float, float]:
-        current_time = time.perf_counter()
-        dist_remaining = math.hypot(intent_dx, intent_dy)
+        """
+        [主线程调用] 路径规划
+        注意：这里的距离判断是为了'动量融合'，属于运动学范畴，而非目标选择范畴。
+        """
+        if abs(intent_dx) < 1.0 and abs(intent_dy) < 1.0:
+            return 0.0, 0.0
 
-        # [状态机重置]
-        # 增加灵敏度：如果目标剧烈移动（距离变化超过 30px），立即重置规划，重新爆发
-        # 原来的 512px 太大了，导致长距离跟枪时一直在这个慢速周期里
-        if not self.is_planning or dist_remaining > 512.0 or abs(dist_remaining - self.last_dist) > 30.0:
-            self._plan_trajectory(intent_dx, intent_dy)
-            self.start_time = current_time
-            self.executed_pos = np.array([0.0, 0.0])
+        with self._lock:
+            now = time.perf_counter()
+            # 计算新目标绝对位置
+            new_target = self.current_counts + np.array([intent_dx, intent_dy])
+            dist_change = np.linalg.norm(new_target - self.target_counts)
 
-        self.last_dist = dist_remaining  # 记录上一帧距离用于检测突变
+            # 物理判定：如果目标位置突变（>5px），说明是新的甩枪，需要重置起点
+            # 如果变化很小，说明是跟踪微调，保留当前速度，只更新终点
+            if dist_change > 5.0 or not self.is_moving:
+                self.start_time = now
+                self.start_counts = self.current_counts.copy()
+                self.target_counts = new_target
+                self.is_moving = True
+            else:
+                self.target_counts = new_target
 
-        elapsed = current_time - self.start_time
+        return 0.0, 0.0
 
-        # [核心优化 1: 热启动]
-        # 欺骗算法，让它以为已经过了 15% 的时间。
-        # 这样起步就是最大速度，跳过了 Min-Jerk 的"墨迹"阶段
-        hot_start_offset = self.duration * 0.15
-        effective_elapsed = elapsed + hot_start_offset
+    def tick_mouse(self) -> Tuple[int, int]:
+        """
+        [MouseWorker线程调用] 执行 1ms 微步插值
+        """
+        if not self.is_moving: return 0, 0
 
-        if self.duration <= 0.0001:
-            tau = 1.0
-        else:
-            tau = min(effective_elapsed / self.duration, 1.0)
-
-        # [核心优化 2: 爆发曲线]
-        # 抛弃 S 曲线 (Slow-Fast-Slow)，改用 Ease-Out (Fast-Slow)
-        # s_tau = 1 - (1 - tau)^4
-        # 这种曲线起步极快，后段平滑吸附，像磁铁一样
-        s_tau = 1.0 - (1.0 - tau) ** 4
-
-        # 动态终点更新
-        current_total_goal_x = (self.executed_pos[0] + intent_dx) * self.current_overshoot_factor
-        current_total_goal_y = (self.executed_pos[1] + intent_dy) * self.current_overshoot_factor
-
-        ideal_x = current_total_goal_x * s_tau
-        ideal_y = current_total_goal_y * s_tau
-
-        step_x = ideal_x - self.executed_pos[0]
-        step_y = ideal_y - self.executed_pos[1]
-
-        # 极速模式下只保留极微小的微调抖动
-        if self.enable_noise and 0.5 < tau < 0.9:
-            nx, ny = self._generate_biometric_noise(tau)
-            # 降低抖动权重，避免影响吸附
-            step_x += nx * 0.3
-            step_y += ny * 0.3
-
-        self.executed_pos[0] += step_x
-        self.executed_pos[1] += step_y
-
-        if tau >= 1.0:
-            self.is_planning = False
-            # 结束时给予 100% 的吸附力，不要 0.8，直接锁死
-            return intent_dx, intent_dy
-
-        return self._apply_safety_limits(step_x, step_y)
-    def _plan_trajectory(self, dx: float, dy: float):
-        distance = math.hypot(dx, dy)
-
-        # [针对 256 截图的优化]
-        # 如果距离小于 30px (约屏幕的 1/8)，直接瞬移，不走 Fitts
-        if distance < 30.0:
-            self.duration = 0.005  # 5ms 极速
-            self.current_overshoot_factor = 1.0
-            self.is_planning = True
-            return
-
-        # Fitts Law 计算
-        W = 20.0
-        index_of_difficulty = math.log2(2 * distance / W + 1)
-        mt = self.fitts_a + self.fitts_b * index_of_difficulty
-
-        # [加速倍率] 强制将所有规划时间缩短 20%
-        self.duration = mt * 0.8
-
-        # 远距离依然保留一点点过冲，为了更自然的急停感
-        self.current_overshoot_factor = 1.0
-        if distance > 100:
-            self.current_overshoot_factor = random.uniform(1.01, 1.05)
-
-        self.is_planning = True
-
-    def _generate_biometric_noise(self, tau: float) -> Tuple[float, float]:
-        velocity_profile = 30 * (tau ** 2) - 60 * (tau ** 3) + 30 * (tau ** 4)
-        freq = random.uniform(10, 15)  # 提高频率
-        amp = self.noise_intensity * velocity_profile * 3.0
         t = time.perf_counter()
-        nx = math.sin(t * freq * 6.28) * amp
-        ny = math.cos(t * freq * 6.28) * amp
-        return nx, ny
 
-    def _apply_safety_limits(self, ux: float, uy: float) -> Tuple[float, float]:
-        if math.hypot(ux, uy) < 0.5: return 0.0, 0.0
+        with self._lock:
+            if np.isnan(self.target_counts).any() or np.isnan(self.current_counts).any():
+                self.is_moving = False
+                return 0, 0
 
-        # [放开限速] 允许单帧移动更多像素
-        max_step = config.getfloat("Controller", "max_step", 500.0)
-        mag = math.hypot(ux, uy)
-        if mag > max_step:
-            scale = max_step / mag
-            ux *= scale
-            uy *= scale
-        return ux, uy
+            elapsed = t - self.start_time
+
+            if elapsed >= self.snap_duration:
+                self.is_moving = False
+                delta = self.target_counts - self.current_counts
+                self.current_counts = self.target_counts.copy()
+                return int(delta[0]), int(delta[1])
+
+            tau = elapsed / self.snap_duration
+            s_val = 10 * (tau ** 3) - 15 * (tau ** 4) + 6 * (tau ** 5)
+
+            ideal_pos = self.start_counts + (self.target_counts - self.start_counts) * s_val
+            delta_float = ideal_pos - self.current_counts
+            move_x = int(delta_float[0])
+            move_y = int(delta_float[1])
+
+            if move_x != 0 or move_y != 0:
+                self.current_counts[0] += move_x
+                self.current_counts[1] += move_y
+                return move_x, move_y
+
+            return 0, 0
