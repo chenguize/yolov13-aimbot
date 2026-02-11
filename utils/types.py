@@ -4,11 +4,11 @@
 # 包含：
 # 1. FrameInfo (原子帧信息)
 # 2. Detection (标准化检测目标)
-# 3. InferenceContext (Structure B - 单帧任务单)
-# 4. StrategyResult (策略计算结果)
+# 3. StrategyResult (策略计算结果)
+# 4. InferenceContext (Structure B - 单帧任务单 - 修复版)
 
 from dataclasses import dataclass, field
-from typing import Tuple, List, Optional, Any
+from typing import Tuple, List, Optional
 import numpy as np
 
 
@@ -37,8 +37,8 @@ class Detection:
     conf: float  # 置信度
     class_id: int  # 类别 ID (0=Head, 1=Body, etc.)
 
-    # 原始检测框 (x1, y1, x2, y2)
-    xyxy: Tuple[float, float, float, float]
+    # 原始检测框 (x1, y1, x2, y2)，通常是 numpy 数组切片
+    xyxy: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -59,7 +59,7 @@ class StrategyResult:
 class InferenceContext:
     """
     [Structure B] 单帧推理上下文 / 任务单
-    这是 Phase 3 的核心载体，贯穿 WorldModel -> Strategy -> Controller。
+    这是 Phase 3 的核心载体，贯穿 WorldModel -> Strategy -> Controller -> Agent。
     """
     # --- 1. 时序信息 (Timing) ---
     t_cap: float = 0.0  # 截图时间 (来自 FrameInfo)
@@ -74,6 +74,12 @@ class InferenceContext:
     p_predict: Tuple[float, float] = (0.0, 0.0)  # 延迟补偿后的预测落点 (Screen Abs)
     is_valid: bool = False  # 本帧数据是否可信 (是否允许开火/瞄准)
 
-    # --- 4. 策略意图 (Strategy Intent) ---
-    # 这里存储 Strategy 计算出的原始建议，供 Controller 参考
+    # [关键修复] 目标置信度 (用于 Triggerbot 判定)
+    conf: float = 0.0
+
+    # --- 4. 调试与反馈 (Debug / Feedback) ---
+    dynamic_lag_ms: float = 0.0  # 当前系统计算出的动态延迟
+    final_move: Optional[Tuple[float, float]] = None  # 本帧计算出的鼠标移动量 (dx, dy)
+
+    # --- 5. 策略意图 (Strategy Intent - 可选) ---
     strategy_result: Optional[StrategyResult] = None
