@@ -47,54 +47,10 @@ class RingBuffer:
 
     def get_cursor_delta_sum(self, t_start: float, t_end: float) -> Tuple[int, int]:
         """
-        查询时间区间 [t_start, t_end] 内的累积位移。
-        WorldModel 用此接口来计算：
-        "从截图那一刻(t_start) 到现在(t_end)，准星自己动了多少？"
-        """
-        sum_x, sum_y = 0, 0
-
-        # 快速路径
-        if t_start >= t_end:
-            return 0, 0
-
-        with self._lock:
-            # 倒序遍历（因为大部分查询都是查最近的数据）
-            for event in reversed(self._buffer):
-                if event.timestamp > t_end:
-                    continue
-                if event.timestamp < t_start:
-                    break  # 已超出时间窗口，停止遍历
-
-                # 累加区间内的位移
-                sum_x += event.dx
-                sum_y += event.dy
-
-        return sum_x, sum_y
-
-    def get_ai_confidence(self, t_lookback: float = 0.5) -> float:
-        """
-        (可选) 分析最近 0.5s 内 AI 介入的程度。
-        用于判断"现在是不是 AI 在主导控制"。
-        """
-        now = time.perf_counter()
-        ai_moves = 0
-        total_moves = 0
-
-        with self._lock:
-            for event in reversed(self._buffer):
-                if now - event.timestamp > t_lookback:
-                    break
-                total_moves += abs(event.dx) + abs(event.dy)
-                if event.is_ai:
-                    ai_moves += abs(event.dx) + abs(event.dy)
-
-        if total_moves == 0:
-            return 0.0
-        return ai_moves / total_moves
-
-    def get_human_delta_sum(self, t_start: float, t_end: float) -> Tuple[int, int]:
-        """
-        专门为自调参设计的接口：只返回人类手动操作的累积位移。
+        [极其关键的修正]
+        查询时间区间内的【屏幕真实总位移】。
+        由于 Windows GetCursorPos (标记为 is_ai=False) 已经包含了人与 AI 的混合物理位移，
+        这里绝对不能把 is_ai=True 的数据再加进去，否则会引发致命的双重计算 (Double Counting)！
         """
         sum_x, sum_y = 0, 0
         if t_start >= t_end:
@@ -102,13 +58,41 @@ class RingBuffer:
 
         with self._lock:
             for event in reversed(self._buffer):
-                if event.timestamp > t_end:
-                    continue
-                if event.timestamp < t_start:
-                    break
+                if event.timestamp > t_end: continue
+                if event.timestamp < t_start: break
 
-                # 关键：只统计非 AI 事件，避免 AI 的位移污染校准基准
+                # ⚠️ 只累加外部捕获的真实物理位移
                 if not event.is_ai:
                     sum_x += event.dx
                     sum_y += event.dy
+
         return sum_x, sum_y
+
+    def get_ai_delta_sum(self, t_start: float, t_end: float) -> Tuple[int, int]:
+        """
+        统计 AI (gHub) 明确下发的已知位移指令。
+        """
+        sum_x, sum_y = 0, 0
+        if t_start >= t_end:
+            return 0, 0
+
+        with self._lock:
+            for event in reversed(self._buffer):
+                if event.timestamp > t_end: continue
+                if event.timestamp < t_start: break
+
+                if event.is_ai:
+                    sum_x += event.dx
+                    sum_y += event.dy
+
+        return sum_x, sum_y
+
+    def get_pure_human_delta_sum(self, t_start: float, t_end: float) -> Tuple[int, int]:
+        """
+        [实战核心接口] 剥离出真正的人类手腕发力物理量。
+        纯净人类位移 = 屏幕观测总位移 - AI 已知下发位移
+        """
+        total_dx, total_dy = self.get_cursor_delta_sum(t_start, t_end)
+        ai_dx, ai_dy = self.get_ai_delta_sum(t_start, t_end)
+
+        return total_dx - ai_dx, total_dy - ai_dy

@@ -38,40 +38,39 @@ class InferenceThread(threading.Thread):
         if self.model is None: return
 
         conf_thres = config.getfloat("Inference", "conf_threshold", 0.40)
-        # [YOLO26] iou_threshold 已不再需要 (无 NMS)
         max_det = config.getint("Inference", "max_det", 20)
         img_size = config.getint("General", "capture_size", 256)
 
-        # [算法优化] 确定要检测的目标 ID。假设 7 是敌人。
-        target_classes = [7]
+        # ⚠️ 记得把这里的 [7] 注释掉或者改成你的目标类别，否则依然会被强行过滤！
+        # target_classes = [7]
+
+        # 1️⃣ 新增：用于控制台打印的计时器
+        last_print_time = 0.0
 
         while not self.shutdown_event.is_set():
-            # 阻塞等待新帧信号，超时 5ms 防止死锁
             if not self.frame_ready_event.wait(timeout=0.005):
                 continue
 
             self.frame_ready_event.clear()
-
-            # 从总线拿数据
             frame_info = self.bus.get_latest()
 
             if frame_info is None or frame_info.frame_id <= self.last_processed_id:
                 continue
 
             try:
-                # [针对 YOLO26 的修改]
-                # 1. 移除了 agnostic_nms (无 NMS 架构)
-                # 2. 移除了 iou (不需要 IOU 抑制)
+                # 🌟 修复点 1：将 DXCam 的 RGB 转换为 YOLO 认识的 BGR，并强制内存连续以满足 TensorRT 胃口
+                bgr_frame = np.ascontiguousarray(frame_info.frame[..., ::-1])
+
+                # ⚠️ 将 source 替换为我们转换好的 bgr_frame
                 results = self.model.predict(
-                    source=frame_info.frame,
+                    source=bgr_frame,
                     imgsz=img_size,
-                    conf=conf_thres,     # 仍然需要 conf 过滤
-                    max_det=max_det,     # 仍然可以限制最大输出数量
-                    classes=target_classes, # GPU 层面直接过滤类别
+                    conf=conf_thres,
+                    max_det=max_det,
                     verbose=False,
                     device=0,
                     half=True,
-                    stream=True          # 流式推理
+                    stream=True
                 )
 
                 t_inference_done = time.perf_counter()
@@ -79,19 +78,29 @@ class InferenceThread(threading.Thread):
                 detections = np.empty((0, 6), dtype=np.float32)
                 for r in results:
                     if r.boxes is not None and len(r.boxes) > 0:
-                        # YOLO26 输出直接就是最终框
-                        # 数据格式依然是标准 [x1, y1, x2, y2, conf, cls]
                         detections = r.boxes.data.cpu().numpy()
                     break
+
+                now = time.perf_counter()
+                if now - last_print_time > 1.0:
+                    if len(detections) > 0:
+                        best_conf = detections[0][4]
+                        best_cls = int(detections[0][5])
+                        print(
+                            f"[Inference 🔍] 状态: 识别中 | 视野(256x256)内发现 {len(detections)} 个目标 | 最优: 类别 {best_cls}, 置信度 {best_conf:.2f}")
+                    else:
+                        print(f"[Inference 🔍] 状态: 识别中 | 视野(256x256)内没有任何符合的目标...")
+                    last_print_time = now
 
                 self.world_model.update_detections(
                     detections=detections,
                     frame_id=frame_info.frame_id,
-                    t_capture=frame_info.t_cap,  # [修复 2] 这里必须叫 t_capture，与 world_model 保持一致
+                    t_capture=frame_info.t_cap,
                     t_done=t_inference_done
                 )
 
                 self.last_processed_id = frame_info.frame_id
 
-            except Exception:
-                pass
+            except Exception as e:
+                # 🌟 修复点 2：绝不吞掉报错，大声喊出来！
+                print(f"[Inference 🔍] ⚠️ 识别线程崩溃: {e}")

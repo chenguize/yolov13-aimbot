@@ -24,6 +24,42 @@ logger = logging.getLogger("Agent")
 
 
 # ==============================================================================
+# 🌟 人物急停与运动状态监控器
+# ==============================================================================
+class MovementTracker:
+    def __init__(self):
+        # 虚拟键码 (WASD)
+        self.W = 0x57
+        self.A = 0x41
+        self.S = 0x53
+        self.D = 0x44
+
+        # 急停物理恢复时间 (Valorant 建议 0.08~0.12 秒，CS2 建议 0.15 秒)
+        self.stop_cooldown_duration = 0.10
+        self.last_moving_time = 0.0
+
+    def is_accurate_to_shoot(self) -> bool:
+        # 检测 WASD 是否有任意一个被按下 (最高位为 1 表示按下)
+        is_w = win32api.GetAsyncKeyState(self.W) & 0x8000
+        is_a = win32api.GetAsyncKeyState(self.A) & 0x8000
+        is_s = win32api.GetAsyncKeyState(self.S) & 0x8000
+        is_d = win32api.GetAsyncKeyState(self.D) & 0x8000
+
+        currently_moving = is_w or is_a or is_s or is_d
+        current_time = time.perf_counter()
+
+        if currently_moving:
+            self.last_moving_time = current_time
+            return False
+
+        # 检查松开按键后，是否度过了物理滑行期
+        if current_time - self.last_moving_time < self.stop_cooldown_duration:
+            return False
+
+        return True
+
+
+# ==============================================================================
 class HumanMouseListener(threading.Thread):
     def __init__(self, ring_buffer, shutdown_evt):
         super().__init__(name="HumanMouseListener", daemon=True)
@@ -145,9 +181,13 @@ class AIAgent:
         self.target_in_crosshair_time = 0.0
         self.is_target_in_crosshair = False
 
-        # [核心反作弊优化：Perlin 噪声的随机初始偏移量]
+        # 人机 Flick 状态检测
+        self._prev_human_flicking = False
+
+        # Perlin 噪声的随机初始偏移量
         self.noise_offset_x = random.uniform(0, 1000.0)
         self.noise_offset_y = random.uniform(0, 1000.0)
+        self.movement_tracker = MovementTracker()
 
         print("[Agent] Initialized. Ready to start.")
 
@@ -183,22 +223,25 @@ class AIAgent:
         if dt <= 0 or dt > 0.1:
             return
 
+        # 🌟 对齐点 1：目标无效时重置生命周期
         if not self.ctx.is_valid or not self.ctx.p_predict:
             self.target_first_seen_time = 0.0
             self.is_target_in_crosshair = False
+            if hasattr(self.controller, 'reset_target_state'):
+                self.controller.reset_target_state()
             return
 
         if self.target_first_seen_time == 0.0:
             self.target_first_seen_time = now
+            print(f"[{time.strftime('%H:%M:%S')}] 🎯 发现目标！")
+        dx_h_inst, dy_h_inst = self.ring_buffer.get_pure_human_delta_sum(now - dt, now)
+        human_vx_inst = dx_h_inst / dt if dt > 0 else 0.0
+        human_vy_inst = dy_h_inst / dt if dt > 0 else 0.0
 
-        dx_h, dy_h = self.ring_buffer.get_human_delta_sum(now - dt, now)
-        vx = dx_h / dt if dt > 0 else 0.0
-        vy = dy_h / dt if dt > 0 else 0.0
-
-        bbox_w = self.ctx.targets[0].w if self.ctx.targets else None
+        bbox_w = self.ctx.targets[0].w if self.ctx.targets else 60.0
 
         # ==============================================================================
-        # [核心反作弊优化：Perlin 噪声替代固定正弦波] 绝对无规律的连续漂移
+        # 视觉坐标映射与漂移
         # ==============================================================================
         noise_scale = 0.5
         amplitude = 3.0
@@ -213,21 +256,68 @@ class AIAgent:
         )
 
         v_real_pixels = self.ctx.v_real
-        intent_vx, intent_vy = self.aim_strategy.calculate_mouse_move(
+        intent_vx, intent_vy = self.aim_strategy.calculate_velocity_move(
             v_real_pixels[0], v_real_pixels[1], bbox_w=bbox_w
         )
 
-        pixel_error_dist = np.linalg.norm([self.ctx.p_predict[0], self.ctx.p_predict[1]])
-        spatial_factor = np.clip(1.0 - (pixel_error_dist / 128.0) ** 2, 0.1, 1.0)
+        a_real_pixels = getattr(self.ctx, 'a_real', (0.0, 0.0))
+        intent_ax, intent_ay = self.aim_strategy.calculate_velocity_move(
+            a_real_pixels[0], a_real_pixels[1], bbox_w=bbox_w
+        )
+
+        pixel_error_dist = np.linalg.norm([drifted_p_x, drifted_p_y])
+
+        # ==============================================================================
+        # 🌟 对齐点 4：将发力空间系数对齐到 800px 二次曲面衰减
+        # ==============================================================================
+        spatial_factor = np.clip(1.0 - (pixel_error_dist / 800.0) ** 2, 0.1, 1.0)
+
         time_since_seen = now - self.target_first_seen_time
         reaction_factor = np.clip(time_since_seen / 0.15, 0.0, 1.0)
 
-        power_factor = spatial_factor * reaction_factor
+        # ==============================================================================
+        # 🌟 对齐点 3：人机动态离合器 (基于距离自适应的人类优先阈值)
+        # ==============================================================================
+        dx_h_recent, dy_h_recent = self.ring_buffer.get_pure_human_delta_sum(now - 0.1, now)
+        human_speed = math.hypot(dx_h_recent, dy_h_recent) / 0.1
 
+        if pixel_error_dist < 40.0:
+            speed_thresh_min = 1200.0
+            speed_thresh_max = 2500.0
+        elif pixel_error_dist > 150.0:
+            speed_thresh_min = 150.0
+            speed_thresh_max = 800.0
+        else:
+            progress = (150.0 - pixel_error_dist) / 110.0
+            speed_thresh_min = 150.0 + progress * 1050.0
+            speed_thresh_max = 800.0 + progress * 1700.0
+
+        if human_speed > speed_thresh_max:
+            human_override_factor = 0.0
+        elif human_speed < speed_thresh_min:
+            human_override_factor = 1.0
+        else:
+            human_override_factor = 1.0 - ((human_speed - speed_thresh_min) / (speed_thresh_max - speed_thresh_min))
+
+        power_factor = spatial_factor * reaction_factor * human_override_factor
+
+        # ==============================================================================
+        # 🌟 对齐点 2：人类 Flick 结束边缘检测 (通知控制器清空积分)
+        # ==============================================================================
+        cur_human_flicking = human_speed > (speed_thresh_max * 0.7)
+        if self._prev_human_flicking and not cur_human_flicking:
+            if hasattr(self.controller, 'notify_flick_end'):
+                self.controller.notify_flick_end()
+        self._prev_human_flicking = cur_human_flicking
+
+        # 核心 LQR 计算
         self.controller.compute(
             target_x=intent_x, target_y=intent_y, dt=dt,
-            human_v=np.array([vx, vy]), v_real=np.array([intent_vx, intent_vy]),
-            power_factor=power_factor
+            human_v=np.array([human_vx_inst, human_vy_inst]),
+            v_real=np.array([intent_vx, intent_vy]),
+            a_real=np.array([intent_ax, intent_ay]),
+            power_factor=power_factor,
+            bbox_w=bbox_w
         )
 
         if self.enable_aimbot:
@@ -238,7 +328,8 @@ class AIAgent:
 
     def _check_and_trigger(self):
         if self._check_trigger_condition():
-            self._perform_shoot()
+            if self.movement_tracker.is_accurate_to_shoot():
+                self._perform_shoot()
 
     def _check_trigger_condition(self) -> bool:
         if not (self.enable_aimbot and self.enable_trigger and self.ctx.is_valid):
@@ -268,10 +359,6 @@ class AIAgent:
         dx_sum, dy_sum = self.ring_buffer.get_human_delta_sum(now - 0.2, now)
         human_movement_dist = math.hypot(dx_sum, dy_sum)
 
-        # ==============================================================================
-        # [核心反作弊优化：Gamma分布生理学延迟] 拥有真实的“拖沓长尾”
-        # ==============================================================================
-        # Gamma分布：shape=8.0, scale=0.0125 -> 均值约 100ms，最高允许到350ms大分心
         raw_reaction = np.random.gamma(shape=8.0, scale=0.0125)
         base_delay = np.clip(raw_reaction, 0.05, 0.35)
 

@@ -1,462 +1,302 @@
-# control_enhanced.py
-# 增强版仿真控制和诊断工具
-# 核心功能：
-# 1. 详细的性能分析
-# 2. 可视化诊断
-# 3. 原版vs修复版对比测试
-
+# control.py
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple
 
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+# ====================== 全局工具函数 ======================
+def safe_mean(arr, default=0.0):
+    return float(np.mean(arr)) if len(arr) > 0 else default
+
 
 def analyze_tracking_quality(logs: List[Dict]) -> Dict:
     """
-    分析跟踪质量
-
-    Returns:
-        包含多种性能指标的字典
+    Valorant-Specific Biomimetic Scoring v3.0
+    专为《无畏契约》定制：极短TTK + 严苛首发精度 + 微调拟人特征(Micro-correction) + 零高频抖动
     """
     if not logs:
         return {}
 
-    # 提取时间序列数据
-    times = np.array([log['t'] for log in logs])
-    targets = np.array([log['target'] for log in logs])
-    crosshairs = np.array([log['crosshair'] for log in logs])
+    kills_data = {}
+    for log in logs:
+        kid = log['kill_id']
+        kills_data.setdefault(kid, {'logs': [], 'mode': log['mode']})['logs'].append(log)
 
-    # ========== 精度指标 ==========
-    errors = targets - crosshairs
-    distances = np.linalg.norm(errors, axis=1)
-
-    mae = np.mean(distances)
-    rmse = np.sqrt(np.mean(distances ** 2))
-    max_error = np.max(distances)
-    p95_error = np.percentile(distances, 95)
-    p99_error = np.percentile(distances, 99)
-
-    # ========== 速度指标 ==========
-    dt = np.diff(times)
-    velocities = np.diff(crosshairs, axis=0) / dt[:, np.newaxis]
-    speeds = np.linalg.norm(velocities, axis=1)
-
-    mean_speed = np.mean(speeds)
-    max_speed = np.max(speeds)
-    speed_std = np.std(speeds)
-
-    # ========== 加速度指标 ==========
-    if len(velocities) > 1:
-        accelerations = np.diff(velocities, axis=0) / dt[1:, np.newaxis]
-        accels = np.linalg.norm(accelerations, axis=1)
-
-        mean_accel = np.mean(accels)
-        max_accel = np.max(accels)
-        accel_std = np.std(accels)
-    else:
-        mean_accel = max_accel = accel_std = 0.0
-
-    # ========== 平滑度指标（高频抖动）==========
-    jitter_x = np.std(np.diff(crosshairs[:, 0]))
-    jitter_y = np.std(np.diff(crosshairs[:, 1]))
-
-    # ========== 响应延迟估计 ==========
-    # 计算误差与目标速度的相位关系
-    if len(logs) > 10:
-        # 简化：使用误差峰值与目标峰值的时间差
-        target_peaks_x = np.where(np.diff(np.sign(np.diff(targets[:, 0]))) < 0)[0] + 1
-        error_peaks_x = np.where(np.diff(np.sign(np.diff(errors[:, 0]))) < 0)[0] + 1
-
-        if len(target_peaks_x) > 0 and len(error_peaks_x) > 0:
-            # 平均相位滞后
-            avg_lag_samples = np.mean([
-                np.abs(target_peaks_x[0] - ep)
-                for ep in error_peaks_x[:min(3, len(error_peaks_x))]
-            ])
-            avg_lag_time = avg_lag_samples * np.mean(dt) if len(dt) > 0 else 0.0
-        else:
-            avg_lag_time = 0.0
-    else:
-        avg_lag_time = 0.0
-
-    # ========== 模式统计 ==========
-    modes = [log.get('mode', 'unknown') for log in logs]
-    mode_counts = {}
-    for mode in modes:
-        mode_counts[mode] = mode_counts.get(mode, 0) + 1
-
-    # ========== 综合评分 ==========
-    # 评分公式：精度(60%) + 平滑度(20%) + 响应(20%)
-    accuracy_score = max(0, 100 - mae * 2)  # MAE<5px得满分
-    smoothness_score = max(0, 100 - jitter_x * 10)  # 低抖动得高分
-    responsiveness_score = max(0, 100 - avg_lag_time * 1000)  # 低延迟得高分
-
-    overall_score = (
-            accuracy_score * 0.6 +
-            smoothness_score * 0.2 +
-            responsiveness_score * 0.2
-    )
-
-    return {
-        # 精度指标
-        'mae': mae,
-        'rmse': rmse,
-        'max_error': max_error,
-        'p95_error': p95_error,
-        'p99_error': p99_error,
-
-        # 速度指标
-        'mean_speed': mean_speed,
-        'max_speed': max_speed,
-        'speed_std': speed_std,
-
-        # 加速度指标
-        'mean_accel': mean_accel,
-        'max_accel': max_accel,
-        'accel_std': accel_std,
-
-        # 平滑度指标
-        'jitter_x': jitter_x,
-        'jitter_y': jitter_y,
-
-        # 延迟估计
-        'avg_lag_time': avg_lag_time,
-
-        # 模式统计
-        'modes': modes,
-        'mode_distribution': mode_counts,
-
-        # 综合评分
-        'overall_score': overall_score,
-        'accuracy_score': accuracy_score,
-        'smoothness_score': smoothness_score,
-        'responsiveness_score': responsiveness_score
+    metrics = {
+        'pure_ai': {'acq_times': [], 'steady_maes': [], 'natural_scores': [], 'bio_bonuses': [], 'vel_rms': []},
+        'human_flick': {'recovery_times': [], 'steady_maes': [], 'natural_scores': [], 'bio_bonuses': [], 'vel_rms': []}
     }
 
+    print("\n" + "=" * 165)
+    print(
+        f"{'KillID':<6} | {'Mode':<10} | {'Acq/Rec(s)':<10} | {'SteadyMAE':<9} | {'Natural':<7} | {'BioBonus':<8} | {'VelRMS':<7} | Status")
+    print("=" * 165)
 
+    for kid, data in kills_data.items():
+        k_logs = data['logs']
+        if len(k_logs) < 12:
+            continue
+
+        times = np.array([l['t'] for l in k_logs])
+        targets = np.array([l['target'] for l in k_logs])
+        crosshairs = np.array([l['crosshair'] for l in k_logs])
+        errors = np.linalg.norm(targets - crosshairs, axis=1)
+        ai_factors = np.array([l.get('ai_factor', 1.0) for l in k_logs])
+
+        see_idx = next((i for i, l in enumerate(k_logs) if l.get('is_valid', False)), 0)
+
+        # 【锁定判定重构】：Valorant的头部很小，锁定阈值从 42px 缩紧到 15px
+        lock_idx = None
+        for i in range(see_idx, len(errors) - 10):
+            if errors[i] < 15.0 and np.all(errors[i:i + 10] < 22.0):
+                lock_idx = i
+                break
+        if lock_idx is None:
+            lock_idx = see_idx + min(60, len(errors) - see_idx - 1)
+
+        phase_time = times[lock_idx] - times[see_idx]
+        steady_errors = errors[lock_idx:]
+
+        raw_mae = float(np.mean(steady_errors)) if len(steady_errors) > 0 else 0.0
+
+        # ==================== Naturalness v3.0 (Valorant Edition) ====================
+        vel_rms = 0.0
+        natural_score = 75.0
+        if len(k_logs) > 5:
+            dt_arr = np.diff(times)
+            dt_arr[dt_arr < 1e-6] = 0.002
+            vels = np.diff(crosshairs, axis=0) / dt_arr[:, None]
+            vel_rms = float(np.mean(np.linalg.norm(vels, axis=1)))
+
+            # 取消对高速度的惩罚（允许拉枪），但极度惩罚高频加速度（机械抖动）
+            accel = np.diff(vels, axis=0)
+            high_freq = float(np.mean(np.abs(accel[::2])))
+            hf_penalty = max(0.0, high_freq / 40.0 * 25.0)  # 对高频颤抖更加敏感
+
+            # 如果锁定时完全不动（像机器死锁），给予惩罚；需要有极其微弱的呼吸游离
+            dead_lock_penalty = 15.0 if float(np.std(crosshairs[lock_idx:, 0])) < 0.1 else 0.0
+
+            natural_score = np.clip(100.0 - hf_penalty - dead_lock_penalty, 0.0, 100.0)
+
+        # ==================== Biomimetic Micro-correction v3.0 ====================
+        # 奖励瓦罗兰特特征的微调：高速甩枪 -> 降速停顿且存在2~8px误差 -> 二次修正入魂
+        bio_bonus = 0.0
+        if lock_idx > see_idx + 5 and len(steady_errors) > 5:
+            pre_lock_err = errors[lock_idx - 5: lock_idx]
+            # 检查锁定前夕是否出现了轻微的 Under-flick 或 Over-flick（误差在 2 到 10 之间）
+            if np.max(pre_lock_err) > 2.0 and np.min(pre_lock_err) < 18.0:
+                # 检查这段时间内速度是否有明显下降（人类大脑在确认目标位置的短暂降速）
+                pre_lock_dt = times[lock_idx] - times[lock_idx - 5]
+                if pre_lock_dt > 0.008:  # 至少有短暂的停顿期
+                    bio_bonus += 30.0
+
+            # 如果 AI 是以一条极其完美的直线零误差砸在目标上（误差瞬间从几十掉到 <1.0），说明极其机械
+            if errors[lock_idx] < 1.0 and np.mean(errors[lock_idx:lock_idx + 5]) < 1.0:
+                bio_bonus -= 40.0  # 扣除死锁分
+
+        bio_bonus = np.clip(bio_bonus, 0.0, 100.0)
+
+        # 记录
+        mode_key = data['mode']
+        if mode_key == 'human_flick':
+            takeover_idx = see_idx
+            for i in range(see_idx, len(ai_factors)):
+                if ai_factors[i] > 0.45 and (i == see_idx or ai_factors[i - 1] <= 0.45):
+                    takeover_idx = i
+                    break
+            recovery_time = times[lock_idx] - times[takeover_idx] if lock_idx > takeover_idx else phase_time
+            metrics['human_flick']['recovery_times'].append(recovery_time)
+        else:
+            metrics['pure_ai']['acq_times'].append(phase_time)
+
+        metrics[mode_key]['steady_maes'].append(raw_mae)
+        metrics[mode_key]['natural_scores'].append(natural_score)
+        metrics[mode_key]['bio_bonuses'].append(bio_bonus)
+        metrics[mode_key]['vel_rms'].append(vel_rms)
+
+        # 【瓦罗兰特严苛评级标准】
+        status = "✅ 爆头"
+        if phase_time > 0.28:
+            status = "⚠️ 反应慢"
+        elif phase_time < 0.12:
+            status = "🤖 机器瞬锁"
+
+        if raw_mae > 12.0: status += " ⚠️ 空枪"
+
+        if natural_score < 60: status += " (高频抖动)"
+        if bio_bonus > 20: status += " ✨真人类微调"
+
+        print(f"{kid:<6} | {'🧑 人机' if mode_key == 'human_flick' else '🤖 纯AI':<10} | "
+              f"{phase_time:<10.3f} | {raw_mae:<9.2f} | {natural_score:<7.1f} | "
+              f"+{bio_bonus:<6.1f} | {vel_rms:<7.0f} | {status}")
+
+        # ====================== 最终评分 (V5.5 真实 Hitbox 版) ======================
+    acq_all = metrics['pure_ai']['acq_times'] + metrics['human_flick'].get('recovery_times', [])
+    mean_ttk = safe_mean(acq_all)
+    acq_score = np.clip(100.0 - max(0.0, mean_ttk - 0.24) * 250.0, 0.0, 100.0)
+
+    # 精度评分：允许 5px 以内的绝对完美，5px~15px 缓慢扣分（对应打在头边缘）
+    mean_err = safe_mean(metrics['pure_ai']['steady_maes'] + metrics['human_flick']['steady_maes'])
+    precision_score = np.clip(100.0 - max(0.0, mean_err - 5.0) * 8.0, 0.0, 100.0)
+
+    natural_avg = safe_mean(metrics['pure_ai']['natural_scores'] + metrics['human_flick']['natural_scores'])
+    bio_avg = safe_mean(metrics['pure_ai']['bio_bonuses'] + metrics['human_flick']['bio_bonuses'])
+
+    overall_score = 0.35 * acq_score + 0.35 * precision_score + 0.15 * natural_avg + 0.15 * bio_avg
+
+    analysis = {
+        'total_kills': len(metrics['pure_ai']['steady_maes']) + len(metrics['human_flick']['steady_maes']),
+        'overall_score': float(overall_score),
+        'acq_score': float(acq_score),
+        'precision_score': float(precision_score),
+        'natural_score': float(natural_avg),
+        'bio_bonus': float(bio_avg),
+        'ttk_base_score': float((acq_score + precision_score) / 2),
+        'jitter_penalty': float(max(0.0, (100 - natural_avg) * 1.4)),
+        # MAE 惩罚放宽：8像素以内完全免罚
+        'mae_penalty': float(max(0.0, (mean_err - 8.0) * 3.0)),
+        'metrics': metrics,
+    }
+
+    print("\n" + "=" * 102)
+    print(f"🎯 Valorant Biomimetic v3.0 Final Score: {overall_score:.1f}/100")
+    print(f"   TTK (Acq/Rec) : {acq_score:.1f} | Headshot Precision : {precision_score:.1f}")
+    print(f"   Smooth & Stop : {natural_avg:.1f} | Micro-adjust Bonus : +{bio_avg:.1f}")
+    print("=" * 102)
+
+    return analysis
 def plot_diagnostics(logs: List[Dict], analysis: Dict, title_prefix: str = ""):
-    """
-    绘制详细诊断图表
-    """
-    times = np.array([log['t'] for log in logs])
-    targets = np.array([log['target'] for log in logs])
-    crosshairs = np.array([log['crosshair'] for log in logs])
-    errors = targets - crosshairs
-    distances = np.linalg.norm(errors, axis=1)
+    """绘制带 NAN 断点的图表"""
+    plot_times = []
+    plot_targets_x, plot_targets_y = [], []
+    plot_cross_x,   plot_cross_y   = [], []
+
+    last_kid = logs[0]['kill_id']
+    for log in logs:
+        if log['kill_id'] != last_kid:
+            for arr in [plot_times, plot_targets_x, plot_targets_y, plot_cross_x, plot_cross_y]:
+                arr.append(np.nan)
+            last_kid = log['kill_id']
+        plot_times.append(log['t'])
+        plot_targets_x.append(log['target'][0])
+        plot_targets_y.append(log['target'][1])
+        plot_cross_x.append(log['crosshair'][0])
+        plot_cross_y.append(log['crosshair'][1])
 
     fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    gs  = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.2)
+    fig.suptitle(
+        f"{title_prefix} test result | kills: {analysis['total_kills']} | "
+        f"score: {analysis['overall_score']:.1f}  "
+        f"(TTK: {analysis['ttk_base_score']:.1f} "
+        f"- jitter: {analysis['jitter_penalty']:.1f} "
+        f"- MAE: {analysis['mae_penalty']:.1f})",
+        fontsize=14, fontweight='bold'
+    )
 
-    main_title = f"{title_prefix}诊断报告 | 综合评分: {analysis['overall_score']:.1f}/100"
-    fig.suptitle(main_title, fontsize=16, fontweight='bold')
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(plot_targets_x, plot_targets_y, 'r--', alpha=0.5, label='Target')
+    ax1.plot(plot_cross_x,   plot_cross_y,   'b-',  alpha=0.8, label='Crosshair')
+    ax1.set_title('2D Target Switching Map')
+    ax1.axis('equal')
 
-    # ========== 1. X轴跟踪 ==========
-    ax = fig.add_subplot(gs[0, 0])
-    ax.plot(times, targets[:, 0], 'r--', linewidth=2, label='Target X', alpha=0.7)
-    ax.plot(times, crosshairs[:, 0], 'g-', linewidth=1.5, label='Crosshair X')
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('X Position [px]')
-    ax.set_title('X-Axis Tracking')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.plot(plot_times, plot_targets_x, 'r--', alpha=0.6)
+    ax2.plot(plot_times, plot_cross_x,   'g-')
+    ax2.set_title('X-Axis Tracking')
 
-    # ========== 2. Y轴跟踪 ==========
-    ax = fig.add_subplot(gs[0, 1])
-    ax.plot(times, targets[:, 1], 'r--', linewidth=2, label='Target Y', alpha=0.7)
-    ax.plot(times, crosshairs[:, 1], 'b-', linewidth=1.5, label='Crosshair Y')
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Y Position [px]')
-    ax.set_title('Y-Axis Tracking')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.plot(plot_times, plot_targets_y, 'r--', alpha=0.6)
+    ax3.plot(plot_times, plot_cross_y,   'b-')
+    ax3.set_title('Y-Axis Tracking')
 
-    # ========== 3. 误差时间序列 ==========
-    ax = fig.add_subplot(gs[0, 2])
-    ax.plot(times, distances, color='orange', linewidth=1.5, label='Distance Error')
-    ax.axhline(analysis['mae'], color='green', linestyle='--',
-               linewidth=2, label=f'MAE: {analysis["mae"]:.2f}px')
-    ax.axhline(analysis['p95_error'], color='red', linestyle='--',
-               linewidth=1, label=f'P95: {analysis["p95_error"]:.2f}px')
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Error [px]')
-    ax.set_title('Tracking Error Over Time')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # ========== 4. 误差分布直方图 ==========
-    ax = fig.add_subplot(gs[1, 0])
-    ax.hist(distances, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
-    ax.axvline(analysis['mae'], color='green', linestyle='--',
-               linewidth=2, label=f'MAE: {analysis["mae"]:.2f}px')
-    ax.axvline(analysis['p95_error'], color='red', linestyle='--',
-               linewidth=2, label=f'P95: {analysis["p95_error"]:.2f}px')
-    ax.set_xlabel('Error [px]')
-    ax.set_ylabel('Frequency')
-    ax.set_title('Error Distribution')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # ========== 5. 速度曲线 ==========
-    ax = fig.add_subplot(gs[1, 1])
-    if len(times) > 1:
-        dt = np.diff(times)
-        velocities = np.diff(crosshairs, axis=0) / dt[:, np.newaxis]
-        speeds = np.linalg.norm(velocities, axis=1)
-        ax.plot(times[1:], speeds, color='purple', linewidth=1.5)
-        ax.axhline(analysis['mean_speed'], color='blue', linestyle='--',
-                   linewidth=1, label=f'Mean: {analysis["mean_speed"]:.1f}px/s')
-        ax.axhline(analysis['max_speed'], color='red', linestyle=':',
-                   linewidth=1, label=f'Max: {analysis["max_speed"]:.1f}px/s')
-        ax.set_xlabel('Time [s]')
-        ax.set_ylabel('Speed [px/s]')
-        ax.set_title('Crosshair Speed')
-        ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # ========== 6. 加速度曲线 ==========
-    ax = fig.add_subplot(gs[1, 2])
-    if len(times) > 2:
-        dt = np.diff(times)
-        velocities = np.diff(crosshairs, axis=0) / dt[:, np.newaxis]
-        accelerations = np.diff(velocities, axis=0) / dt[1:, np.newaxis]
-        accels = np.linalg.norm(accelerations, axis=1)
-        ax.plot(times[2:], accels, color='brown', linewidth=1.5)
-        ax.axhline(analysis['mean_accel'], color='blue', linestyle='--',
-                   linewidth=1, label=f'Mean: {analysis["mean_accel"]:.1f}px/s²')
-        ax.set_xlabel('Time [s]')
-        ax.set_ylabel('Acceleration [px/s²]')
-        ax.set_title('Crosshair Acceleration')
-        ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # ========== 7. 2D轨迹图 ==========
-    ax = fig.add_subplot(gs[2, 0])
-    ax.plot(targets[:, 0], targets[:, 1], 'r--', linewidth=2,
-            label='Target', alpha=0.6)
-    ax.plot(crosshairs[:, 0], crosshairs[:, 1], 'g-', linewidth=1.5,
-            label='Crosshair', alpha=0.8)
-    ax.set_xlabel('X Position [px]')
-    ax.set_ylabel('Y Position [px]')
-    ax.set_title('2D Trajectory')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.axis('equal')
-
-    # ========== 8. X误差分量 ==========
-    ax = fig.add_subplot(gs[2, 1])
-    ax.plot(times, errors[:, 0], color='coral', linewidth=1.5)
-    ax.axhline(0, color='black', linestyle='-', linewidth=0.5)
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('X Error [px]')
-    ax.set_title('X-Axis Error')
-    ax.grid(True, alpha=0.3)
-
-    # ========== 9. Y误差分量 ==========
-    ax = fig.add_subplot(gs[2, 2])
-    ax.plot(times, errors[:, 1], color='teal', linewidth=1.5)
-    ax.axhline(0, color='black', linestyle='-', linewidth=0.5)
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Y Error [px]')
-    ax.set_title('Y-Axis Error')
-    ax.grid(True, alpha=0.3)
+    ax4 = fig.add_subplot(gs[1, 1])
+    err = np.sqrt(
+        (np.array(plot_targets_x) - np.array(plot_cross_x)) ** 2 +
+        (np.array(plot_targets_y) - np.array(plot_cross_y)) ** 2
+    )
+    ax4.plot(plot_times, err, color='orange')
+    ax4.axhline(25.0, color='green', linestyle='--', label='deadzone')
+    ax4.set_title('Error Distance & Deadzone')
 
     plt.show()
-
-
 def print_analysis_report(analysis: Dict, prefix: str = ""):
-    """打印详细分析报告"""
+    m = analysis['metrics']
+    print("\n" + "=" * 75)
+    print(f"🎮 {prefix} Valorant Biomimetic v3.0 深度诊断报告")
+    print("=" * 75)
+    print(f"【综合得分】: {analysis['overall_score']:8.1f} / 100")
+    print(f"  TTK (Acq/Rec): {analysis['acq_score']:6.1f}   精度: {analysis['precision_score']:6.1f}")
+    print(f"  平滑与急停   : {analysis['natural_score']:6.1f}   微调奖励: +{analysis['bio_bonus']:.1f}")
+    print("-" * 75)
 
-    print("\n" + "=" * 70)
-    print(f"📊 {prefix}跟踪质量分析报告")
-    print("=" * 70)
+    if m['pure_ai']['acq_times']:
+        print(f"🤖 [纯 AI 模式]")
+        print(f"   - 平均 TTK: {safe_mean(m['pure_ai']['acq_times']):.3f}s | "
+              f"平均误差: {safe_mean(m['pure_ai']['steady_maes']):.2f}px | "
+              f"自然度: {safe_mean(m['pure_ai']['natural_scores']):.1f} | "
+              f"微调: +{safe_mean(m['pure_ai']['bio_bonuses']):.1f}")
 
-    print("\n【精度指标】")
-    print(f"  MAE (平均绝对误差):     {analysis['mae']:8.2f} px")
-    print(f"  RMSE (均方根误差):      {analysis['rmse']:8.2f} px")
-    print(f"  最大误差:               {analysis['max_error']:8.2f} px")
-    print(f"  P95 误差:              {analysis['p95_error']:8.2f} px")
-    print(f"  P99 误差:              {analysis['p99_error']:8.2f} px")
-
-    print("\n【运动特性】")
-    print(f"  平均速度:               {analysis['mean_speed']:8.1f} px/s")
-    print(f"  最大速度:               {analysis['max_speed']:8.1f} px/s")
-    print(f"  速度标准差:             {analysis['speed_std']:8.1f} px/s")
-    print(f"  平均加速度:             {analysis['mean_accel']:8.1f} px/s²")
-    print(f"  最大加速度:             {analysis['max_accel']:8.1f} px/s²")
-    print(f"  加速度标准差:           {analysis['accel_std']:8.1f} px/s²")
-
-    print("\n【平滑度指标】")
-    print(f"  X轴抖动 (std):         {analysis['jitter_x']:8.2f} px")
-    print(f"  Y轴抖动 (std):         {analysis['jitter_y']:8.2f} px")
-
-    print("\n【响应延迟】")
-    print(f"  估计延迟:               {analysis['avg_lag_time'] * 1000:8.1f} ms")
-
-    print("\n【模式分布】")
-    total_frames = len(analysis['modes'])
-    for mode, count in analysis['mode_distribution'].items():
-        percentage = (count / total_frames) * 100
-        print(f"  {mode:12s}: {count:6d} 次 ({percentage:5.1f}%)")
-
-    print("\n【综合评分】")
-    print(f"  精度评分:               {analysis['accuracy_score']:8.1f} / 100")
-    print(f"  平滑度评分:             {analysis['smoothness_score']:8.1f} / 100")
-    print(f"  响应性评分:             {analysis['responsiveness_score']:8.1f} / 100")
-    print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"  总分:                   {analysis['overall_score']:8.1f} / 100")
-
-    # 评级
-    score = analysis['overall_score']
-    if score >= 90:
-        grade = "🌟 卓越 (Excellent)"
-    elif score >= 75:
-        grade = "✅ 优秀 (Good)"
-    elif score >= 60:
-        grade = "⚠️  合格 (Fair)"
-    else:
-        grade = "❌ 需要改进 (Poor)"
-
-    print(f"  等级:                   {grade}")
-    print("=" * 70 + "\n")
-
+    if m['human_flick'].get('recovery_times'):
+        print(f"🧑 [人机协同模式]")
+        print(f"   - 平均恢复时间: {safe_mean(m['human_flick']['recovery_times']):.3f}s | "
+              f"平均误差: {safe_mean(m['human_flick']['steady_maes']):.2f}px | "
+              f"自然度: {safe_mean(m['human_flick']['natural_scores']):.1f} | "
+              f"微调: +{safe_mean(m['human_flick']['bio_bonuses']):.1f}")
 
 def run_simulation_with_diagnostics(
-        duration: float = 8.0,
-        plot: bool = True,
-        verbose: bool = True,
-        use_fixed: bool = True
+    plot: bool = True,
+    verbose: bool = True,
+    use_fixed: bool = True,
+    duration: float = 60.0,
+    params: Dict = None,
 ) -> Tuple[float, float, Dict]:
-    """
-    运行带完整诊断的仿真
+    from sim_agent import SimAIAgent
+    from config import config
+    config.reload()
 
-    Args:
-        duration: 仿真时长（秒）
-        plot: 是否绘图
-        verbose: 是否打印详细报告
-        use_fixed: 是否使用修复版控制器
-    """
-    # 选择版本
-    if use_fixed:
-        try:
-            from sim_agent_improved import SimAIAgent
-            print("✅ 使用修复版控制器")
-        except ImportError:
-            print("⚠️  修复版未找到，使用原版")
-            from sim_agent import SimAIAgent
-    else:
-        from sim_agent import SimAIAgent
-        print("📌 使用原版控制器")
+    if params is not None:
+        original_getfloat = config.getfloat
+        def override_getfloat(section, key, fallback=None):
+            if key in params:
+                return float(params[key])
+            if key == "base_hardware_lag" and "fixed_lead_time" in params:
+                return float(params["fixed_lead_time"])
+            return original_getfloat(section, key, fallback)
+        config.getfloat = override_getfloat
 
     agent = SimAIAgent()
-
-    # 固定时间步长仿真
-    fixed_dt = 0.002  # 2ms
-    sim_time = 0.0
-    next_step_time = time.perf_counter()
-
-    logs = []
-
-    print(f"▶ 运行仿真 (dt={fixed_dt * 1000:.1f}ms, duration={duration}s)")
-
-    while sim_time < duration:
-        now = time.perf_counter()
-
-        # 精确时间控制
-        if now < next_step_time:
-            time.sleep(max(0, next_step_time - now))
-
-        # 执行仿真步骤
-        agent.step()
-
-        # 记录日志
-        logs.append({
-            't': sim_time,
-            'target': agent.enemy_pos.copy(),
-            'crosshair': agent.crosshair_pos.copy(),
-            'velocity': agent.ctx.v_real if agent.ctx.v_real else (0, 0),
-            'mode': agent.world_model.controller.mode
-        })
-
-        sim_time += fixed_dt
-        next_step_time += fixed_dt
-
-    # 分析结果
-    analysis = analyze_tracking_quality(logs)
+    sim_time, fixed_dt, logs = 0.0, 0.002, []
 
     if verbose:
-        prefix = "修复版 " if use_fixed else "原版 "
-        print_analysis_report(analysis, prefix)
+        print(f"▶ 正在载入实战模拟环境...")
 
+    while not agent.is_done and sim_time < duration:
+        agent.step()
+        logs.append({
+            't':        sim_time,
+            'target':   agent.enemy_pos.copy(),
+            'crosshair':agent.crosshair_pos.copy(),
+            'kill_id':  agent.kill_count,
+            'mode':     agent.chase_mode,
+            'is_valid': agent.ctx.p_predict is not None,
+            'ai_factor':getattr(agent, 'last_ai_factor', 1.0),
+        })
+        sim_time += fixed_dt
+
+    analysis = analyze_tracking_quality(logs)
+    if verbose:
+        print_analysis_report(analysis, "Optuna 调参版" if params else "诊断版")
     if plot:
-        title_prefix = "修复版 " if use_fixed else "原版 "
-        plot_diagnostics(logs, analysis, title_prefix)
+        plot_diagnostics(logs, analysis, "诊断版")
 
-    return analysis['mae'], analysis['rmse'], analysis
+    if params is not None:
+        config.getfloat = original_getfloat
 
-
-def compare_versions(duration: float = 8.0):
-    """
-    对比原版和修复版性能
-    """
-    print("\n" + "=" * 70)
-    print("🔬 开始版本对比测试")
-    print("=" * 70)
-
-    # 测试原版
-    print("\n📍 测试原版控制器...")
-    mae_orig, rmse_orig, analysis_orig = run_simulation_with_diagnostics(
-        duration=duration,
-        plot=False,
-        verbose=False,
-        use_fixed=False
-    )
-    print_analysis_report(analysis_orig, "原版")
-
-    # 测试修复版
-    print("\n📍 测试修复版控制器...")
-    mae_fixed, rmse_fixed, analysis_fixed = run_simulation_with_diagnostics(
-        duration=duration,
-        plot=False,
-        verbose=False,
-        use_fixed=True
-    )
-    print_analysis_report(analysis_fixed, "修复版")
-
-    # 对比报告
-    print("\n" + "=" * 70)
-    print("📊 版本对比总结")
-    print("=" * 70)
-
-    improvement_mae = (mae_orig - mae_fixed) / mae_orig * 100
-    improvement_score = (
-            analysis_fixed['overall_score'] - analysis_orig['overall_score']
-    )
-
-    print(f"\n{'指标':<20} {'原版':>12} {'修复版':>12} {'改进':>12}")
-    print("-" * 70)
-    print(f"{'MAE (px)':<20} {mae_orig:>12.2f} {mae_fixed:>12.2f} {improvement_mae:>11.1f}%")
-    print(f"{'RMSE (px)':<20} {rmse_orig:>12.2f} {rmse_fixed:>12.2f}")
-    print(f"{'综合评分':<20} {analysis_orig['overall_score']:>12.1f} "
-          f"{analysis_fixed['overall_score']:>12.1f} {improvement_score:>+11.1f}")
-    print("-" * 70)
-
-    if improvement_mae > 0:
-        print(f"\n✅ 修复版性能提升 {improvement_mae:.1f}%")
-    else:
-        print(f"\n⚠️  修复版性能下降 {abs(improvement_mae):.1f}%")
-
-    print("=" * 70 + "\n")
+    return 0.0, 0.0, analysis
 
 
 if __name__ == "__main__":
-    # 单独测试修复版
-    print("🚀 测试修复版控制器")
-    mae, rmse, analysis = run_simulation_with_diagnostics(
-        duration=8.0,
-        plot=True,
-        verbose=True,
-        use_fixed=True
-    )
-
-    # 可选：运行对比测试
-    # compare_versions(duration=8.0)
+    run_simulation_with_diagnostics(use_fixed=True)

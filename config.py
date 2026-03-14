@@ -89,7 +89,8 @@ class Config:
         if not val:
             return default or []
         return [item.strip() for item in val.split(',') if item.strip()]
-
+    def reload(self):
+        self._load()
 
 # 全局单例访问 - 提供全局配置访问接口
 config = Config()

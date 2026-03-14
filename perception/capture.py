@@ -11,7 +11,7 @@ class CaptureThread(threading.Thread):
         super().__init__(name="CaptureThread", daemon=True)
         self.bus = bus
         self.shutdown_event = shutdown_event
-        self.frame_ready_event = frame_ready_event  # [新增] 同步信号
+        self.frame_ready_event = frame_ready_event
 
         self.target_fps = config.getint("General", "capture_fps_target", 240)
         self.capture_size = config.getint("General", "capture_size", 256)
@@ -21,30 +21,45 @@ class CaptureThread(threading.Thread):
         self.center_x, self.center_y = sw // 2, sh // 2
 
         half = self.capture_size // 2
+        # ROI 格式: (left, top, right, bottom)
         self.roi = (self.center_x - half, self.center_y - half, self.center_x + half, self.center_y + half)
 
+        self.camera = None
         try:
-            self.camera = dxcam.create(device_idx=0, output_idx=0, output_color="BGR")
-            self.camera.start(region=self.roi, target_fps=self.target_fps)
+            # 🌟 核心修复：在 create 阶段就强制传入 region，让 dxcam 按照 256x256 分配底层 Buffer
+            self.camera = dxcam.create(
+                device_idx=0,
+                output_idx=0,
+                output_color="RGB",
+                max_buffer_len=64,
+                region=self.roi  # <--- 就是加了这一行
+            )
+
+            if self.camera:
+                # start 里也可以保留，双保险
+                self.camera.start(region=self.roi, target_fps=self.target_fps)
         except Exception as e:
             print(f"[Capture] ❌ DXCAM Init Failed: {e}")
-            self.camera = None
 
+    # ... 剩下的 run 方法保持不变 ...
     def run(self):
-        if not self.camera: return
-        print(f"[Capture] Started (Event-Driven Mode)")
+        if not self.camera:
+            print("[Capture] ❌ No camera instance, thread exiting.")
+            return
+
+        print(f"[Capture] Started (Event-Driven Mode) | ROI: {self.roi}")
 
         frame_count = 0
 
-        # [优化] 预分配 FrameInfo 对象，避免循环内重复 malloc (虽然 Python GC 很快，但高频下能省则省)
-        # 注意：这里主要为了代码结构清晰，极致优化可以用对象池，但这里先不做过度优化
-
         while not self.shutdown_event.is_set():
             try:
-                # get_latest_frame 依然是主动获取，但配合后面的 Event，我们可以让消费者完全被动
                 frame = self.camera.get_latest_frame()
 
                 if frame is not None:
+                    # 验证 shape
+                    if frame.shape[0] != self.capture_size or frame.shape[1] != self.capture_size:
+                        continue
+
                     t_cap = time.perf_counter()
                     info = FrameInfo(
                         frame=frame,
@@ -54,16 +69,19 @@ class CaptureThread(threading.Thread):
                     )
                     self.bus.publish(info)
 
-                    # [关键算法改变] 生产一帧，立即通知消费者
+                    # 通知推理线程
                     self.frame_ready_event.set()
-
                     frame_count += 1
+                else:
+                    time.sleep(0.001)
 
-                # [优化] 这里的 sleep 仅用于释放 GIL 给 DXCam 的后台线程一点喘息空间
-                # 由于是生产者，这里保留微小 sleep 是安全的
-                time.sleep(0.0001)
+            except Exception as e:
+                # 如果还是有报错，不再暴力 stop，避免线程锁死
+                print(f"[Capture] ⚠️ Runtime Error: {e}")
+                time.sleep(0.01)
 
-            except Exception:
-                pass
-
-        if self.camera: self.camera.stop()
+        try:
+            self.camera.stop()
+        except:
+            pass
+        print(f"[Capture] Stopped. Total frames: {frame_count}")
