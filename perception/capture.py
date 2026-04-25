@@ -25,21 +25,42 @@ class CaptureThread(threading.Thread):
         self.roi = (self.center_x - half, self.center_y - half, self.center_x + half, self.center_y + half)
 
         self.camera = None
+        # dxcam 直出 BGR（YOLO/TensorRT 的原生输入格式），省掉 inference
+        # 每帧 256×256×3 的 RGB→BGR 翻转 copy（240fps × 196KB ≈ 47MB/s）。
+        # 旧版 dxcam 若不识别 BGR，回退 RGB + 上层翻转。
         try:
-            # 🌟 核心修复：在 create 阶段就强制传入 region，让 dxcam 按照 256x256 分配底层 Buffer
             self.camera = dxcam.create(
                 device_idx=0,
                 output_idx=0,
-                output_color="RGB",
+                output_color="BGR",
                 max_buffer_len=64,
-                region=self.roi  # <--- 就是加了这一行
+                region=self.roi,
             )
-
-            if self.camera:
-                # start 里也可以保留，双保险
-                self.camera.start(region=self.roi, target_fps=self.target_fps)
+            self.output_is_bgr = True
+        except (TypeError, ValueError) as e:
+            print(f"[Capture] ⚠️ DXCAM BGR mode not supported, falling back to RGB: {e}")
+            try:
+                self.camera = dxcam.create(
+                    device_idx=0,
+                    output_idx=0,
+                    output_color="RGB",
+                    max_buffer_len=64,
+                    region=self.roi,
+                )
+                self.output_is_bgr = False
+            except Exception as e2:
+                print(f"[Capture] ❌ DXCAM Init Failed: {e2}")
+                return
         except Exception as e:
             print(f"[Capture] ❌ DXCAM Init Failed: {e}")
+            return
+
+        if self.camera:
+            try:
+                self.camera.start(region=self.roi, target_fps=self.target_fps)
+            except Exception as e:
+                print(f"[Capture] ❌ DXCAM Start Failed: {e}")
+                self.camera = None
 
     # ... 剩下的 run 方法保持不变 ...
     def run(self):
@@ -56,9 +77,12 @@ class CaptureThread(threading.Thread):
                 frame = self.camera.get_latest_frame()
 
                 if frame is not None:
-                    # 验证 shape
                     if frame.shape[0] != self.capture_size or frame.shape[1] != self.capture_size:
                         continue
+
+                    # 旧版 dxcam 若不识别 BGR，这里翻转一次；新版直出 BGR
+                    if not self.output_is_bgr:
+                        frame = frame[..., ::-1]
 
                     t_cap = time.perf_counter()
                     info = FrameInfo(
@@ -68,8 +92,6 @@ class CaptureThread(threading.Thread):
                         center_pos=(self.center_x, self.center_y)
                     )
                     self.bus.publish(info)
-
-                    # 通知推理线程
                     self.frame_ready_event.set()
                     frame_count += 1
                 else:

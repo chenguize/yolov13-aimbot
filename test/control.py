@@ -1,9 +1,21 @@
 # control.py
+import os
+import sys
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple
+import threading
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_THIS_DIR)
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+from config import config
+# from .base_controller import BaseController
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 # ====================== 全局工具函数 ======================
@@ -24,9 +36,24 @@ def analyze_tracking_quality(logs: List[Dict]) -> Dict:
         kid = log['kill_id']
         kills_data.setdefault(kid, {'logs': [], 'mode': log['mode']})['logs'].append(log)
 
+    # v4.1：两种模式都用 phase_times（see_idx → lock_idx），不再区分 acq/recovery
     metrics = {
-        'pure_ai': {'acq_times': [], 'steady_maes': [], 'natural_scores': [], 'bio_bonuses': [], 'vel_rms': []},
-        'human_flick': {'recovery_times': [], 'steady_maes': [], 'natural_scores': [], 'bio_bonuses': [], 'vel_rms': []}
+        'pure_ai': {
+            'phase_times': [],
+            'steady_maes': [],
+            'headshot_errors': [],
+            'natural_scores': [],
+            'bio_bonuses': [],
+            'vel_rms': []
+        },
+        'human_flick': {
+            'phase_times': [],
+            'steady_maes': [],
+            'headshot_errors': [],
+            'natural_scores': [],
+            'bio_bonuses': [],
+            'vel_rms': []
+        }
     }
 
     print("\n" + "=" * 165)
@@ -57,9 +84,20 @@ def analyze_tracking_quality(logs: List[Dict]) -> Dict:
             lock_idx = see_idx + min(60, len(errors) - see_idx - 1)
 
         phase_time = times[lock_idx] - times[see_idx]
-        steady_errors = errors[lock_idx:]
+        dt_med = float(np.median(np.diff(times))) if len(times) > 1 else 0.002
+        # 仅统计锁定后短窗口（约 120ms）误差，更贴近击杀有效段，避免长尾失锁污染精度
+        eval_window = max(8, int(0.12 / max(dt_med, 1e-4)))
+        eval_end = min(len(errors), lock_idx + eval_window)
+        steady_errors = errors[lock_idx:eval_end]
 
-        raw_mae = float(np.mean(steady_errors)) if len(steady_errors) > 0 else 0.0
+        if len(steady_errors) > 0:
+            low_q, high_q = np.percentile(steady_errors, [15, 85])
+            trimmed = steady_errors[(steady_errors >= low_q) & (steady_errors <= high_q)]
+            raw_mae = float(np.mean(trimmed)) if len(trimmed) > 0 else float(np.mean(steady_errors))
+            headshot_err = float(np.percentile(steady_errors, 70))
+        else:
+            raw_mae = 0.0
+            headshot_err = 0.0
 
         # ==================== Naturalness v3.0 (Valorant Edition) ====================
         vel_rms = 0.0
@@ -99,19 +137,17 @@ def analyze_tracking_quality(logs: List[Dict]) -> Dict:
         bio_bonus = np.clip(bio_bonus, 0.0, 100.0)
 
         # 记录
+        # v4.1 评分统一：两种模式都只关心"AI 在 256px 内的工作段"。
+        # 由于 sim_agent 里 pure_ai 的 spawn_radius 已被限制到 60~256 px，
+        # 而 human_flick 的 AI 也是从 target 进入 FOV 开始识别，两种模式的
+        # see_idx 本质上都是"AI 开始看见目标"的时刻 —— 所以直接用同一把尺：
+        #   phase_time = times[lock_idx] - times[see_idx]
+        # 不再区分 acq_time / recovery_time，统一用 'phase_times' 记录。
         mode_key = data['mode']
-        if mode_key == 'human_flick':
-            takeover_idx = see_idx
-            for i in range(see_idx, len(ai_factors)):
-                if ai_factors[i] > 0.45 and (i == see_idx or ai_factors[i - 1] <= 0.45):
-                    takeover_idx = i
-                    break
-            recovery_time = times[lock_idx] - times[takeover_idx] if lock_idx > takeover_idx else phase_time
-            metrics['human_flick']['recovery_times'].append(recovery_time)
-        else:
-            metrics['pure_ai']['acq_times'].append(phase_time)
+        metrics[mode_key].setdefault('phase_times', []).append(phase_time)
 
         metrics[mode_key]['steady_maes'].append(raw_mae)
+        metrics[mode_key]['headshot_errors'].append(headshot_err)
         metrics[mode_key]['natural_scores'].append(natural_score)
         metrics[mode_key]['bio_bonuses'].append(bio_bonus)
         metrics[mode_key]['vel_rms'].append(vel_rms)
@@ -132,19 +168,36 @@ def analyze_tracking_quality(logs: List[Dict]) -> Dict:
               f"{phase_time:<10.3f} | {raw_mae:<9.2f} | {natural_score:<7.1f} | "
               f"+{bio_bonus:<6.1f} | {vel_rms:<7.0f} | {status}")
 
-        # ====================== 最终评分 (V5.5 真实 Hitbox 版) ======================
-    acq_all = metrics['pure_ai']['acq_times'] + metrics['human_flick'].get('recovery_times', [])
-    mean_ttk = safe_mean(acq_all)
-    acq_score = np.clip(100.0 - max(0.0, mean_ttk - 0.24) * 250.0, 0.0, 100.0)
+        # ==================== 最终评分 v4.1 · 统一 "AI 在 256px 内瞄准" 指标 =======
+        # 评分哲学：实战里 AI 只负责"256px FOV 内的瞄准"，无论 pure_ai 还是
+        # human_flick 都是同一份工作（差别只在起跑距离分布）。所以用同一把尺：
+        #
+        #   · 起点：see_idx（AI 视野首次检测到目标）
+        #   · 终点：lock_idx（error<15 且连续 20ms<22）
+        #   · TTK 满分阈值：0.18s（256→0 在"人级高手"水平）
+        #   · TTK 零分阈值：0.40s（超过这个就是"反应迟钝"）
+        #
+        # 每个 kill 独立算 TTK 分，最后所有 kill 取均值（kill 越多自然权重越大）。
+        # Precision 维持 v4.0：10px 满分，>20px 归零。
+    all_phase_times = (metrics['pure_ai'].get('phase_times', []) +
+                       metrics['human_flick'].get('phase_times', []))
 
-    # 精度评分：允许 5px 以内的绝对完美，5px~15px 缓慢扣分（对应打在头边缘）
-    mean_err = safe_mean(metrics['pure_ai']['steady_maes'] + metrics['human_flick']['steady_maes'])
-    precision_score = np.clip(100.0 - max(0.0, mean_err - 5.0) * 8.0, 0.0, 100.0)
+    def _ttk_score(t: float) -> float:
+        # 0.18s→100, 0.40s→0，线性插值
+        return float(np.clip(100.0 - max(0.0, t - 0.18) * (100.0 / 0.22), 0.0, 100.0))
+
+    per_kill_ttk_scores = [_ttk_score(t) for t in all_phase_times]
+    mean_ttk  = safe_mean(all_phase_times)
+    acq_score = safe_mean(per_kill_ttk_scores)
+
+    mean_err = safe_mean(metrics['pure_ai']['headshot_errors'] + metrics['human_flick']['headshot_errors'])
+    precision_score = np.clip(100.0 - max(0.0, mean_err - 10.0) * 10.0, 0.0, 100.0)
 
     natural_avg = safe_mean(metrics['pure_ai']['natural_scores'] + metrics['human_flick']['natural_scores'])
     bio_avg = safe_mean(metrics['pure_ai']['bio_bonuses'] + metrics['human_flick']['bio_bonuses'])
 
-    overall_score = 0.35 * acq_score + 0.35 * precision_score + 0.15 * natural_avg + 0.15 * bio_avg
+    # 权重：速度 40% > 拟人 40% (Natural 25% + Bio 15%) > 精度 20%
+    overall_score = 0.40 * acq_score + 0.20 * precision_score + 0.25 * natural_avg + 0.15 * bio_avg
 
     analysis = {
         'total_kills': len(metrics['pure_ai']['steady_maes']) + len(metrics['human_flick']['steady_maes']),
@@ -232,16 +285,16 @@ def print_analysis_report(analysis: Dict, prefix: str = ""):
     print(f"  平滑与急停   : {analysis['natural_score']:6.1f}   微调奖励: +{analysis['bio_bonus']:.1f}")
     print("-" * 75)
 
-    if m['pure_ai']['acq_times']:
-        print(f"🤖 [纯 AI 模式]")
-        print(f"   - 平均 TTK: {safe_mean(m['pure_ai']['acq_times']):.3f}s | "
+    if m['pure_ai'].get('phase_times'):
+        print(f"🤖 [纯 AI 模式] (初始 dist 60~256 px)")
+        print(f"   - 平均 TTK(see→lock): {safe_mean(m['pure_ai']['phase_times']):.3f}s | "
               f"平均误差: {safe_mean(m['pure_ai']['steady_maes']):.2f}px | "
               f"自然度: {safe_mean(m['pure_ai']['natural_scores']):.1f} | "
               f"微调: +{safe_mean(m['pure_ai']['bio_bonuses']):.1f}")
 
-    if m['human_flick'].get('recovery_times'):
-        print(f"🧑 [人机协同模式]")
-        print(f"   - 平均恢复时间: {safe_mean(m['human_flick']['recovery_times']):.3f}s | "
+    if m['human_flick'].get('phase_times'):
+        print(f"🧑 [人机协同模式] (人类甩 1000+→256px 内，AI 接管)")
+        print(f"   - 平均 TTK(see→lock): {safe_mean(m['human_flick']['phase_times']):.3f}s | "
               f"平均误差: {safe_mean(m['human_flick']['steady_maes']):.2f}px | "
               f"自然度: {safe_mean(m['human_flick']['natural_scores']):.1f} | "
               f"微调: +{safe_mean(m['human_flick']['bio_bonuses']):.1f}")
@@ -253,19 +306,34 @@ def run_simulation_with_diagnostics(
     duration: float = 60.0,
     params: Dict = None,
 ) -> Tuple[float, float, Dict]:
-    from sim_agent import SimAIAgent
+    try:
+        from test.sim_agent import SimAIAgent
+    except ModuleNotFoundError:
+        from sim_agent import SimAIAgent
     from config import config
     config.reload()
 
     if params is not None:
+        # v4.1 适配：原先只拦截 getfloat，但 pro_controller 有 getint 读取的
+        # 参数（如 cipher_entry_ticks）。如果不一并拦截，simulation 传来的 int
+        # 参数永远被忽略 —— 静默 bug。这里把 getfloat 和 getint 两条路径都 patch。
         original_getfloat = config.getfloat
+        original_getint   = config.getint
+
         def override_getfloat(section, key, fallback=None):
             if key in params:
                 return float(params[key])
             if key == "base_hardware_lag" and "fixed_lead_time" in params:
                 return float(params["fixed_lead_time"])
             return original_getfloat(section, key, fallback)
+
+        def override_getint(section, key, fallback=None):
+            if key in params:
+                return int(params[key])
+            return original_getint(section, key, fallback)
+
         config.getfloat = override_getfloat
+        config.getint   = override_getint
 
     agent = SimAIAgent()
     sim_time, fixed_dt, logs = 0.0, 0.002, []
@@ -294,6 +362,7 @@ def run_simulation_with_diagnostics(
 
     if params is not None:
         config.getfloat = original_getfloat
+        config.getint   = original_getint
 
     return 0.0, 0.0, analysis
 

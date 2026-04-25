@@ -1,143 +1,199 @@
 # agent.py
-import time
-import threading
-import random
+# ═══════════════════════════════════════════════════════════════════════════════
+# 实战 Agent —— Perception / Inference / WorldModel / Controller 组装与 tick 驱动
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 线程拓扑：
+#   CaptureThread        —— dxcam @ target_fps，写 FrameBus → set frame_ready
+#   InferenceThread      —— 消费 FrameBus，YOLO + 推理，写 WorldModel
+#   MouseWorker          —— 1000Hz 消费 controller.tick_mouse()，下发 SendInput
+#   HumanMouseListener   —— 阻塞式 RawInput，记录人类物理位移到 RingBuffer
+#   TriggerWorker        —— 单独线程处理 click down/up，主 tick 不再被 sleep 阻塞
+#   Main loop (tick)     —— 每帧调 world_model.step + controller.compute
+#
+# 与 sim_agent 的对应：
+#   实战 tick() ≈ sim_agent.step()
+#   实战 agent 遵循同样的 chase_mode 判定：
+#     · 最近 100ms 人类速度 > 500 px/s → human_flick (人拉枪，AI 补枪微调)
+#     · 否则 → pure_ai (目标自己进 FOV，AI 独立瞄准)
+
 import logging
 import math
+import random
+import threading
+import time
+
 import numpy as np
 import win32api
 from ctypes import windll
 
-import noise  # [必须安装] pip install noise
-
 from config import config
-from utils.types import InferenceContext
+from inference import InferenceThread
+from output import gHub as output_device
 from perception.bus import FrameBus
 from perception.capture import CaptureThread
 from perception.ring_buffer import RingBuffer
-from inference import InferenceThread
-from world_model import WorldModel
-from output import gHub as output_device
 from utils.recorder import TraceRecorder
+from utils.types import InferenceContext
+from world_model import WorldModel
 
 logger = logging.getLogger("Agent")
 
 
-# ==============================================================================
-# 🌟 人物急停与运动状态监控器
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# § 1 │ MovementTracker —— 人物急停状态
+# ══════════════════════════════════════════════════════════════════════════════
 class MovementTracker:
-    def __init__(self):
-        # 虚拟键码 (WASD)
-        self.W = 0x57
-        self.A = 0x41
-        self.S = 0x53
-        self.D = 0x44
+    """监控 WASD 按键，判断 '已停止位移 + 滑行衰减' 窗口。"""
 
-        # 急停物理恢复时间 (Valorant 建议 0.08~0.12 秒，CS2 建议 0.15 秒)
+    def __init__(self):
+        self.W, self.A, self.S, self.D = 0x57, 0x41, 0x53, 0x44
+        # Valorant 0.08-0.12s，CS2 0.15s；这里 0.10 偏均衡
         self.stop_cooldown_duration = 0.10
         self.last_moving_time = 0.0
 
     def is_accurate_to_shoot(self) -> bool:
-        # 检测 WASD 是否有任意一个被按下 (最高位为 1 表示按下)
-        is_w = win32api.GetAsyncKeyState(self.W) & 0x8000
-        is_a = win32api.GetAsyncKeyState(self.A) & 0x8000
-        is_s = win32api.GetAsyncKeyState(self.S) & 0x8000
-        is_d = win32api.GetAsyncKeyState(self.D) & 0x8000
-
-        currently_moving = is_w or is_a or is_s or is_d
+        keys = (self.W, self.A, self.S, self.D)
+        currently_moving = any(win32api.GetAsyncKeyState(k) & 0x8000 for k in keys)
         current_time = time.perf_counter()
-
         if currently_moving:
             self.last_moving_time = current_time
             return False
-
-        # 检查松开按键后，是否度过了物理滑行期
-        if current_time - self.last_moving_time < self.stop_cooldown_duration:
-            return False
-
-        return True
+        return (current_time - self.last_moving_time) >= self.stop_cooldown_duration
 
 
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# § 2 │ HumanMouseListener —— 物理鼠标输入监听
+# ══════════════════════════════════════════════════════════════════════════════
 class HumanMouseListener(threading.Thread):
-    def __init__(self, ring_buffer, shutdown_evt):
-        super().__init__(name="HumanMouseListener", daemon=True)
+    """
+    阻塞式 RawInput 采样。把物理位移（is_ai=False）写入 RingBuffer，
+    供人机离合器 / 反馈校准使用。
+    """
+
+    def __init__(self, ring_buffer: RingBuffer, shutdown_evt: threading.Event):
+        super().__init__(name="RawInputListener", daemon=True)
         self.ring_buffer = ring_buffer
         self.shutdown_evt = shutdown_evt
 
     def run(self):
-        print("[Agent] 🖐️ Human Mouse Listener Started")
+        logger.info("RawInput Mouse Listener starting")
         try:
-            last_pos = win32api.GetCursorPos()
-        except Exception:
-            last_pos = (0, 0)
+            from inputs import get_mouse
+        except ImportError:
+            logger.error("缺少依赖 'inputs'，请 pip install inputs；人机离合器不可用")
+            return
+
+        # 某些 inputs 版本无 UnpluggedError，用 OSError 兜底
+        try:
+            from inputs import UnpluggedError
+        except (ImportError, AttributeError):
+            UnpluggedError = OSError
 
         while not self.shutdown_evt.is_set():
             try:
-                current_pos = win32api.GetCursorPos()
-                dx = current_pos[0] - last_pos[0]
-                dy = current_pos[1] - last_pos[1]
-
-                if dx != 0 or dy != 0:
+                events = get_mouse()
+                dx = dy = 0
+                for event in events:
+                    if event.ev_type == 'Relative':
+                        if event.code == 'REL_X':
+                            dx += event.state
+                        elif event.code == 'REL_Y':
+                            dy += event.state
+                if dx or dy:
                     self.ring_buffer.add_event(dx, dy, is_ai=False)
-
-                last_pos = current_pos
-            except Exception:
-                pass
-
-            time.sleep(0.001)
-
-        print("[Agent] 🖐️ Human Mouse Listener Stopped")
+            except UnpluggedError:
+                time.sleep(1.0)
+            except Exception as e:
+                logger.debug("HumanMouseListener transient: %s", e)
+                time.sleep(0.001)
+        logger.info("RawInput Mouse Listener stopped")
 
 
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# § 3 │ MouseWorker —— 1000Hz 输出循环
+# ══════════════════════════════════════════════════════════════════════════════
 class MouseWorker(threading.Thread):
-    def __init__(self, controller, output_dev, shutdown_evt):
+    """1kHz 主 tick + 高斯抖动（±100μs 打破机器特征）。"""
+
+    def __init__(self, controller, output_dev, shutdown_evt: threading.Event):
         super().__init__(name="MouseWorker", daemon=True)
         self.controller = controller
         self.output = output_dev
         self.shutdown_evt = shutdown_evt
 
     def run(self):
-        print("[Agent] 🚀 MouseWorker (1000Hz) Started")
+        logger.info("MouseWorker (1000Hz) starting")
         try:
             windll.winmm.timeBeginPeriod(1)
         except Exception:
             pass
 
         base_period = 0.001
-
         while not self.shutdown_evt.is_set():
             loop_start = time.perf_counter()
-
-            # [核心反作弊优化：添加 ±100μs 的时间抖动，打破完美的 1000Hz 机器特征]
             jitter = random.gauss(0, 0.0001)
-            current_target_period = max(0.0008, min(0.0012, base_period + jitter))
+            target_period = max(0.0008, min(0.0012, base_period + jitter))
 
             try:
                 dx, dy = self.controller.tick_mouse()
-                if dx != 0 or dy != 0:
+                if dx or dy:
                     self.output.mouse_xy(dx, dy)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("MouseWorker tick error: %s", e)
 
             elapsed = time.perf_counter() - loop_start
-            remaining = current_target_period - elapsed
+            remaining = target_period - elapsed
             if remaining > 0.0005:
                 time.sleep(remaining - 0.0002)
-
-            while (time.perf_counter() - loop_start) < current_target_period:
+            while (time.perf_counter() - loop_start) < target_period:
                 pass
 
         try:
             windll.winmm.timeEndPeriod(1)
         except Exception:
             pass
-        print("[Agent] 🚀 MouseWorker Stopped")
+        logger.info("MouseWorker stopped")
 
 
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# § 4 │ TriggerWorker —— 异步射击
+# ══════════════════════════════════════════════════════════════════════════════
+class TriggerWorker(threading.Thread):
+    """
+    把 mouse_down/sleep/mouse_up 异步化，避免 sleep 阻塞主 tick。
+    调用方只需 fire(click_duration_s)；类内保证 15~60ms 点击时长。
+    """
+
+    def __init__(self, output_dev, shutdown_evt: threading.Event):
+        super().__init__(name="TriggerWorker", daemon=True)
+        self.output = output_dev
+        self.shutdown_evt = shutdown_evt
+        self._fire_evt = threading.Event()
+        self._click_duration = 0.03
+
+    def fire(self, click_duration: float):
+        self._click_duration = float(np.clip(click_duration, 0.015, 0.06))
+        self._fire_evt.set()
+
+    def run(self):
+        logger.info("TriggerWorker starting")
+        while not self.shutdown_evt.is_set():
+            if not self._fire_evt.wait(timeout=0.1):
+                continue
+            self._fire_evt.clear()
+            try:
+                self.output.mouse_down(1)
+                time.sleep(self._click_duration)
+                self.output.mouse_up(1)
+            except Exception as e:
+                logger.debug("TriggerWorker fire error: %s", e)
+        logger.info("TriggerWorker stopped")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 5 │ AIAgent —— 主驱动
+# ══════════════════════════════════════════════════════════════════════════════
 class AIAgent:
     def __init__(self):
         self.shutdown_event = threading.Event()
@@ -159,10 +215,12 @@ class AIAgent:
         self.cap_to_inf_event = threading.Event()
 
         self.capture_thread = CaptureThread(self.frame_bus, self.shutdown_event, self.cap_to_inf_event)
-        self.inference_thread = InferenceThread(self.frame_bus, self.world_model, self.shutdown_event,
-                                                self.cap_to_inf_event)
+        self.inference_thread = InferenceThread(
+            self.frame_bus, self.world_model, self.shutdown_event, self.cap_to_inf_event
+        )
         self.mouse_worker = MouseWorker(self.controller, output_device, self.shutdown_event)
         self.human_mouse_listener = HumanMouseListener(self.ring_buffer, self.shutdown_event)
+        self.trigger_worker = TriggerWorker(output_device, self.shutdown_event)
 
         self.ctx = InferenceContext()
         self.crop_center = self.world_model.crop_center
@@ -177,26 +235,29 @@ class AIAgent:
         self.trigger_conf = config.getfloat("Triggerbot", "trigger_confidence", 0.6)
         self.last_shot_time = 0.0
 
+        # ── 目标生命周期 ──
         self.target_first_seen_time = 0.0
         self.target_in_crosshair_time = 0.0
         self.is_target_in_crosshair = False
 
-        # 人机 Flick 状态检测
+        # ── 人机 Flick 状态检测 ──
         self._prev_human_flicking = False
 
-        # Perlin 噪声的随机初始偏移量
-        self.noise_offset_x = random.uniform(0, 1000.0)
-        self.noise_offset_y = random.uniform(0, 1000.0)
+        # ── 当前目标的 chase_mode（由首帧决定，丢失后下一个目标重判定）──
+        self._current_chase_mode: str = 'pure_ai'
+
         self.movement_tracker = MovementTracker()
 
-        print("[Agent] Initialized. Ready to start.")
+        logger.info("Agent initialized")
 
+    # ────────────────────────────────────────────────────────────────────
     def start(self):
         self.capture_thread.start()
         self.inference_thread.start()
         self.mouse_worker.start()
         self.human_mouse_listener.start()
-        print("[Agent] All threads started.")
+        self.trigger_worker.start()
+        logger.info("All threads started")
 
     def stop(self):
         self.shutdown_event.set()
@@ -204,8 +265,11 @@ class AIAgent:
         self.world_model.frame_ready_event.set()
         time.sleep(0.5)
         self.recorder.save_to_disk()
-        print("[Agent] Shutdown sequence completed.")
+        logger.info("Shutdown sequence completed")
 
+    # ────────────────────────────────────────────────────────────────────
+    # Main tick — 由 frame_ready_event 驱动，通常 ~200-300Hz（随推理帧率）
+    # ────────────────────────────────────────────────────────────────────
     def tick(self):
         self.world_model.frame_ready_event.wait()
         self.world_model.frame_ready_event.clear()
@@ -219,105 +283,110 @@ class AIAgent:
 
         dt = now - self.last_tick_time
         self.last_tick_time = now
-
         if dt <= 0 or dt > 0.1:
             return
 
-        # 🌟 对齐点 1：目标无效时重置生命周期
-        if not self.ctx.is_valid or not self.ctx.p_predict:
+        # ── 目标有效性判定 ───────────────────────────────────────────────
+        # Bug J 修：p_predict 是 tuple，tuple 永远 truthy。显式 is None 判断
+        if not self.ctx.is_valid or self.ctx.p_predict is None:
+            # Bug A 修：不再每帧 reset_target_state —— 每次 reset 会把
+            # arm_vel × 0.05，连乘 6 帧变 ~1e-8，高速追踪短暂丢帧后无法平滑续上。
+            # 让 controller 自然冻结（下次 compute 时延续 arm_vel），仅清掉外层
+            # 的"生命周期"状态。真正的 reset 只在首次见到"新"目标时做。
             self.target_first_seen_time = 0.0
             self.is_target_in_crosshair = False
-            if hasattr(self.controller, 'reset_target_state'):
-                self.controller.reset_target_state()
             return
 
-        if self.target_first_seen_time == 0.0:
+        # ── 首次见到目标：决定 chase_mode 并 reset controller ───────────
+        first_frame = (self.target_first_seen_time == 0.0)
+        if first_frame:
             self.target_first_seen_time = now
-            print(f"[{time.strftime('%H:%M:%S')}] 🎯 发现目标！")
+            # Bug B 修：按最近 100ms 人类速度判定模式
+            #   实战大部分场景是"人拉枪到 256px 内 AI 接管" → human_flick
+            #   目标自己走进 FOV（被动追）→ pure_ai
+            dx_100, dy_100 = self.ring_buffer.get_pure_human_delta_sum(now - 0.1, now)
+            recent_speed = math.hypot(dx_100, dy_100) / 0.1
+            self._current_chase_mode = 'human_flick' if recent_speed > 500.0 else 'pure_ai'
+            if hasattr(self.controller, 'reset_target_state'):
+                try:
+                    self.controller.reset_target_state(mode=self._current_chase_mode)
+                except TypeError:
+                    self.controller.reset_target_state()
+            logger.info("Target acquired (mode=%s, human_speed_100ms=%.0f)",
+                        self._current_chase_mode, recent_speed)
+
         dx_h_inst, dy_h_inst = self.ring_buffer.get_pure_human_delta_sum(now - dt, now)
         human_vx_inst = dx_h_inst / dt if dt > 0 else 0.0
         human_vy_inst = dy_h_inst / dt if dt > 0 else 0.0
 
         bbox_w = self.ctx.targets[0].w if self.ctx.targets else 60.0
 
-        # ==============================================================================
-        # 视觉坐标映射与漂移
-        # ==============================================================================
-        noise_scale = 0.5
-        amplitude = 3.0
-        drift_x = noise.pnoise1(now * noise_scale + self.noise_offset_x) * amplitude
-        drift_y = noise.pnoise1(now * noise_scale + self.noise_offset_y) * amplitude
+        # ── 视觉坐标映射 ──────────────────────────────────────────────
+        # Bug F 修：实战路径不叠 perlin drift。
+        # drift 的初衷是"sim 里模拟人手抖"，但实战 Kalman 已经做了平滑，
+        # 再叠 ±3px 抖动反而让精度掉 15-30%。拟人特征完全由 controller 的
+        # OU tremor + postural drift 负责（在 tick_mouse 里，有物理意义的谱形）。
+        p_x = self.ctx.p_predict[0]
+        p_y = self.ctx.p_predict[1]
 
-        drifted_p_x = self.ctx.p_predict[0] + drift_x
-        drifted_p_y = self.ctx.p_predict[1] + drift_y
-
-        intent_x, intent_y = self.aim_strategy.calculate_mouse_move(
-            drifted_p_x, drifted_p_y, bbox_w=bbox_w
-        )
+        intent_x, intent_y = self.aim_strategy.calculate_mouse_move(p_x, p_y, bbox_w=bbox_w)
 
         v_real_pixels = self.ctx.v_real
         intent_vx, intent_vy = self.aim_strategy.calculate_velocity_move(
             v_real_pixels[0], v_real_pixels[1], bbox_w=bbox_w
         )
-
         a_real_pixels = getattr(self.ctx, 'a_real', (0.0, 0.0))
         intent_ax, intent_ay = self.aim_strategy.calculate_velocity_move(
             a_real_pixels[0], a_real_pixels[1], bbox_w=bbox_w
         )
 
-        pixel_error_dist = np.linalg.norm([drifted_p_x, drifted_p_y])
+        pixel_error_dist = math.hypot(p_x, p_y)
 
-        # ==============================================================================
-        # 🌟 对齐点 4：将发力空间系数对齐到 800px 二次曲面衰减
-        # ==============================================================================
-        spatial_factor = np.clip(1.0 - (pixel_error_dist / 800.0) ** 2, 0.1, 1.0)
+        # ── power_factor = spatial × reaction × human_override ─────────
+        spatial_factor = float(np.clip(1.0 - (pixel_error_dist / 800.0) ** 2, 0.1, 1.0))
 
         time_since_seen = now - self.target_first_seen_time
-        reaction_factor = np.clip(time_since_seen / 0.15, 0.0, 1.0)
+        if self._current_chase_mode == 'pure_ai':
+            reaction_factor = 1.0  # AI 独立瞄准，无视觉反应斜坡
+        else:
+            reaction_factor = float(np.clip(time_since_seen / 0.15, 0.0, 1.0))
 
-        # ==============================================================================
-        # 🌟 对齐点 3：人机动态离合器 (基于距离自适应的人类优先阈值)
-        # ==============================================================================
+        # 人机动态离合器：人速度大时 AI 让位
         dx_h_recent, dy_h_recent = self.ring_buffer.get_pure_human_delta_sum(now - 0.1, now)
         human_speed = math.hypot(dx_h_recent, dy_h_recent) / 0.1
 
         if pixel_error_dist < 40.0:
-            speed_thresh_min = 1200.0
-            speed_thresh_max = 2500.0
+            s_min, s_max = 1200.0, 2500.0
         elif pixel_error_dist > 150.0:
-            speed_thresh_min = 150.0
-            speed_thresh_max = 800.0
+            s_min, s_max = 150.0, 800.0
         else:
             progress = (150.0 - pixel_error_dist) / 110.0
-            speed_thresh_min = 150.0 + progress * 1050.0
-            speed_thresh_max = 800.0 + progress * 1700.0
+            s_min = 150.0 + progress * 1050.0
+            s_max = 800.0 + progress * 1700.0
 
-        if human_speed > speed_thresh_max:
-            human_override_factor = 0.0
-        elif human_speed < speed_thresh_min:
-            human_override_factor = 1.0
+        if human_speed > s_max:
+            human_override = 0.0
+        elif human_speed < s_min:
+            human_override = 1.0
         else:
-            human_override_factor = 1.0 - ((human_speed - speed_thresh_min) / (speed_thresh_max - speed_thresh_min))
+            human_override = 1.0 - (human_speed - s_min) / (s_max - s_min)
 
-        power_factor = spatial_factor * reaction_factor * human_override_factor
+        power_factor = spatial_factor * reaction_factor * human_override
 
-        # ==============================================================================
-        # 🌟 对齐点 2：人类 Flick 结束边缘检测 (通知控制器清空积分)
-        # ==============================================================================
-        cur_human_flicking = human_speed > (speed_thresh_max * 0.7)
+        # ── 人类甩枪结束沿检测 → 通知控制器清积分 ──────────────────────
+        cur_human_flicking = human_speed > (s_max * 0.7)
         if self._prev_human_flicking and not cur_human_flicking:
             if hasattr(self.controller, 'notify_flick_end'):
                 self.controller.notify_flick_end()
         self._prev_human_flicking = cur_human_flicking
 
-        # 核心 LQR 计算
+        # ── 调用控制器 ────────────────────────────────────────────────
         self.controller.compute(
             target_x=intent_x, target_y=intent_y, dt=dt,
-            human_v=np.array([human_vx_inst, human_vy_inst]),
             v_real=np.array([intent_vx, intent_vy]),
             a_real=np.array([intent_ax, intent_ay]),
             power_factor=power_factor,
-            bbox_w=bbox_w
+            bbox_w=bbox_w,
         )
 
         if self.enable_aimbot:
@@ -326,80 +395,72 @@ class AIAgent:
         self.frames_in_cycle += 1
         self._print_stats()
 
+    # ────────────────────────────────────────────────────────────────────
     def _check_and_trigger(self):
-        if self._check_trigger_condition():
-            if self.movement_tracker.is_accurate_to_shoot():
-                self._perform_shoot()
+        if self._check_trigger_condition() and self.movement_tracker.is_accurate_to_shoot():
+            self._perform_shoot()
 
     def _check_trigger_condition(self) -> bool:
         if not (self.enable_aimbot and self.enable_trigger and self.ctx.is_valid):
             self.is_target_in_crosshair = False
             return False
-
         if self.ctx.conf < self.trigger_conf:
+            self.is_target_in_crosshair = False
+            return False
+        if self.ctx.p_predict is None:
             self.is_target_in_crosshair = False
             return False
 
         tx, ty = self.ctx.p_predict
-        dx = abs(tx)
-        dy = abs(ty)
-
-        if dx <= self.trigger_fov and dy <= self.trigger_fov:
+        if abs(tx) <= self.trigger_fov and abs(ty) <= self.trigger_fov:
             if not self.is_target_in_crosshair:
                 self.is_target_in_crosshair = True
                 self.target_in_crosshair_time = time.perf_counter()
             return True
-        else:
-            self.is_target_in_crosshair = False
-            return False
+        self.is_target_in_crosshair = False
+        return False
 
     def _perform_shoot(self):
         now = time.perf_counter()
-
-        dx_sum, dy_sum = self.ring_buffer.get_human_delta_sum(now - 0.2, now)
+        dx_sum, dy_sum = self.ring_buffer.get_pure_human_delta_sum(now - 0.2, now)
         human_movement_dist = math.hypot(dx_sum, dy_sum)
 
         raw_reaction = np.random.gamma(shape=8.0, scale=0.0125)
-        base_delay = np.clip(raw_reaction, 0.05, 0.35)
-
+        base_delay = float(np.clip(raw_reaction, 0.05, 0.35))
         activity_factor = min(human_movement_dist / 80.0, 1.0)
         dynamic_delay = base_delay * (1.0 - activity_factor)
 
         if now - self.target_in_crosshair_time < dynamic_delay:
             return
-
         if now - self.last_shot_time < 0.15:
             return
 
-        output_device.mouse_down(1)
-
-        raw_click_duration = random.gauss(0.03, 0.005)
-        click_duration = max(0.015, min(0.06, raw_click_duration))
-
-        time.sleep(click_duration)
-        output_device.mouse_up(1)
-
+        # Bug C 修：异步 fire，主 tick 立即返回，不再被 30ms sleep 阻塞
+        raw_click = random.gauss(0.03, 0.005)
+        self.trigger_worker.fire(raw_click)
         self.last_shot_time = now
 
+    # ────────────────────────────────────────────────────────────────────
     def _print_stats(self):
         now = time.perf_counter()
         dt = now - self.last_stat_time
-        if dt <= 0 or dt < 1.0:
+        if dt < 1.0:
             return
         real_fps = self.frames_in_cycle / dt
         lag = getattr(self.ctx, 'dynamic_lag_ms', 0.0)
         conf = self.ctx.conf
-        print(f"[Agent] FPS: {real_fps:.1f} | Lat: {lag:.1f}ms | Conf: {conf:.2f}")
+        logger.info("FPS: %.1f | Lat: %.1fms | Conf: %.2f | Mode: %s",
+                    real_fps, lag, conf, self._current_chase_mode)
         self.last_stat_time = now
         self.frames_in_cycle = 0
 
     def toggle_pause(self):
         self.paused = not self.paused
-        print(f"[System] PAUSED: {self.paused}")
+        logger.warning("PAUSED: %s", self.paused)
 
     def toggle_aimbot(self):
         self.enable_aimbot = not self.enable_aimbot
         if not self.enable_aimbot:
             self.controller.crosshair_velocity[:] = 0
             self.controller._subpixel[:] = 0
-        print(f"[System] AIMBOT: {self.enable_aimbot}")
+        logger.warning("AIMBOT: %s", self.enable_aimbot)

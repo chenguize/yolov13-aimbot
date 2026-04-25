@@ -71,7 +71,10 @@ class InferenceContext:
     # --- 3. 认知状态 (Cognition / WorldModel) ---
     selected_id: int = -1  # 最终选定的目标 ID
     v_real: Tuple[float, float] = (0.0, 0.0)  # Kalman 估算的真实世界速度 (px/s)
-    p_predict: Tuple[float, float] = (0.0, 0.0)  # 延迟补偿后的预测落点 (Screen Abs)
+    a_real: Tuple[float, float] = (0.0, 0.0)  # Kalman 估算的加速度 (px/s^2)
+    # p_predict 用 Optional：None 代表"本帧无可用目标"。
+    # 原 Tuple 默认 (0.0, 0.0) 导致 `if not ctx.p_predict` 判空失效（tuple 永真）。
+    p_predict: Optional[Tuple[float, float]] = None
     is_valid: bool = False  # 本帧数据是否可信 (是否允许开火/瞄准)
 
     # [关键修复] 目标置信度 (用于 Triggerbot 判定)

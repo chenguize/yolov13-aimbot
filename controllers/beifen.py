@@ -1,6 +1,6 @@
 # pro_controller.py
 # ═══════════════════════════════════════════════════════════════════════════════
-# Tier S+++ │ 解析 LQR + 制动轮廓控制器  v5 (Biomimetic Edition)
+# Tier S+++ │ 解析 LQR + 制动轮廓控制器  v5.1b (Enhanced Biomimetic - Hotfix)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # ┌─ v4 → v5 升级与重构清单 ────────────────────────────────────────────────────┐
@@ -160,25 +160,29 @@ class PROController(BaseController):
     def __init__(self):
         super().__init__()
         self.mode = "track"
-
+        self._capture_fps = config.getfloat("General", "capture_fps_target", 240.0)
+        self._frame_time = 1.0 / max(self._capture_fps, 30.0)  # 兜底限制，防止除零或过低帧率
         self.max_speed = config.getfloat("Controller", "max_speed", 8250.0)
-        self.max_accel = config.getfloat("Controller", "max_accel", 120000.0)
+        # 【优化点 1】降低极限加速度：拉长物理加减速的过渡带，避免机器式的瞬间爆发
+        self.max_accel = config.getfloat("Controller", "max_accel", 75000.0)
         self.integral = np.zeros(2, dtype=np.float64)
 
-        q_pos_track = config.getfloat("Controller", "q_pos_track", 62.1)
-        q_vel_track = config.getfloat("Controller", "q_vel_track", 0.304)
-        r_track = config.getfloat("Controller", "r_track", 5e-5)
+        # 恢复适中刚性，让瞄准像磁铁一样吸附，但不僵硬
+        q_pos_track = config.getfloat("Controller", "q_pos_track", 35.0)
+        q_vel_track = config.getfloat("Controller", "q_vel_track", 0.50)
+        r_track = config.getfloat("Controller", "r_track", 5.0e-4)
 
-        q_pos_flick = config.getfloat("Controller", "q_pos_flick", 3.5)
-        q_vel_flick = config.getfloat("Controller", "q_vel_flick", 5e-5)
-        r_flick = config.getfloat("Controller", "r_flick", 5e-7)
+        # 稍微柔化 Flick 模式，防止大甩时用力过猛
+        q_pos_flick = config.getfloat("Controller", "q_pos_flick", 2.0)
+        q_vel_flick = config.getfloat("Controller", "q_vel_flick", 8e-5)
+        r_flick = config.getfloat("Controller", "r_flick", 2e-6)
 
         _dt = 0.002
         self._kp_track, self._kv_track = _solve_dare_1d(q_pos_track, q_vel_track, r_track, _dt)
         self._kp_flick, self._kv_flick = _solve_dare_1d(q_pos_flick, q_vel_flick, r_flick, _dt)
 
-        print(f"[LQR v5] TRACK: k_pos={self._kp_track:.1f}, k_vel={self._kv_track:.2f}  (Biomimetic)")
-        print(f"[LQR v5] FLICK: k_pos={self._kp_flick:.1f}, k_vel={self._kv_flick:.2f}")
+        print(f"[LQR v5.2] TRACK: k_pos={self._kp_track:.1f}, k_vel={self._kv_track:.2f}  (Biomimetic Tuned)")
+        print(f"[LQR v5.2] FLICK: k_pos={self._kp_flick:.1f}, k_vel={self._kv_flick:.2f}")
 
         self._ff_acc_gain = config.getfloat("Controller", "ff_acc_gain", 0.35)
         self._blend_dist = config.getfloat("Controller", "blend_dist", 50.0)
@@ -186,9 +190,9 @@ class PROController(BaseController):
         self._friction = config.getfloat("Controller", "velocity_friction", 0.993)
         self._ki = config.getfloat("Controller", "ki_gain", 0.025)
 
-        # ── FIX-2 冷启动参数 ─────────────────────────────────────────────────
-        self._ramp_ms = config.getfloat("Controller", "coldstart_ramp_ms", 60.0)
-        self._ramp_min = config.getfloat("Controller", "coldstart_ramp_min", 0.45)
+        # 【优化点 3】拉长冷启动斜坡时间：将启动延迟从 60ms 拉长至 140ms，解决 TTK < 0.12s 的瞬锁判定
+        self._ramp_ms = config.getfloat("Controller", "coldstart_ramp_ms", 40.0)
+        self._ramp_min = config.getfloat("Controller", "coldstart_ramp_min", 0.85)
         self._target_age_ms: float = self._ramp_ms
 
         # ── FIX-3 Flick 衔接阻尼参数 ─────────────────────────────────────────
@@ -221,11 +225,17 @@ class PROController(BaseController):
         self._perlin_off_x = np.random.uniform(0.0, 100.0)
         self._perlin_off_y = np.random.uniform(200.0, 300.0)
 
+        # 【新增】物理手腕速度容器与配置文件读取
+        self._wrist_velocity = np.zeros(2, dtype=np.float64)
+        # 从配置读取手腕灵敏度，默认给 0.45 保证爆发力
+        self._wrist_alpha = config.getfloat("Controller", "wrist_alpha", 0.45)
+
     # ──────────────────────────────────────────────────────────────────────────
     def reset_target_state(self):
         """切换目标时调用：重置残差、离合、积分、冷启动，并强制触发重新规划。"""
         with self._lock:
             self.crosshair_velocity *= 0.08
+            self._wrist_velocity[:] = 0.0  # <--- 新增这行，清空手腕动能
             self._spf = 1.0
             self._spf_prev = 1.0
             self.integral[:] = 0.0
@@ -233,18 +243,16 @@ class PROController(BaseController):
             # 【核心安全锁】换目标必须立刻睁眼观察世界，拒绝发呆
             self._plan_timer = self._plan_interval
 
-            # ──────────────────────────────────────────────────────────────────────────
-
+    # ──────────────────────────────────────────────────────────────────────────
     def notify_flick_end(self):
         """人机 Flick 结束时调用：清除惯性并强制触发 AI 重新规划。"""
         with self._lock:
             self.crosshair_velocity *= self._flick_end_damp
+            self._wrist_velocity[:] = 0.0  # <--- 新增这行，清空手腕动能
             self.integral[:] = 0.0
             self._target_age_ms = 0.0
             # 【核心安全锁】人手接管完毕，立刻睁眼定位残差
             self._plan_timer = self._plan_interval
-
-            # ──────────────────────────────────────────────────────────────────────────
 
     def compute(
             self,
@@ -285,40 +293,63 @@ class PROController(BaseController):
             eff_human = human_vel * human_w
 
             total_crosshair_vel = self.crosshair_velocity + eff_human
-
             real_dist = float(np.linalg.norm(real_e_pos))
+            self._head_radius = max(5.0, bbox_w * 0.28)
+            # 【帧率自适应节拍器】：严格对齐捕获帧周期，杜绝相位撕裂
+            # 远距离观察间隔基准：约 50ms (比如 240Hz 下取 12 帧，120Hz 下取 6 帧)
+            frames_far = max(3, int(round(0.050 / self._frame_time)))
+            interval_far = frames_far * self._frame_time
 
-            # 动态节拍器：距离越近，观察频率越高
+            # 近距离观察间隔基准：约 25ms (比如 240Hz 下取 6 帧，120Hz 下取 3 帧)
+            frames_close = max(1, int(round(0.025 / self._frame_time)))
+            interval_close = frames_close * self._frame_time
+
             if real_dist > 100.0:
-                current_interval = 0.120  # 大甩：120ms 生理延迟
+                current_interval = interval_far
             elif real_dist < 30.0:
-                current_interval = 0.015  # 微调贴脸：15ms 极速反馈
+                current_interval = interval_close
             else:
                 progress = (real_dist - 30.0) / 70.0
-                current_interval = 0.015 + progress * (0.120 - 0.015)
+                current_interval = interval_close + progress * (interval_far - interval_close)
 
             self._plan_timer += dt
 
-            # 【惊跳反射 (Startle Response) 动态收紧】
-            startle_thresh = max(15.0, real_dist * 0.3)
+            # 【惊跳反射 (Startle Response) 动态收紧】向动态半径看齐
+            startle_thresh = max(self._head_radius, real_dist * 0.3)
             if np.linalg.norm(real_e_pos - self._ghost_e_pos) > startle_thresh:
+                self._plan_timer = current_interval
+
+            # 【新增：触膛唤醒】向动态半径看齐
+            if real_dist < self._head_radius and self.last_error_dist >= self._head_radius:
                 self._plan_timer = current_interval
 
             # 【阶段 1：观察足够，重新规划路径】
             if self._plan_timer >= current_interval:
-                self._ghost_e_pos = real_e_pos.copy()
-                self._ghost_vel = real_vel.copy()
-                self._ghost_acc = real_acc.copy()
+                # [路线 B 真实拟人化]：高斯分布的肌肉欠冲，向动态半径看齐
+                # 只有距离大于头部半径，且小于一定范围时才制造欠冲
+                if self._head_radius < real_dist < (self._head_radius + 65.0):
+                    # 欠冲落点均值设为刚好停在头部边缘外围一点点
+                    short_dist = max(1.5, min(18.0, np.random.normal(loc=self._head_radius * 0.6, scale=3.5)))
+                    direction = real_e_pos / real_dist
+                    self._ghost_e_pos = real_e_pos - direction * short_dist
+                else:
+                    self._ghost_e_pos = real_e_pos.copy()
+
+                # 【物理合理性保留】：人类视觉确实无法感知毫秒级的高频加速度
+                self._ghost_acc = np.zeros(2, dtype=np.float64)
+
+                # 视觉延迟带来的速度平滑保留
+                alpha_v = 0.6
+                self._ghost_vel = alpha_v * real_vel + (1.0 - alpha_v) * self._ghost_vel
+
                 self._plan_timer = 0.0
             # 【阶段 2：开环执行（模拟人类生理延迟盲区）】
             else:
-                # ✨ BIOMIMETIC 修复：人类大脑的保守预测衰减
-                # 闭眼越久，对目标保持原有速度的信心越低。防止敌方急停导致的 800px 致命过冲。
-                decay_factor = 0.94  # 每一帧预测速度衰减 6%
+                # 预测衰减：由于我们干掉了加速度，速度的衰减需要稍微平缓一点
+                decay_factor = 0.992
                 self._ghost_vel *= decay_factor
-                self._ghost_acc *= 0.85  # 加速度的置信度消失得更快
 
-                self._ghost_vel += self._ghost_acc * dt
+                # 仅靠速度积分进行盲区预测
                 self._ghost_e_pos += (self._ghost_vel - total_crosshair_vel) * dt
 
             # 瞒天过海：给下方所有系统（含 LQR 内核）喂食“影子目标”
@@ -350,12 +381,14 @@ class PROController(BaseController):
                 1.0
             ))
 
-            k_pos_t_eff = self._kp_track * age_ramp * depth_gain
-            k_pos_f_eff = self._kp_flick * age_ramp * depth_gain
-            k_vel_t_eff = self._kv_track * depth_gain
-            k_vel_f_eff = self._kv_flick * depth_gain
-            ff_acc_eff = self._ff_acc_gain * depth_gain
-            ki_eff = self._ki * depth_gain
+            effective_depth_gain = depth_gain * (0.75 + 0.25 / max(age_ramp, 0.75))
+
+            k_pos_t_eff = self._kp_track * age_ramp * effective_depth_gain
+            k_pos_f_eff = self._kp_flick * age_ramp * effective_depth_gain
+            k_vel_t_eff = self._kv_track * effective_depth_gain
+            k_vel_f_eff = self._kv_flick * effective_depth_gain
+            ff_acc_eff = self._ff_acc_gain * effective_depth_gain
+            ki_eff = self._ki * effective_depth_gain
 
             # ── § 3.6 LQI 内核计算 ──────────────────────────────────────────
             u_x, u_y = _lqr_kernel_v4(
@@ -385,14 +418,24 @@ class PROController(BaseController):
             self.crosshair_velocity += np.array([u_x, u_y]) * dt
 
             # ── § 3.9 轨道阻尼（Anti-orbit） ─────────────────────────────────
-            self.crosshair_velocity *= self._friction
+            if error_dist < 30.0:
+                dynamic_friction = self._friction * (0.985 + 0.01 * (error_dist / 30.0))
+            else:
+                dynamic_friction = self._friction
+            self.crosshair_velocity *= dynamic_friction
 
             # ── § 3.10 速度限幅 ──────────────────────────────────────────────
             speed = float(np.linalg.norm(self.crosshair_velocity))
             if speed > self.max_speed:
                 self.crosshair_velocity *= self.max_speed / speed
 
-            # ── § 3.11 mode 标志 ─────────────────────────────────────────────
+            # ── § 3.11 真实的生理反应死区 (Biological Reaction Deadzone) ──────────
+            # 人类不是“缓慢起步”，而是“绝对硬直 110ms -> 瞬间满负荷爆发”
+            if self._target_age_ms < 110.0:
+                # 视觉信号还在视神经传递，大脑未下达指令，手部肌肉强制锁死 (保留 2% 允许极微小游离)
+                self.crosshair_velocity *= 0.02
+
+            # ── § 3.12 mode 标志 ─────────────────────────────────────────────
             thresh_high = config.getfloat("Controller", "mode_threshold_high", 50.0)
             thresh_low = config.getfloat("Controller", "mode_threshold_low", 35.0)
             threshold = thresh_high if self.mode == "track" else thresh_low
@@ -400,43 +443,80 @@ class PROController(BaseController):
 
             return float(self.crosshair_velocity[0]), float(self.crosshair_velocity[1])
 
-    # ──────────────────────────────────────────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────────────────
     def tick_mouse(self) -> Tuple[int, int]:
         with self._lock:
-            dt = self.current_dt
+            # ================= 核心修复 1：分离物理时钟 =================
+            import time  # 局部导入，防止文件头部漏导
+            now = time.perf_counter()
+            if not hasattr(self, '_last_mouse_time'):
+                self._last_mouse_time = now
+                return 0, 0
 
+            # 获取真实的鼠标循环 dt (1000Hz 线程下通常在 0.001 秒左右)
+            dt = now - self._last_mouse_time
+            self._last_mouse_time = now
+
+            # 安全锁：如果系统卡顿，限制最大积分步长，防止准星瞬间跨越屏幕
+            if dt > 0.01:
+                dt = 0.001
+            if dt <= 0:
+                return 0, 0
+            # =========================================================
+
+            # ================= 核心修复 2：清理重复的手腕滤波器 =================
+            # 统一使用 config 中读取的 _wrist_alpha (约 0.22)，这是抑制 12 万加速度高频颤抖的核心
+            alpha_w = getattr(self, '_wrist_alpha', 0.22)
+            self._wrist_velocity = (1.0 - alpha_w) * self._wrist_velocity + alpha_w * self.crosshair_velocity
+
+            # ================= 核心修复 3：统一量纲 (物理 Counts 还原为 Pixels) =================
+            kx = config.getfloat("AimStrategy", "k_factor_x", 1.0)
+            # 将 LQR 里的 counts 距离还原为真实的屏幕像素，用于拟人化阈值判定
+            err_px = self.last_error_dist / max(kx, 0.01)
+            # 兼容读取动态头部大小，如果没有则回退到 15px
+            head_r = getattr(self, '_head_radius_px', getattr(self, '_head_radius', 15.0))
+
+            # ── 噪声相位积分 ──
             self._ph_3_2 = (self._ph_3_2 + 2.0 * np.pi * 3.2 * dt) % (2.0 * np.pi)
             self._ph_2_8 = (self._ph_2_8 + 2.0 * np.pi * 2.8 * dt) % (2.0 * np.pi)
-
             self._perlin_t += dt
+
             try:
                 import noise as _noise
-                px = _noise.pnoise1(
-                    self._perlin_t * 2.8 + self._perlin_off_x,
-                    octaves=4, persistence=0.5, lacunarity=2.0
-                ) * 0.085
-                py = _noise.pnoise1(
-                    self._perlin_t * 3.1 + self._perlin_off_y,
-                    octaves=4, persistence=0.5, lacunarity=2.0
-                ) * 0.085
+                # Perlin 噪声天生就是连续的低频波，非常适合模拟呼吸
+                px = _noise.pnoise1(self._perlin_t * 2.8 + self._perlin_off_x, octaves=2) * 0.05
+                py = _noise.pnoise1(self._perlin_t * 3.1 + self._perlin_off_y, octaves=2) * 0.05
             except Exception:
-                px = np.random.normal(0.0, 0.035)
-                py = np.random.normal(0.0, 0.035)
+                px, py = 0.0, 0.0
 
-            sx = 0.018 * np.sin(self._ph_3_2)
-            sy = 0.018 * np.sin(self._ph_2_8)
+            sx = 0.012 * np.sin(self._ph_3_2)
+            sy = 0.012 * np.sin(self._ph_2_8)
 
-            noise_amp = 0.55 if self.last_error_dist < 45.0 else 1.0
+            # [路线 B 真实拟人化]：根据真实的屏幕像素距离决定噪音振幅
+            if err_px < head_r:
+                target_noise_amp = 0.035
+            elif err_px < head_r * 2.5:
+                target_noise_amp = 0.12
+            else:
+                target_noise_amp = 0.40
 
-            nx = (px + sx + np.random.normal(0.0, 0.022)) * noise_amp
-            ny = (py + sy + np.random.normal(0.0, 0.022)) * noise_amp
+            # 【终极防抖细节】：平滑过渡噪音振幅，消除 if/else 带来的阶跃高频毛刺
+            if not hasattr(self, '_smoothed_noise_amp'):
+                self._smoothed_noise_amp = target_noise_amp
+            self._smoothed_noise_amp = 0.95 * self._smoothed_noise_amp + 0.05 * target_noise_amp
 
-            delta = self.crosshair_velocity * dt + self._subpixel
+            nx = (px + sx) * self._smoothed_noise_amp
+            ny = (py + sy) * self._smoothed_noise_amp
+
+            # ── 最终位移积分 ──
+            delta = self._wrist_velocity * dt + self._subpixel
             delta[0] += nx
             delta[1] += ny
 
             mx = int(np.floor(delta[0]))
             my = int(np.floor(delta[1]))
+
+            # 亚像素级残差保留，防止低速时被 int() 吃掉精度导致无法移动
             self._subpixel[0] = delta[0] - mx
             self._subpixel[1] = delta[1] - my
 
