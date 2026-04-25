@@ -565,7 +565,10 @@ class SimAIAgent:
 
             power_factor = spatial_factor * reaction_factor * human_override_factor
 
-            self.world_model.controller.compute(
+            ctrl = self.world_model.controller
+            if hasattr(ctrl, "set_mouse_emit"):
+                ctrl.set_mouse_emit(True)
+            ctrl.compute(
                 target_x=intent_x, target_y=intent_y, dt=dt,
                 human_v=np.array([human_vx_inst, human_vy_inst]),
                 v_real=np.array([intent_vx, intent_vy]),
@@ -581,6 +584,11 @@ class SimAIAgent:
             # 造成 SteadyMAE 飙升。reset 的正确时机只在 spawn_new_target 时调用
             # 一次（已在 spawn_new_target 里做了）。
             # 这里只记录 "AI 没发力"，保留 controller 的 arm_vel 与 Kalman 状态。
+            # 与实战一致：关 emit 避免 tick_mouse 对 OU/漂移 1kHz 积分，但不 freeze
+            #（保留 arm_vel 供重锁时续上）。
+            ctrl = self.world_model.controller
+            if hasattr(ctrl, "set_mouse_emit"):
+                ctrl.set_mouse_emit(False)
             self.last_ai_factor = 0.0
 
         self.tick_mouse()

@@ -250,6 +250,11 @@ class AIAgent:
 
         logger.info("Agent initialized")
 
+    def _freeze_mouse_motion(self):
+        c = self.controller
+        if hasattr(c, "freeze_output_integrators"):
+            c.freeze_output_integrators()
+
     # ────────────────────────────────────────────────────────────────────
     def start(self):
         self.capture_thread.start()
@@ -276,6 +281,7 @@ class AIAgent:
 
         now = time.perf_counter()
         if self.paused:
+            self._freeze_mouse_motion()
             self.last_tick_time = now
             return
 
@@ -289,13 +295,16 @@ class AIAgent:
         # ── 目标有效性判定 ───────────────────────────────────────────────
         # Bug J 修：p_predict 是 tuple，tuple 永远 truthy。显式 is None 判断
         if not self.ctx.is_valid or self.ctx.p_predict is None:
-            # Bug A 修：不再每帧 reset_target_state —— 每次 reset 会把
-            # arm_vel × 0.05，连乘 6 帧变 ~1e-8，高速追踪短暂丢帧后无法平滑续上。
-            # 让 controller 自然冻结（下次 compute 时延续 arm_vel），仅清掉外层
-            # 的"生命周期"状态。真正的 reset 只在首次见到"新"目标时做。
+            # 无有效目标时主线程不调用 compute，但 MouseWorker 仍 1kHz 跑 tick_mouse；
+            # 必须显式清积分器，否则会沿上一时刻 arm_vel/噪声持续乱飘。
+            self._freeze_mouse_motion()
             self.target_first_seen_time = 0.0
             self.is_target_in_crosshair = False
             return
+
+        c = self.controller
+        if hasattr(c, "set_mouse_emit"):
+            c.set_mouse_emit(True)
 
         # ── 首次见到目标：决定 chase_mode 并 reset controller ───────────
         first_frame = (self.target_first_seen_time == 0.0)
@@ -461,6 +470,5 @@ class AIAgent:
     def toggle_aimbot(self):
         self.enable_aimbot = not self.enable_aimbot
         if not self.enable_aimbot:
-            self.controller.crosshair_velocity[:] = 0
-            self.controller._subpixel[:] = 0
+            self._freeze_mouse_motion()
         logger.warning("AIMBOT: %s", self.enable_aimbot)

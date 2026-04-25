@@ -313,6 +313,9 @@ class PROController:
 
         # ── Subpixel accumulator & output clock ───────────────────────────────
         self._subpixel        = np.zeros(2, dtype=np.float64)
+        # 仅主线程在「有目标且会 compute」时置 True。否则 1kHz tick_mouse 会对 OU/漂移
+        # 做随机游走 → 无目标/暂停/启动阶段仍见缓慢漂移（如持续向左上）。
+        self._emit_mouse: bool = False
         self._last_mouse_time: Optional[float] = None
         # sim 侧使用的"真实浮点位移"（counts，不含 subpixel 残差），每次 tick_mouse
         # 更新。真实驱动依然收整数；这只是给 sim_agent 更新 crosshair_pos 用
@@ -475,6 +478,30 @@ class PROController:
             self.crosshair_velocity *= self._flick_end_damp
             self._age_ms  = 0.0
             self._last_prog_time = -999.0   # arm re-trigger
+
+    def freeze_output_integrators(self) -> None:
+        """
+        主线程未调用 compute 时，tick_mouse 仍会以 1kHz 积分 _arm_vel 与 tremor/drift。
+        暂停 / 无有效目标 时必须清零，否则会出现持续漂移或「按 P 也不停」。
+        """
+        with self._lock:
+            self._arm_vel[:] = 0.0
+            self._wrist_vel[:] = 0.0
+            self.crosshair_velocity[:] = 0.0
+            self._ou_state[:] = 0.0
+            self._drift_state[:] = 0.0
+            self._subpixel[:] = 0.0
+            self._last_delta_float = (0.0, 0.0)
+            self._prog_t = 0.0
+            self._spf = 0.0
+            self._phase = self._TRACKING
+            self._last_prog_time = -999.0
+            self._emit_mouse = False
+
+    def set_mouse_emit(self, enable: bool) -> None:
+        """是否允许 tick_mouse 执行 OU/腕滤波与相对位移。无目标/暂停 必须为 False。"""
+        with self._lock:
+            self._emit_mouse = bool(enable)
 
     # ──────────────────────────────────────────────────────────────────────────
     def compute(
@@ -788,6 +815,11 @@ class PROController:
         with self._lock:
             now = time.perf_counter()
             if self._last_mouse_time is None:
+                self._last_mouse_time = now
+                return 0, 0
+
+            # 无 emit 时禁止走 OU/漂移（否则 1kHz 纯噪声积分 → 极慢的斜向「爬行」）
+            if not self._emit_mouse:
                 self._last_mouse_time = now
                 return 0, 0
 
