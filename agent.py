@@ -252,6 +252,8 @@ class AIAgent:
         self._first_tick: bool = True
         # conf / is_valid 单帧毛刺 若立刻 target_first_seen=0 → 每帧都 reset_target_state → 准星旁摆
         self._invalid_streak: int = 0
+        self._aim_lock_diag: bool = config.getbool("Debug", "aim_lock_diag", False)
+        self._last_move_emit_log: float = 0.0
 
         logger.info("Agent core constructed (WorldModel+threads configured, not started)")
         self._log_runtime_summary()
@@ -260,6 +262,26 @@ class AIAgent:
         c = self.controller
         if hasattr(c, "freeze_output_integrators"):
             c.freeze_output_integrators()
+
+    def _log_aim_lock(self, event: str, **fields) -> None:
+        """可开关的拆锁/首锁诊断，便于从日志直读根因（配合 [Debug] aim_lock_diag）。"""
+        if not self._aim_lock_diag:
+            return
+        extra = " | ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+        if extra:
+            logger.info("AimLock | %s | %s", event, extra)
+        else:
+            logger.info("AimLock | %s", event)
+
+    @staticmethod
+    def _ctx_best_cls(ctx: InferenceContext) -> int:
+        t = ctx.targets
+        if not t:
+            return -1
+        try:
+            return int(t[0].class_id)
+        except (TypeError, ValueError, IndexError):
+            return -1
 
     def _log_runtime_summary(self) -> None:
         if not config.getbool("Debug", "startup_diag", True):
@@ -285,6 +307,10 @@ class AIAgent:
         if stream_ms < 1.0 and config.getfloat("WorldModel", "moonlight_latency_ms", 0.0) < 0.5:
             logger.info(
                 "WorldModel | stream_ingress≈0：若用 Moonlight/云游戏仍摆/穿零，把 [WorldModel] moonlight_latency_ms 调到 25–45 再试"
+            )
+        if self._aim_lock_diag:
+            logger.info(
+                "AimLock diag: ON | 见日志前缀 AimLock | DROP/HOLD/ACQUIRE/COAST/SKIP，定位为何重复 Target acquired"
             )
         logger.info(
             "Pipeline | [Capture+cap_event] -> Inference -> update_detections&frame_ready -> main.tick; "
@@ -343,6 +369,15 @@ class AIAgent:
 
         # coast：无新框但 Kalman 仍在 150ms 内续跑；勿当「无效」累加 streak → 否则 2 帧拆锁 → 狂刷 Target acquired
         if self.ctx.is_coasting:
+            if self._aim_lock_diag:
+                t0 = time.perf_counter()
+                if t0 - getattr(self, "_aim_coast_log_t", 0) > 0.25:
+                    self._aim_coast_log_t = t0
+                    self._log_aim_lock(
+                        "COAST",
+                        lock_kept=self.target_first_seen_time > 0.0,
+                        dets_ctx=len(self.ctx.targets or []),
+                    )
             self._freeze_mouse_motion()
             self.last_tick_time = now
             return
@@ -353,6 +388,7 @@ class AIAgent:
             self._first_tick = False
         elif dt <= 0 or dt > 0.1:
             # 异常 dt（首帧外）：关 emit
+            self._log_aim_lock("SKIP", reason="bad_dt", dt_ms=round(dt * 1000.0, 2), note="lock_not_cleared")
             self._freeze_mouse_motion()
             return
 
@@ -368,8 +404,29 @@ class AIAgent:
             n_inv_drop = max(1, int(config.getint("General", "aim_drop_invalid_frames", 2)))
             # 已锁时：短无效帧只 freeze 不拆锁，避免丢框一帧就 reset 控制器 → 贴脸来回摆
             if self.target_first_seen_time > 0.0 and self._invalid_streak < n_inv_drop:
+                if self._aim_lock_diag and self._invalid_streak == 1:
+                    self._log_aim_lock(
+                        "HOLD",
+                        reason="invalid",
+                        streak=self._invalid_streak,
+                        need_drop_at=n_inv_drop,
+                        is_valid=self.ctx.is_valid,
+                        has_p=(self.ctx.p_predict is not None),
+                        dets=len(self.ctx.targets or []),
+                        cls=self._ctx_best_cls(self.ctx),
+                    )
                 self._freeze_mouse_motion()
                 return
+            self._log_aim_lock(
+                "DROP",
+                reason="invalid",
+                streak=self._invalid_streak,
+                need_streak=">=" + str(n_inv_drop),
+                is_valid=self.ctx.is_valid,
+                has_p=(self.ctx.p_predict is not None),
+                dets=len(self.ctx.targets or []),
+                cls=self._ctx_best_cls(self.ctx),
+            )
             self._freeze_mouse_motion()
             self.target_first_seen_time = 0.0
             self.is_target_in_crosshair = False
@@ -388,6 +445,14 @@ class AIAgent:
                 return
         else:
             if self.ctx.conf < min_drop:
+                self._log_aim_lock(
+                    "DROP",
+                    reason="conf",
+                    conf=round(self.ctx.conf, 3),
+                    min_drop=round(min_drop, 3),
+                    dets=len(self.ctx.targets or []),
+                    cls=self._ctx_best_cls(self.ctx),
+                )
                 self._freeze_mouse_motion()
                 self.target_first_seen_time = 0.0
                 self.is_target_in_crosshair = False
@@ -414,6 +479,13 @@ class AIAgent:
                     self.controller.reset_target_state()
             logger.info("Target acquired (mode=%s, human_speed_100ms=%.0f)",
                         self._current_chase_mode, recent_speed)
+            self._log_aim_lock(
+                "ACQUIRE",
+                mode=self._current_chase_mode,
+                dets=len(self.ctx.targets or []),
+                conf=round(self.ctx.conf, 3),
+                cls=self._ctx_best_cls(self.ctx),
+            )
 
         dx_h_inst, dy_h_inst = self.ring_buffer.get_pure_human_delta_sum(now - dt, now)
         human_vx_inst = dx_h_inst / dt if dt > 0 else 0.0
@@ -488,6 +560,25 @@ class AIAgent:
             power_factor=power_factor,
             bbox_w=bbox_w,
         )
+
+        if config.getbool("Debug", "move_emit_diag", False):
+            ival = config.getfloat("Debug", "move_emit_log_interval_sec", 0.2)
+            t_m = time.perf_counter()
+            if t_m - self._last_move_emit_log >= ival:
+                self._last_move_emit_log = t_m
+                d = self.controller.get_move_emit_diag()
+                if d is not None:
+                    eix, eiy = d["prev_emit_int"]
+                    efx, efy = d["prev_emit_flt"]
+                    cvx, cvy = d["cmd_vel_ct_s"]
+                    dts = d["dt_s"]
+                    ex = cvx * dts
+                    ey = cvy * dts
+                    logger.info(
+                        "MoveEmit | 上周期(两次compute间)实发 ct_int=(%d,%d) ct_flt=(%.3f,%.3f) | "
+                        "本帧末 cmd_vel=(%.1f,%.1f)ct/s dt=%.4fs 粗 v*dt=(%.2f,%.2f) [v*dt 为快照粗算；上周期实发由 1kHz+腕/OU+取整 积分]",
+                        eix, eiy, efx, efy, cvx, cvy, dts, ex, ey,
+                    )
 
         if config.getbool("Debug", "aim_diagnostics", False) or config.getbool("Debug", "aim_diag_warn_only", False):
             from utils.aim_diagnostics import aim_diag

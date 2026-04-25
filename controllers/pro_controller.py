@@ -324,6 +324,17 @@ class PROController:
         # 更新。真实驱动依然收整数；这只是给 sim_agent 更新 crosshair_pos 用
         self._last_delta_float: Tuple[float, float] = (0.0, 0.0)
 
+        # MoveEmit 诊断：两次 compute 之间 1kHz 累计的 SendInput 整型/浮点位移 (counts)
+        self._emit_ix = 0
+        self._emit_iy = 0
+        self._emit_fx = 0.0
+        self._emit_fy = 0.0
+        self._move_diag_prev_int = (0, 0)
+        self._move_diag_prev_flt = (0.0, 0.0)
+        self._move_diag_cvx = 0.0
+        self._move_diag_cvy = 0.0
+        self._move_diag_dt = 0.001
+
         # ── Public tracking state ──────────────────────────────────────────────
         self.last_error_dist = 0.0
         self._head_radius    = 15.0
@@ -506,6 +517,24 @@ class PROController:
         with self._lock:
             self._emit_mouse = bool(enable)
 
+    def _accum_emit_tick(self, mx: int, my: int, fdx: float, fdy: float) -> None:
+        self._emit_ix += mx
+        self._emit_iy += my
+        self._emit_fx += fdx
+        self._emit_fy += fdy
+
+    def get_move_emit_diag(self):
+        """供 Debug：上一主周期实际累计位移 vs 本帧末臂速度指令。基类默认 None。"""
+        with self._lock:
+            eix, eiy = self._move_diag_prev_int
+            efx, efy = self._move_diag_prev_flt
+            return {
+                "prev_emit_int": (eix, eiy),
+                "prev_emit_flt": (efx, efy),
+                "cmd_vel_ct_s": (self._move_diag_cvx, self._move_diag_cvy),
+                "dt_s": self._move_diag_dt,
+            }
+
     # ──────────────────────────────────────────────────────────────────────────
     def compute(
             self,
@@ -536,6 +565,15 @@ class PROController:
         同时写入 self._arm_vel 与 self.crosshair_velocity（外部只读）。
         """
         with self._lock:
+            p_ix, p_iy = self._emit_ix, self._emit_iy
+            p_fx, p_fy = self._emit_fx, self._emit_fy
+            self._emit_ix = 0
+            self._emit_iy = 0
+            self._emit_fx = 0.0
+            self._emit_fy = 0.0
+            self._move_diag_prev_int = (int(p_ix), int(p_iy))
+            self._move_diag_prev_flt = (float(p_fx), float(p_fy))
+
             dt = max(dt, 0.0005)
             self._elapsed += dt
             is_pure_ai = (self._chase_mode == 'pure_ai')
@@ -798,6 +836,10 @@ class PROController:
             threshold = thresh_high_counts if self.mode == "track" else thresh_low_counts  # [FIX]
             self.mode = "flick" if dist > threshold else "track"
 
+            self._move_diag_dt = float(dt)
+            self._move_diag_cvx = float(self._arm_vel[0])
+            self._move_diag_cvy = float(self._arm_vel[1])
+
             return float(self._arm_vel[0]), float(self._arm_vel[1])
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -819,11 +861,13 @@ class PROController:
             now = time.perf_counter()
             if self._last_mouse_time is None:
                 self._last_mouse_time = now
+                self._accum_emit_tick(0, 0, 0.0, 0.0)
                 return 0, 0
 
             # 无 emit 时禁止走 OU/漂移（否则 1kHz 纯噪声积分 → 极慢的斜向「爬行」）
             if not self._emit_mouse:
                 self._last_mouse_time = now
+                self._accum_emit_tick(0, 0, 0.0, 0.0)
                 return 0, 0
 
             dt = now - self._last_mouse_time
@@ -833,6 +877,7 @@ class PROController:
             if dt > 0.015:
                 dt = 0.002
             if dt <= 0.0:
+                self._accum_emit_tick(0, 0, 0.0, 0.0)
                 return 0, 0
 
             # ── § 1. Advance OU tremor state (Brown & Loeb 2000) ───────────────
@@ -897,4 +942,5 @@ class PROController:
                 self._wrist_vel[0] * dt + drift_x,
                 self._wrist_vel[1] * dt + drift_y,
             )
+            self._accum_emit_tick(mx, my, self._last_delta_float[0], self._last_delta_float[1])
             return mx, my

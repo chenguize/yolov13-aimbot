@@ -105,3 +105,10 @@ class BaseController(ABC):
         使用 self.vel / self.pos
         """
         pass
+
+    def get_move_emit_diag(self):
+        """
+        可选：PROController 在 compute 与 tick_mouse 之间统计「指令速度 vs 实际下发」。
+        非 PRO 或尚未实现时返回 None。
+        """
+        return None
