@@ -341,6 +341,12 @@ class AIAgent:
 
         self.world_model.step(self.ctx, self.ring_buffer)
 
+        # coast：无新框但 Kalman 仍在 150ms 内续跑；勿当「无效」累加 streak → 否则 2 帧拆锁 → 狂刷 Target acquired
+        if self.ctx.is_coasting:
+            self._freeze_mouse_motion()
+            self.last_tick_time = now
+            return
+
         dt = now - self.last_tick_time
         self.last_tick_time = now
         if self._first_tick:

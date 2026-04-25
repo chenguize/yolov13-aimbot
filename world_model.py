@@ -200,6 +200,7 @@ class WorldModel:
 
     def step(self, context: InferenceContext, ring_buffer: RingBuffer):
         self.ring_buffer = ring_buffer
+        context.is_coasting = False
         now = time.perf_counter()
 
         if self.last_ts == 0:
@@ -351,6 +352,7 @@ class WorldModel:
         # 丢框后的 150ms 纯预测 (coast)：不输出 p_predict 给主循环，避免盲飞阶段乱吸鼠标 /
         # 「无目标也在动」；Kalman 已在上面 predict 过，保持内部状态即可。
         if is_coasting:
+            context.is_coasting = True
             context.p_predict = None
             context.v_real = (0.0, 0.0)
             context.a_real = (0.0, 0.0)

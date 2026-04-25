@@ -76,6 +76,8 @@ class InferenceContext:
     # 原 Tuple 默认 (0.0, 0.0) 导致 `if not ctx.p_predict` 判空失效（tuple 永真）。
     p_predict: Optional[Tuple[float, float]] = None
     is_valid: bool = False  # 本帧数据是否可信 (是否允许开火/瞄准)
+    # 丢框后 150ms 内 Kalman coast：无 p_predict 但不应按「无效」拆锁（否则 2 帧就 reset → Target acquired 刷屏）
+    is_coasting: bool = False
 
     # [关键修复] 目标置信度 (用于 Triggerbot 判定)
     conf: float = 0.0
