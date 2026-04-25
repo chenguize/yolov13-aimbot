@@ -452,6 +452,31 @@ class AIAgent:
             bbox_w=bbox_w,
         )
 
+        if config.getbool("Debug", "aim_diagnostics", False) or config.getbool("Debug", "aim_diag_warn_only", False):
+            from utils.aim_diagnostics import aim_diag
+            _d = aim_diag()
+            ar = np.asarray(self.controller.crosshair_velocity, dtype=np.float64)
+            _d.record(
+                px=p_x,
+                py=p_y,
+                intent_x=intent_x,
+                intent_y=intent_y,
+                power=power_factor,
+                human_override=human_override,
+                spatial=spatial_factor,
+                reaction=reaction_factor,
+                arm_vx=float(ar.flat[0]),
+                arm_vy=float(ar.flat[1]),
+                mode=str(getattr(self.controller, "mode", "?")),
+                lead_ms=float(getattr(self.ctx, "dynamic_lag_ms", 0.0)),
+                vh_s=float(getattr(self.world_model, "dynamic_vh_latency", 0.0)),
+                inf_ema=float(getattr(self.world_model, "inference_ms_ema", 0.0)),
+                dt=dt,
+                chase=self._current_chase_mode,
+                bypass_map=bool(getattr(self.aim_strategy, "bypass_mapping", False)),
+            )
+            _d.maybe_emit()
+
         if self.enable_aimbot:
             self._check_and_trigger()
 
