@@ -250,6 +250,8 @@ class AIAgent:
         self.movement_tracker = MovementTracker()
         # 首帧前 last_tick 距当前可达数百 ms，若参与 dt>0.1 判定会误整段不 compute
         self._first_tick: bool = True
+        # conf / is_valid 单帧毛刺 若立刻 target_first_seen=0 → 每帧都 reset_target_state → 准星旁摆
+        self._invalid_streak: int = 0
 
         logger.info("Agent core constructed (WorldModel+threads configured, not started)")
         self._log_runtime_summary()
@@ -266,11 +268,15 @@ class AIAgent:
         bp = getattr(st, "bypass_mapping", None)
         cap = int(self.crop_center * 2) if self.crop_center is not None else config.getint("General", "capture_size", 256)
         mac = config.getfloat("General", "min_aim_conf", 0.32)
+        mdr = min(mac - 1e-3, config.getfloat("General", "min_aim_conf_drop", 0.20))
+        ninv = max(1, int(config.getint("General", "aim_drop_invalid_frames", 2)))
         logger.info(
-            "Runtime | capture=%dpx | inf_conf>=%.2f | min_aim=%.2f | strategy_bypass=%s | model=%s",
+            "Runtime | capture=%dpx | inf_conf>=%.2f | min_aim=%.2f (drop<%.2f) inv_n=%d | strategy_bypass=%s | model=%s",
             cap,
             config.getfloat("Inference", "conf_threshold", 0.4),
             mac,
+            mdr,
+            ninv,
             bp,
             config.getstr("Inference", "model_path", ""),
         )
@@ -340,21 +346,40 @@ class AIAgent:
 
         # ── 目标有效性判定 ───────────────────────────────────────────────
         # Bug J 修：p_predict 是 tuple，tuple 永远 truthy。显式 is None 判断
-        if not self.ctx.is_valid or self.ctx.p_predict is None:
-            # 无有效目标时主线程不调用 compute，但 MouseWorker 仍 1kHz 跑 tick_mouse；
-            # 必须显式清积分器，否则会沿上一时刻 arm_vel/噪声持续乱飘。
+        invalid = (not self.ctx.is_valid) or (self.ctx.p_predict is None)
+        if invalid:
+            self._invalid_streak += 1
+        else:
+            self._invalid_streak = 0
+
+        if invalid:
+            n_inv_drop = max(1, int(config.getint("General", "aim_drop_invalid_frames", 2)))
+            # 已锁时：短无效帧只 freeze 不拆锁，避免丢框一帧就 reset 控制器 → 贴脸来回摆
+            if self.target_first_seen_time > 0.0 and self._invalid_streak < n_inv_drop:
+                self._freeze_mouse_motion()
+                return
             self._freeze_mouse_motion()
             self.target_first_seen_time = 0.0
             self.is_target_in_crosshair = False
             return
 
-        # 与 Inference.conf_threshold 对齐的可调门限，防止低分框/桌面噪声「假锁人」
-        min_aim_conf = config.getfloat("General", "min_aim_conf", 0.32)
-        if self.ctx.conf < min_aim_conf:
-            self._freeze_mouse_motion()
-            self.target_first_seen_time = 0.0
-            self.is_target_in_crosshair = False
-            return
+        # conf 滞回：未锁时须 ≥ min_aim_conf；已锁时须 ≥ min_aim_conf_drop 才继续，否者拆锁
+        # 单阈值时 conf 在 0.30~0.38 间抖会每帧「丢→锁→reset」→ 日志狂刷 Target acquired
+        min_aim = config.getfloat("General", "min_aim_conf", 0.32)
+        min_drop = min(
+            min_aim - 1e-3,
+            config.getfloat("General", "min_aim_conf_drop", 0.20),
+        )
+        if self.target_first_seen_time == 0.0:
+            if self.ctx.conf < min_aim:
+                self._freeze_mouse_motion()
+                return
+        else:
+            if self.ctx.conf < min_drop:
+                self._freeze_mouse_motion()
+                self.target_first_seen_time = 0.0
+                self.is_target_in_crosshair = False
+                return
 
         c = self.controller
         if hasattr(c, "set_mouse_emit"):
