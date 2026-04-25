@@ -304,6 +304,10 @@ class AIAgent:
             bp,
             config.getstr("Inference", "model_path", ""),
         )
+        logger.info(
+            "WorldModel | predict_ahead=%s | False 时无时间前推，动目标/高延迟会偏「拖尾」，可对照过冲/穿零是否由 lead 引起",
+            config.getbool("WorldModel", "predict_ahead", True),
+        )
         if stream_ms < 1.0 and config.getfloat("WorldModel", "moonlight_latency_ms", 0.0) < 0.5:
             logger.info(
                 "WorldModel | stream_ingress≈0：若用 Moonlight/云游戏仍摆/穿零，把 [WorldModel] moonlight_latency_ms 调到 25–45 再试"

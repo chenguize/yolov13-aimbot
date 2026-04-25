@@ -416,60 +416,66 @@ class WorldModel:
         abs_velocity = target.state[2:4].copy()
         abs_accel = target.state[4:6].copy()
 
-        t_capture = now
-        if data is not None:
-            t_capture = data.get("t_capture", now)
+        if not config.getbool("WorldModel", "predict_ahead", True):
+            # 关「时间前视」：瞄准误差 = 当前 KF 平滑后的物面位置 − 准星（不做 v·T/½aT²/ctrl_lead）。
+            # 动目标/高延迟下会**滞后**，可用来对照过冲/穿零是否由 lead 引起；v_real/a_real 仍给控制器前馈。
+            rel_pred_pos = abs_position - self.ego_pos_px
+            context.dynamic_lag_ms = 0.0
+        else:
+            t_capture = now
+            if data is not None:
+                t_capture = data.get("t_capture", now)
 
-        software_lag = now - t_capture
-        # 串流 ingress + 本机 t_cap→本步 的软件排队/推理/线程间隙 + 键鼠/显示刚性延迟
-        raw_lead_time = self._stream_ingress_s + software_lag + self.base_hardware_lag
-        # 高串流场景可能 >120ms，钳太死会系统性地短 lead → 准星在目标后「追逐振荡」
-        raw_lead_time = float(np.clip(raw_lead_time, 0.005, 0.200))
-        # 网络/调度抖动大时加快跟上，减小编码抖动的预测滞后
-        lead_gap = abs(raw_lead_time - self.smoothed_lead_time)
-        ema = 0.50 if lead_gap > 0.025 else 0.15
-        self.smoothed_lead_time = (1.0 - ema) * self.smoothed_lead_time + ema * raw_lead_time
+            software_lag = now - t_capture
+            # 串流 ingress + 本机 t_cap→本步 的软件排队/推理/线程间隙 + 键鼠/显示刚性延迟
+            raw_lead_time = self._stream_ingress_s + software_lag + self.base_hardware_lag
+            # 高串流场景可能 >120ms，钳太死会系统性地短 lead → 准星在目标后「追逐振荡」
+            raw_lead_time = float(np.clip(raw_lead_time, 0.005, 0.200))
+            # 网络/调度抖动大时加快跟上，减小编码抖动的预测滞后
+            lead_gap = abs(raw_lead_time - self.smoothed_lead_time)
+            ema = 0.50 if lead_gap > 0.025 else 0.15
+            self.smoothed_lead_time = (1.0 - ema) * self.smoothed_lead_time + ema * raw_lead_time
 
-        base_lead = self.smoothed_lead_time
+            base_lead = self.smoothed_lead_time
 
-        accel_norm = np.linalg.norm(abs_accel)
-        accel_penalty = 1.0 / (1.0 + 0.001 * accel_norm)
-        cov_trace = np.trace(target.covariance)
-        cov_penalty = np.clip(1.0 - (cov_trace - 450.0) / 1400.0, 0.45, 1.0)
+            accel_norm = np.linalg.norm(abs_accel)
+            accel_penalty = 1.0 / (1.0 + 0.001 * accel_norm)
+            cov_trace = np.trace(target.covariance)
+            cov_penalty = np.clip(1.0 - (cov_trace - 450.0) / 1400.0, 0.45, 1.0)
 
-        # ── 架构改进：复合 lead = 管道延迟 + 控制器剩余执行时长 ───────────────
-        # 原 smart_lead 只覆盖 "拍照 → 命令发出" 的管道延迟（~15-30ms），但
-        # BALLISTIC 本身是 80~200ms 的开环 min-jerk 轨迹；期间目标会持续移动，
-        # p_predict 若不把这段时间算进去，BALLISTIC 着陆时天然产生 ~V_target·T
-        # 级别的系统偏差（e.g. 10m/8.5m/s → ~60-90px），逼 TRACKING 多花 150-300ms
-        # 把这段偏差磨掉 —— 这就是 pure_ai 0.617s TTK 的核心源头。
-        #
-        # ctrl_lead 默认 0（保持对无此接口的控制器的兼容）；CIPHER 的
-        # get_expected_lead() 在 BALLISTIC 返回 remain·0.5（质心时刻），
-        # 在 TRACKING/空转时返回 0。
-        ctrl_lead = 0.0
-        if hasattr(self.controller, 'get_expected_lead'):
-            try:
-                ctrl_lead = float(self.controller.get_expected_lead())
-            except Exception:
-                ctrl_lead = 0.0
-        # ctrl_lead 上限 150ms，防极端 Fitts 尾巴把 p_predict 推太远造成过冲
-        ctrl_lead = float(np.clip(ctrl_lead, 0.0, 0.150))
+            # ── 架构改进：复合 lead = 管道延迟 + 控制器剩余执行时长 ───────────────
+            # 原 smart_lead 只覆盖 "拍照 → 命令发出" 的管道延迟（~15-30ms），但
+            # BALLISTIC 本身是 80~200ms 的开环 min-jerk 轨迹；期间目标会持续移动，
+            # p_predict 若不把这段时间算进去，BALLISTIC 着陆时天然产生 ~V_target·T
+            # 级别的系统偏差（e.g. 10m/8.5m/s → ~60-90px），逼 TRACKING 多花 150-300ms
+            # 把这段偏差磨掉 —— 这就是 pure_ai 0.617s TTK 的核心源头。
+            #
+            # ctrl_lead 默认 0（保持对无此接口的控制器的兼容）；CIPHER 的
+            # get_expected_lead() 在 BALLISTIC 返回 remain·0.5（质心时刻），
+            # 在 TRACKING/空转时返回 0。
+            ctrl_lead = 0.0
+            if hasattr(self.controller, 'get_expected_lead'):
+                try:
+                    ctrl_lead = float(self.controller.get_expected_lead())
+                except Exception:
+                    ctrl_lead = 0.0
+            # ctrl_lead 上限 150ms，防极端 Fitts 尾巴把 p_predict 推太远造成过冲
+            ctrl_lead = float(np.clip(ctrl_lead, 0.0, 0.150))
 
-        # accel/cov penalty 只作用于管道 lead 部分（物理噪声相关），不惩罚
-        # 控制器自身的确定性剩余时间 —— 否则 BALLISTIC 会永远"差一截"。
-        pipeline_lead = base_lead * accel_penalty * cov_penalty
-        smart_lead    = pipeline_lead + ctrl_lead
+            # accel/cov penalty 只作用于管道 lead 部分（物理噪声相关），不惩罚
+            # 控制器自身的确定性剩余时间 —— 否则 BALLISTIC 会永远"差一截"。
+            pipeline_lead = base_lead * accel_penalty * cov_penalty
+            smart_lead    = pipeline_lead + ctrl_lead
 
-        accel_bonus = 0.5 * abs_accel * (smart_lead ** 2)
-        bonus_norm = float(np.linalg.norm(accel_bonus))
-        if bonus_norm > 28.0:
-            accel_bonus = accel_bonus * (28.0 / bonus_norm)
+            accel_bonus = 0.5 * abs_accel * (smart_lead ** 2)
+            bonus_norm = float(np.linalg.norm(accel_bonus))
+            if bonus_norm > 28.0:
+                accel_bonus = accel_bonus * (28.0 / bonus_norm)
 
-        pred_abs_pos = abs_position + abs_velocity * smart_lead + accel_bonus
+            pred_abs_pos = abs_position + abs_velocity * smart_lead + accel_bonus
 
-        context.dynamic_lag_ms = smart_lead * 1000.0
-        rel_pred_pos = pred_abs_pos - self.ego_pos_px
+            context.dynamic_lag_ms = smart_lead * 1000.0
+            rel_pred_pos = pred_abs_pos - self.ego_pos_px
 
         # 此处 is_coasting 已提前 return，仅保留有量测的帧
         error_distance = np.linalg.norm(measurement)
