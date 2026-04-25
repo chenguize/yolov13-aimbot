@@ -6,6 +6,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from config import config
+from utils.aim_class_filter import filter_yolo_boxes
 from perception.bus import FrameBus
 from world_model import WorldModel
 
@@ -91,6 +92,8 @@ class InferenceThread(threading.Thread):
                     if r.boxes is not None and len(r.boxes) > 0:
                         detections = r.boxes.data.cpu().numpy()
                     break
+
+                detections = filter_yolo_boxes(detections)
 
                 t_inference_done = time.perf_counter()
                 last_inference_ms = (t_inference_done - t_inference_start) * 1000.0

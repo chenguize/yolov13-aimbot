@@ -6,13 +6,43 @@ import time
 import threading
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 
 from config import config
+from utils.aim_class_filter import get_aim_target_class_set
 from perception.ring_buffer import RingBuffer
 
 _log = logging.getLogger("WorldModel")
 from utils.types import Detection, InferenceContext
+
+
+def _reorder_dets_by_sticky_prev(
+    dets: List[Detection],
+    sticky: Optional[Tuple[float, float, float, float]],
+    conf_margin: float,
+    max_center_px: float,
+) -> List[Detection]:
+    """
+    多目标时若仅按 conf 排序，两人 conf 接近时 best 会在两框间来回切 → 量测跳变 → Kalman/前馈穿零。
+    在「与上一帧首选中心距离近 + conf 仍在 top 一带」时保持同一物理目标优先。
+    """
+    if sticky is None or len(dets) < 2:
+        return dets
+    pcx, pcy = float(sticky[0]), float(sticky[1])
+    out = sorted(dets, key=lambda d: d.conf, reverse=True)
+    best_c = out[0].conf
+    in_band = [d for d in out if d.conf >= best_c - conf_margin]
+    if not in_band:
+        return out
+    closest = min(in_band, key=lambda d: float(np.hypot(d.x - pcx, d.y - pcy)))
+    ddist = float(np.hypot(closest.x - pcx, closest.y - pcy))
+    if ddist >= max_center_px:
+        return out
+    if out[0] is closest:
+        return out
+    others = [d for d in out if d is not closest]
+    others.sort(key=lambda d: d.conf, reverse=True)
+    return [closest] + others
 from aim_strategies.factory import create_aim_strategy
 
 try:
@@ -182,6 +212,9 @@ class WorldModel:
         # 推理耗时 EMA（毫秒），用于诊断与可选的 lead 自适应
         self.inference_ms_ema: float = 0.0
 
+        # 多目标时按上一帧首选框 (cx,cy,w,h) 粘滞 best，减轻 conf 微差导致 cls/框切换 → 量测跳变
+        self._sticky_crop: Optional[Tuple[float, float, float, float]] = None
+
     def update_detections(self, detections: np.ndarray, frame_id: int, t_capture: float, t_done: float):
         with self._data_lock:
             self._latest_detection_data = {
@@ -259,19 +292,38 @@ class WorldModel:
             ego_at_capture[1] -= r_px_dy
 
             if len(data["detections"]) > 0:
-                dets = []
+                dets: List[Detection] = []
+                cls_allow = get_aim_target_class_set()
                 for box in data["detections"]:
                     x1, y1, x2, y2, conf, cls = box
-                    if conf < 0.3: continue
+                    if conf < 0.3:
+                        continue
+                    ci = int(cls)
+                    if cls_allow is not None and ci not in cls_allow:
+                        continue
                     cx = (x1 + x2) / 2.0
                     cy = (y1 + y2) / 2.0
-                    dets.append(Detection(x=cx, y=cy, w=x2 - x1, h=y2 - y1, conf=conf, class_id=int(cls)))
-                dets.sort(key=lambda d: d.conf, reverse=True)
-                context.targets = dets
-                if dets:
+                    dets.append(Detection(x=cx, y=cy, w=x2 - x1, h=y2 - y1, conf=conf, class_id=ci))
+                if not dets:
+                    context.targets = []
+                    self._sticky_crop = None
+                else:
+                    dets.sort(key=lambda d: d.conf, reverse=True)
+                    if config.getbool("WorldModel", "sticky_target_enable", True) and len(dets) >= 2:
+                        dets = _reorder_dets_by_sticky_prev(
+                            dets,
+                            self._sticky_crop,
+                            config.getfloat("WorldModel", "sticky_conf_margin", 0.10),
+                            config.getfloat("WorldModel", "sticky_max_center_px", 120.0),
+                        )
+                    context.targets = dets
                     self.current_bbox_w = float(dets[0].w)
+                    self._sticky_crop = (
+                        float(dets[0].x), float(dets[0].y), float(dets[0].w), float(dets[0].h),
+                    )
             else:
                 context.targets = []
+                self._sticky_crop = None
 
         best_detection = context.targets[0] if context.targets else None
         target = None
