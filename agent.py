@@ -270,16 +270,22 @@ class AIAgent:
         mac = config.getfloat("General", "min_aim_conf", 0.32)
         mdr = min(mac - 1e-3, config.getfloat("General", "min_aim_conf_drop", 0.20))
         ninv = max(1, int(config.getint("General", "aim_drop_invalid_frames", 2)))
+        stream_ms = float(getattr(self.world_model, "_stream_ingress_s", 0.0)) * 1000.0
         logger.info(
-            "Runtime | capture=%dpx | inf_conf>=%.2f | min_aim=%.2f (drop<%.2f) inv_n=%d | strategy_bypass=%s | model=%s",
+            "Runtime | capture=%dpx | inf_conf>=%.2f | min_aim=%.2f (drop<%.2f) inv_n=%d | stream_ingress=%.0fms | strategy_bypass=%s | model=%s",
             cap,
             config.getfloat("Inference", "conf_threshold", 0.4),
             mac,
             mdr,
             ninv,
+            stream_ms,
             bp,
             config.getstr("Inference", "model_path", ""),
         )
+        if stream_ms < 1.0 and config.getfloat("WorldModel", "moonlight_latency_ms", 0.0) < 0.5:
+            logger.info(
+                "WorldModel | stream_ingress≈0：若用 Moonlight/云游戏仍摆/穿零，把 [WorldModel] moonlight_latency_ms 调到 25–45 再试"
+            )
         logger.info(
             "Pipeline | [Capture+cap_event] -> Inference -> update_detections&frame_ready -> main.tick; "
             "worker threads: Mouse1000Hz, RawInput, Trigger"

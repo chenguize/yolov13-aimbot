@@ -160,7 +160,13 @@ class WorldModel:
 
         self.smoothed_lead_time: float = self.base_hardware_lag
 
-        self._moonlight_latency = config.getfloat("WorldModel", "moonlight_latency_ms", 15.0) / 1000.0
+        # 画面“内容”相对真实游戏状态的一程滞后（与 t_cap 是否含得无关，必须外填）：
+        #   Moonlight/串流/云：约 20–50ms，填 Moonlight 统计或 “主机→本机” 观感延迟。
+        #   virtualhere / KMV：USB 等额外 2–8ms 可在此叠。
+        self._stream_ingress_s = (
+            max(0.0, config.getfloat("WorldModel", "moonlight_latency_ms", 0.0))
+            + max(0.0, config.getfloat("WorldModel", "virtualhere_latency_ms", 0.0))
+        ) / 1000.0
 
         # ==============================================================================
         # 🧬 自适应延迟进化引擎 (Adaptive Latency Engine)
@@ -361,9 +367,14 @@ class WorldModel:
             t_capture = data.get("t_capture", now)
 
         software_lag = now - t_capture
-        raw_lead_time = self._moonlight_latency + software_lag + self.base_hardware_lag
-        raw_lead_time = float(np.clip(raw_lead_time, 0.005, 0.120))
-        self.smoothed_lead_time = 0.85 * self.smoothed_lead_time + 0.15 * raw_lead_time
+        # 串流 ingress + 本机 t_cap→本步 的软件排队/推理/线程间隙 + 键鼠/显示刚性延迟
+        raw_lead_time = self._stream_ingress_s + software_lag + self.base_hardware_lag
+        # 高串流场景可能 >120ms，钳太死会系统性地短 lead → 准星在目标后「追逐振荡」
+        raw_lead_time = float(np.clip(raw_lead_time, 0.005, 0.200))
+        # 网络/调度抖动大时加快跟上，减小编码抖动的预测滞后
+        lead_gap = abs(raw_lead_time - self.smoothed_lead_time)
+        ema = 0.50 if lead_gap > 0.025 else 0.15
+        self.smoothed_lead_time = (1.0 - ema) * self.smoothed_lead_time + ema * raw_lead_time
 
         base_lead = self.smoothed_lead_time
 
