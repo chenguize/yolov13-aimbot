@@ -506,6 +506,9 @@ class PROController:
             self._drift_state[:] = 0.0
             self._subpixel[:] = 0.0
             self._last_delta_float = (0.0, 0.0)
+            # 与 tick_mouse 的 1kHz 时钟对齐：下次有 emit 时先走 _last_mouse_time is None 分支，
+            # 避免 freeze 后仍用旧 dt 让 OU/腕滤波「补」一帧伪位移
+            self._last_mouse_time = None
             self._prog_t = 0.0
             self._spf = 0.0
             self._phase = self._TRACKING

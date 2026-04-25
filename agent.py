@@ -367,6 +367,12 @@ class AIAgent:
 
         self.world_model.step(self.ctx, self.ring_buffer)
 
+        # 关自瞄时仍跑 WM 推理，但绝不允许再发移动（原先只停扳机、仍会 compute → OU 白噪微颤）
+        if not self.enable_aimbot:
+            self._freeze_mouse_motion()
+            self.last_tick_time = now
+            return
+
         # coast：无新框但 Kalman 仍在 150ms 内续跑；勿当「无效」累加 streak → 否则 2 帧拆锁 → 狂刷 Target acquired
         if self.ctx.is_coasting:
             if self._aim_lock_diag:
@@ -524,8 +530,11 @@ class AIAgent:
             reaction_factor = float(np.clip(time_since_seen / 0.15, 0.0, 1.0))
 
         # 人机动态离合器：人速度大时 AI 让位
+        # pure_ai 仍吃 RawInput 时，微动常落在 s_min~s_max 中段 → power 周期性被砍 → 准星在头边来回晃
         dx_h_recent, dy_h_recent = self.ring_buffer.get_pure_human_delta_sum(now - 0.1, now)
-        human_speed = math.hypot(dx_h_recent, dy_h_recent) / 0.1
+        human_speed_raw = math.hypot(dx_h_recent, dy_h_recent) / 0.1
+        floor = max(0.0, config.getfloat("General", "human_clutch_speed_floor_px_s", 0.0))
+        human_speed = max(0.0, human_speed_raw - floor)
 
         if pixel_error_dist < 40.0:
             s_min, s_max = 1200.0, 2500.0
@@ -536,17 +545,22 @@ class AIAgent:
             s_min = 150.0 + progress * 1050.0
             s_max = 800.0 + progress * 1700.0
 
-        if human_speed > s_max:
-            human_override = 0.0
-        elif human_speed < s_min:
+        if self._current_chase_mode == "pure_ai" and config.getbool(
+            "General", "pure_ai_bypass_human_clutch", True
+        ):
             human_override = 1.0
         else:
-            human_override = 1.0 - (human_speed - s_min) / (s_max - s_min)
+            if human_speed > s_max:
+                human_override = 0.0
+            elif human_speed < s_min:
+                human_override = 1.0
+            else:
+                human_override = 1.0 - (human_speed - s_min) / (s_max - s_min)
 
         power_factor = spatial_factor * reaction_factor * human_override
 
         # ── 人类甩枪结束沿检测 → 通知控制器清积分 ──────────────────────
-        cur_human_flicking = human_speed > (s_max * 0.7)
+        cur_human_flicking = human_speed_raw > (s_max * 0.7)
         if self._prev_human_flicking and not cur_human_flicking:
             if hasattr(self.controller, 'notify_flick_end'):
                 self.controller.notify_flick_end()
