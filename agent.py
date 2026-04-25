@@ -28,7 +28,6 @@ import win32api
 from ctypes import windll
 
 from config import config
-from inference import InferenceThread
 from output import gHub as output_device
 from perception.bus import FrameBus
 from perception.capture import CaptureThread
@@ -38,6 +37,12 @@ from utils.types import InferenceContext
 from world_model import WorldModel
 
 logger = logging.getLogger("Agent")
+
+# 与 inference_aimlab 对应；大小写不敏感时在外层 .lower() 后比较
+_AIMLAB_BACKENDS = frozenset({
+    "aimlab", "aimlab_ball", "ball", "aymlab", "opencv", "opencv_aimlab",
+    "hsv", "color", "colour",
+})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -216,9 +221,17 @@ class AIAgent:
         self.cap_to_inf_event = threading.Event()
 
         self.capture_thread = CaptureThread(self.frame_bus, self.shutdown_event, self.cap_to_inf_event)
-        self.inference_thread = InferenceThread(
-            self.frame_bus, self.world_model, self.shutdown_event, self.cap_to_inf_event
-        )
+        _inf_be = (config.getstr("Inference", "backend", "yolo") or "yolo").strip().lower()
+        if _inf_be in _AIMLAB_BACKENDS:
+            from inference_aimlab import AimlabBallInferenceThread
+            self.inference_thread = AimlabBallInferenceThread(
+                self.frame_bus, self.world_model, self.shutdown_event, self.cap_to_inf_event
+            )
+        else:
+            from inference import InferenceThread
+            self.inference_thread = InferenceThread(
+                self.frame_bus, self.world_model, self.shutdown_event, self.cap_to_inf_event
+            )
         self.mouse_worker = MouseWorker(self.controller, output_device, self.shutdown_event)
         self.human_mouse_listener = HumanMouseListener(self.ring_buffer, self.shutdown_event)
         self.trigger_worker = TriggerWorker(output_device, self.shutdown_event)
@@ -293,8 +306,10 @@ class AIAgent:
         mdr = min(mac - 1e-3, config.getfloat("General", "min_aim_conf_drop", 0.20))
         ninv = max(1, int(config.getint("General", "aim_drop_invalid_frames", 2)))
         stream_ms = float(getattr(self.world_model, "_stream_ingress_s", 0.0)) * 1000.0
+        _be = (config.getstr("Inference", "backend", "yolo") or "yolo").strip().lower()
+        _model_disp = "HSV+contour (aimlab)" if _be in _AIMLAB_BACKENDS else config.getstr("Inference", "model_path", "")
         logger.info(
-            "Runtime | capture=%dpx | inf_conf>=%.2f | min_aim=%.2f (drop<%.2f) inv_n=%d | stream_ingress=%.0fms | strategy_bypass=%s | model=%s",
+            "Runtime | capture=%dpx | inf_conf>=%.2f | min_aim=%.2f (drop<%.2f) inv_n=%d | stream_ingress=%.0fms | strategy_bypass=%s | backend=%s | model=%s",
             cap,
             config.getfloat("Inference", "conf_threshold", 0.4),
             mac,
@@ -302,7 +317,8 @@ class AIAgent:
             ninv,
             stream_ms,
             bp,
-            config.getstr("Inference", "model_path", ""),
+            _be,
+            _model_disp,
         )
         logger.info(
             "WorldModel | predict_ahead=%s | False 时无时间前推，动目标/高延迟会偏「拖尾」，可对照过冲/穿零是否由 lead 引起",
@@ -412,6 +428,12 @@ class AIAgent:
 
         if invalid:
             n_inv_drop = max(1, int(config.getint("General", "aim_drop_invalid_frames", 2)))
+            # Aimlab 可选：仅当 [Aimlab] aim_drop_invalid_min>0 时与 General 取 max（默认 0 不加重）
+            _b = (config.getstr("Inference", "backend", "yolo") or "yolo").strip().lower()
+            if _b in _AIMLAB_BACKENDS:
+                _aim_min = int(config.getint("Aimlab", "aim_drop_invalid_min", 0))
+                if _aim_min > 0:
+                    n_inv_drop = max(n_inv_drop, max(1, _aim_min))
             # 已锁时：短无效帧只 freeze 不拆锁，避免丢框一帧就 reset 控制器 → 贴脸来回摆
             if self.target_first_seen_time > 0.0 and self._invalid_streak < n_inv_drop:
                 if self._aim_lock_diag and self._invalid_streak == 1:
