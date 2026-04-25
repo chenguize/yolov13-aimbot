@@ -1,6 +1,8 @@
 # aim_strategies/factory.py
-from typing import Optional
+import logging
 from config import config
+
+_log = logging.getLogger("AimStrategyFactory")
 
 
 def create_aim_strategy():
@@ -15,9 +17,9 @@ def create_aim_strategy():
             from aim_strategies.valorant.strategy import ValorantStrategy
             return ValorantStrategy()
         else:
-            print(f"[StrategyFactory] 未找到策略包 '{package}'，回退使用 valorant")
+            _log.warning("未找到策略包 '%s'，回退使用 valorant", package)
             from aim_strategies.valorant.strategy import ValorantStrategy
             return ValorantStrategy()
     except ImportError as e:
-        print(f"[StrategyFactory] 加载失败: {e}")
+        _log.error("策略加载失败: %s", e)
         return None

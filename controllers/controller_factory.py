@@ -8,12 +8,15 @@
 # 架构特点：工厂模式，支持多种控制器类型
 #
 
+import logging
 from typing import Optional
 from .base_controller import BaseController
 from .simple_controller import SimpleController
 from .pid_controller import PIDController
 from .pro_controller import PROController
 from config import config
+
+_log = logging.getLogger("ControllerFactory")
 
 
 class ControllerFactory:
@@ -40,10 +43,10 @@ class ControllerFactory:
         controller_class = controllers_map.get(controller_type)
 
         if not controller_class:
-            print(f"[ControllerFactory] 未知控制器类型: {controller_type}，回退使用 simple")
+            _log.warning("未知控制器类型: %s，回退使用 simple", controller_type)
             return SimpleController()
 
-        print(f"[ControllerFactory] 加载控制器: {controller_type.upper()}Controller")
+        _log.info("加载控制器: %sController", controller_type.upper())
         return controller_class()  # 直接实例化
 
 def get_controller() -> BaseController:

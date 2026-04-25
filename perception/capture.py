@@ -1,8 +1,11 @@
+import logging
 import time
 import threading
 import numpy as np
 import dxcam
 from config import config
+
+_log = logging.getLogger("Capture")
 from perception.bus import FrameBus, FrameInfo
 
 
@@ -38,7 +41,7 @@ class CaptureThread(threading.Thread):
             )
             self.output_is_bgr = True
         except (TypeError, ValueError) as e:
-            print(f"[Capture] ⚠️ DXCAM BGR mode not supported, falling back to RGB: {e}")
+            _log.warning("DXCAM BGR mode not supported, falling back to RGB: %s", e)
             try:
                 self.camera = dxcam.create(
                     device_idx=0,
@@ -49,26 +52,26 @@ class CaptureThread(threading.Thread):
                 )
                 self.output_is_bgr = False
             except Exception as e2:
-                print(f"[Capture] ❌ DXCAM Init Failed: {e2}")
+                _log.error("DXCAM init failed (RGB path): %s", e2)
                 return
         except Exception as e:
-            print(f"[Capture] ❌ DXCAM Init Failed: {e}")
+            _log.error("DXCAM init failed: %s", e)
             return
 
         if self.camera:
             try:
                 self.camera.start(region=self.roi, target_fps=self.target_fps)
             except Exception as e:
-                print(f"[Capture] ❌ DXCAM Start Failed: {e}")
+                _log.error("DXCAM start failed: %s", e)
                 self.camera = None
 
     # ... 剩下的 run 方法保持不变 ...
     def run(self):
         if not self.camera:
-            print("[Capture] ❌ No camera instance, thread exiting.")
+            _log.error("No camera instance, thread exiting (init failed above)")
             return
 
-        print(f"[Capture] Started (Event-Driven Mode) | ROI: {self.roi}")
+        _log.info("Started event-driven | ROI=%s (center crop -> FrameBus + cap_event)", self.roi)
 
         frame_count = 0
 
@@ -99,11 +102,11 @@ class CaptureThread(threading.Thread):
 
             except Exception as e:
                 # 如果还是有报错，不再暴力 stop，避免线程锁死
-                print(f"[Capture] ⚠️ Runtime Error: {e}")
+                _log.warning("Runtime error: %s", e)
                 time.sleep(0.01)
 
         try:
             self.camera.stop()
         except:
             pass
-        print(f"[Capture] Stopped. Total frames: {frame_count}")
+        _log.info("Stopped, total frames=%d", frame_count)

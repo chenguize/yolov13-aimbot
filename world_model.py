@@ -1,6 +1,7 @@
 # world_model.py
 # Tier S 修复版：Y轴松绑 + 加速度补偿自然 + 延迟自适应进化引擎
 
+import logging
 import time
 import threading
 import numpy as np
@@ -9,6 +10,8 @@ from typing import Optional, Dict
 
 from config import config
 from perception.ring_buffer import RingBuffer
+
+_log = logging.getLogger("WorldModel")
 from utils.types import Detection, InferenceContext
 from aim_strategies.factory import create_aim_strategy
 
@@ -224,6 +227,14 @@ class WorldModel:
             data = self._latest_detection_data
             self._latest_detection_data = None
 
+        if data is None:
+            # 本帧无新推理包：禁止沿用旧 context.targets，否则无检测帧仍会拿上一框当 best
+            context.targets = []
+
+        # 单主目标槽位。原先用 class_id 作 dict 键，多同类别目标（多敌人均为 class 0）
+        # 会共用一个 Kalman，量测在目标间乱切 → 实战「完全不锁人」。
+        PRIMARY_TRACK = 0
+
         # ── 2. 时空回溯：计算拍照瞬间的准星位置 ────────────────────────────────
         ego_at_capture = self.ego_pos_px.copy()
 
@@ -261,7 +272,7 @@ class WorldModel:
         measurement = np.zeros(2, dtype=np.float64)
 
         if best_detection:
-            target_id = int(best_detection.class_id)
+            target_id = PRIMARY_TRACK
             target = self.targets.get(target_id)
 
             # 使用回溯坐标与画面残差进行合成
@@ -270,10 +281,11 @@ class WorldModel:
             abs_measurement = measurement + ego_at_capture
 
             if target is None:
-                target = TargetState(id=target_id, first_seen=now, last_seen=now)
+                self.kalman.reset_adaptive_state()
+                target = TargetState(id=int(best_detection.class_id), first_seen=now, last_seen=now)
                 target.state[:2] = abs_measurement
-                prev_m = self._prev_meas_by_id.get(target_id)
-                prev_t = self._prev_meas_time_by_id.get(target_id, 0.0)
+                prev_m = self._prev_meas_by_id.get(PRIMARY_TRACK)
+                prev_t = self._prev_meas_time_by_id.get(PRIMARY_TRACK, 0.0)
                 if prev_m is not None and 0 < now - prev_t < 0.08:
                     v_init = (abs_measurement - prev_m) / (now - prev_t)
                     speed = float(np.linalg.norm(v_init))
@@ -284,9 +296,14 @@ class WorldModel:
                 self.targets[target_id] = target
             else:
                 target.last_seen = now
+                # 类别可随框跳变，保持语义
+                try:
+                    target.id = int(best_detection.class_id)
+                except (TypeError, ValueError):
+                    pass
 
-            self._prev_meas_by_id[target_id] = abs_measurement.copy()
-            self._prev_meas_time_by_id[target_id] = now
+            self._prev_meas_by_id[PRIMARY_TRACK] = abs_measurement.copy()
+            self._prev_meas_time_by_id[PRIMARY_TRACK] = now
 
             self.kalman.predict(target, dt)
 
@@ -304,7 +321,7 @@ class WorldModel:
                 self.dynamic_vh_latency = np.clip(self.dynamic_vh_latency, 0.002, 0.050)
 
                 if now - self._latency_print_timer > 1.0:
-                    print(f"🧬 [进化] 自适应网络延迟已校准至: {self.dynamic_vh_latency * 1000:.1f} ms")
+                    _log.info("自适应 vh 延迟: %.1f ms", self.dynamic_vh_latency * 1000.0)
                     self._latency_print_timer = now
 
         else:
@@ -325,21 +342,28 @@ class WorldModel:
                 self.ego_pos_px[:] = self.crop_center
             return
 
+        # 丢框后的 150ms 纯预测 (coast)：不输出 p_predict 给主循环，避免盲飞阶段乱吸鼠标 /
+        # 「无目标也在动」；Kalman 已在上面 predict 过，保持内部状态即可。
+        if is_coasting:
+            context.p_predict = None
+            context.v_real = (0.0, 0.0)
+            context.a_real = (0.0, 0.0)
+            context.conf = 0.0
+            context.is_valid = False
+            return
+
         abs_position = target.state[:2].copy()
         abs_velocity = target.state[2:4].copy()
         abs_accel = target.state[4:6].copy()
 
         t_capture = now
-        if not is_coasting and data is not None:
+        if data is not None:
             t_capture = data.get("t_capture", now)
 
         software_lag = now - t_capture
         raw_lead_time = self._moonlight_latency + software_lag + self.base_hardware_lag
         raw_lead_time = float(np.clip(raw_lead_time, 0.005, 0.120))
         self.smoothed_lead_time = 0.85 * self.smoothed_lead_time + 0.15 * raw_lead_time
-
-        if is_coasting:
-            abs_velocity *= 0.85
 
         base_lead = self.smoothed_lead_time
 
@@ -382,18 +406,17 @@ class WorldModel:
         context.dynamic_lag_ms = smart_lead * 1000.0
         rel_pred_pos = pred_abs_pos - self.ego_pos_px
 
-        if is_coasting:
-            self.controller.mode = "track"
-        else:
-            error_distance = np.linalg.norm(measurement)
-            threshold = self.mode_threshold_high if self.last_mode == "track" else self.mode_threshold_low
-            self.controller.mode = "flick" if error_distance > threshold else "track"
+        # 此处 is_coasting 已提前 return，仅保留有量测的帧
+        error_distance = np.linalg.norm(measurement)
+        threshold = self.mode_threshold_high if self.last_mode == "track" else self.mode_threshold_low
+        self.controller.mode = "flick" if error_distance > threshold else "track"
         self.last_mode = self.controller.mode
 
         context.p_predict = (rel_pred_pos[0], rel_pred_pos[1])
         context.v_real = (abs_velocity[0], abs_velocity[1])
         context.a_real = (abs_accel[0], abs_accel[1])
-        context.conf = 0.5 if is_coasting else 1.0
+        # 实战触发与 gate 用真实检测置信；旧逻辑写死 1.0 时 Triggerbot/调试全失真
+        context.conf = float(best_detection.conf) if best_detection is not None else 0.0
         context.is_valid = True
 
     def cleanup_old_targets(self, max_age: float = 2.0):

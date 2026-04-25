@@ -83,6 +83,7 @@ class HumanMouseListener(threading.Thread):
         except ImportError:
             logger.error("缺少依赖 'inputs'，请 pip install inputs；人机离合器不可用")
             return
+        logger.info("RawInput: inputs 已加载，人类鼠标位移会写入 RingBuffer")
 
         # 某些 inputs 版本无 UnpluggedError，用 OSError 兜底
         try:
@@ -247,13 +248,36 @@ class AIAgent:
         self._current_chase_mode: str = 'pure_ai'
 
         self.movement_tracker = MovementTracker()
+        # 首帧前 last_tick 距当前可达数百 ms，若参与 dt>0.1 判定会误整段不 compute
+        self._first_tick: bool = True
 
-        logger.info("Agent initialized")
+        logger.info("Agent core constructed (WorldModel+threads configured, not started)")
+        self._log_runtime_summary()
 
     def _freeze_mouse_motion(self):
         c = self.controller
         if hasattr(c, "freeze_output_integrators"):
             c.freeze_output_integrators()
+
+    def _log_runtime_summary(self) -> None:
+        if not config.getbool("Debug", "startup_diag", True):
+            return
+        st = self.aim_strategy
+        bp = getattr(st, "bypass_mapping", None)
+        cap = int(self.crop_center * 2) if self.crop_center is not None else config.getint("General", "capture_size", 256)
+        mac = config.getfloat("General", "min_aim_conf", 0.32)
+        logger.info(
+            "Runtime | capture=%dpx | inf_conf>=%.2f | min_aim=%.2f | strategy_bypass=%s | model=%s",
+            cap,
+            config.getfloat("Inference", "conf_threshold", 0.4),
+            mac,
+            bp,
+            config.getstr("Inference", "model_path", ""),
+        )
+        logger.info(
+            "Pipeline | [Capture+cap_event] -> Inference -> update_detections&frame_ready -> main.tick; "
+            "worker threads: Mouse1000Hz, RawInput, Trigger"
+        )
 
     # ────────────────────────────────────────────────────────────────────
     def start(self):
@@ -262,7 +286,7 @@ class AIAgent:
         self.mouse_worker.start()
         self.human_mouse_listener.start()
         self.trigger_worker.start()
-        logger.info("All threads started")
+        logger.info("All worker threads started (order: capture, inference, then mouse/listener/trigger)")
 
     def stop(self):
         self.shutdown_event.set()
@@ -276,8 +300,26 @@ class AIAgent:
     # Main tick — 由 frame_ready_event 驱动，通常 ~200-300Hz（随推理帧率）
     # ────────────────────────────────────────────────────────────────────
     def tick(self):
-        self.world_model.frame_ready_event.wait()
-        self.world_model.frame_ready_event.clear()
+        wfe = self.world_model.frame_ready_event
+        tmo = config.getfloat("Debug", "tick_wait_timeout_sec", 2.0)
+        if tmo > 0:
+            if not wfe.wait(timeout=tmo):
+                if self.shutdown_event.is_set():
+                    return
+                now_log = time.perf_counter()
+                if now_log - getattr(self, "_last_stall_log", 0.0) >= 1.0:
+                    logger.warning(
+                        "main.tick: %.0fs 内无新推理包（未收到 frame_ready）。"
+                        "采图/推理停住或极慢时会出现；有目标后才会移动鼠标。",
+                        tmo,
+                    )
+                    self._last_stall_log = now_log
+                self._freeze_mouse_motion()
+                time.sleep(0.02)
+                return
+        else:
+            wfe.wait()
+        wfe.clear()
 
         now = time.perf_counter()
         if self.paused:
@@ -289,7 +331,11 @@ class AIAgent:
 
         dt = now - self.last_tick_time
         self.last_tick_time = now
-        if dt <= 0 or dt > 0.1:
+        if self._first_tick:
+            self._first_tick = False
+        elif dt <= 0 or dt > 0.1:
+            # 异常 dt（首帧外）：关 emit
+            self._freeze_mouse_motion()
             return
 
         # ── 目标有效性判定 ───────────────────────────────────────────────
@@ -297,6 +343,14 @@ class AIAgent:
         if not self.ctx.is_valid or self.ctx.p_predict is None:
             # 无有效目标时主线程不调用 compute，但 MouseWorker 仍 1kHz 跑 tick_mouse；
             # 必须显式清积分器，否则会沿上一时刻 arm_vel/噪声持续乱飘。
+            self._freeze_mouse_motion()
+            self.target_first_seen_time = 0.0
+            self.is_target_in_crosshair = False
+            return
+
+        # 与 Inference.conf_threshold 对齐的可调门限，防止低分框/桌面噪声「假锁人」
+        min_aim_conf = config.getfloat("General", "min_aim_conf", 0.32)
+        if self.ctx.conf < min_aim_conf:
             self._freeze_mouse_motion()
             self.target_first_seen_time = 0.0
             self.is_target_in_crosshair = False
@@ -458,8 +512,17 @@ class AIAgent:
         real_fps = self.frames_in_cycle / dt
         lag = getattr(self.ctx, 'dynamic_lag_ms', 0.0)
         conf = self.ctx.conf
-        logger.info("FPS: %.1f | Lat: %.1fms | Conf: %.2f | Mode: %s",
-                    real_fps, lag, conf, self._current_chase_mode)
+        n_dets = len(self.ctx.targets) if self.ctx.targets else 0
+        inf_ema = getattr(self.world_model, "inference_ms_ema", 0.0)
+        if config.getbool("Debug", "detailed_stats", True):
+            logger.info(
+                "Tick | fps=%.1f | infer_ema=%.1fms | valid=%s | dets=%d | conf=%.2f | lat=%.1fms | mode=%s | paused=%s | aim_on=%s",
+                real_fps, inf_ema, self.ctx.is_valid, n_dets, conf, lag,
+                self._current_chase_mode, self.paused, self.enable_aimbot,
+            )
+        else:
+            logger.info("FPS: %.1f | Lat: %.1fms | Conf: %.2f | Mode: %s",
+                        real_fps, lag, conf, self._current_chase_mode)
         self.last_stat_time = now
         self.frames_in_cycle = 0
 

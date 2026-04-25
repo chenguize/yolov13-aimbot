@@ -1,15 +1,18 @@
 import time
 import signal
-import keyboard
+import sys
 import logging
+import keyboard
 from ctypes import windll  # [关键] 引入 Windows底层库
 
-# 引入核心 Agent
-from agent import AIAgent
+from utils.logging_bootstrap import setup_root_logging
 
-# 日志设置
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# 在 import Agent（进而 import output/推理栈）之前配置 root logger，否则子模块 log 与格式不一致
+setup_root_logging()
 logger = logging.getLogger("Main")
+
+# 核心 Agent（依赖较多，放日志初始化之后）
+from agent import AIAgent
 
 # ==============================================================================
 # [关键修复] 全局强制 Windows 定时器精度为 1ms
@@ -22,13 +25,30 @@ except Exception as e:
     logger.warning(f"Failed to set high resolution timer: {e}")
 
 
+def _log_startup_banner() -> None:
+    """首屏排查：解释器、工作目录、配置文件路径（与预期 venv 是否一致）。"""
+    from pathlib import Path
+    from config import config as cfg
+
+    root = Path(__file__).resolve().parent
+    ini = root / "config.ini"
+    logger.info("Startup | config.ini -> %s", ini)
+    if not cfg.getbool("Debug", "startup_diag", True):
+        return
+    logger.info("Startup | python_exe=%s", sys.executable)
+    logger.info("Startup | cwd=%s", Path.cwd())
+    logger.info("Startup | project_root=%s", root)
+
+
 def main():
+    _log_startup_banner()
+
     # 1. 实例化 Agent
     agent = AIAgent()
 
     # 2. 定义信号处理 (Ctrl+C)
     def signal_handler(sig, frame):
-        print("\n[System] Interrupt received, stopping...")
+        logger.warning("Interrupt received, stopping...")
         agent.stop()
 
     # 3. 绑定热键
@@ -41,7 +61,7 @@ def main():
 
     # 4. 启动所有子线程 (Capture, Inference, MouseWorker)
     agent.start()
-    print("[System] Online. Press 'P' to pause, 'Alt+F1' to toggle Aimbot.")
+    logger.info("Online | hotkeys: P=pause, Alt+F1=aimbot toggle | main loop blocking on inference frame_ready")
 
     # 5. 进入主循环
     try:
@@ -57,9 +77,9 @@ def main():
             time.sleep(0.0001)
 
     except KeyboardInterrupt:
-        print("\n[System] Keyboard Interrupt (Ctrl+C)")
+        logger.warning("KeyboardInterrupt (Ctrl+C)")
     finally:
-        print("[System] Shutting down...")
+        logger.info("Shutting down...")
         agent.stop()
         keyboard.unhook_all()
 
@@ -68,7 +88,7 @@ def main():
             windll.winmm.timeEndPeriod(1)
         except Exception:
             pass
-        print("[System] Goodbye.")
+        logger.info("Goodbye.")
 
 
 if __name__ == "__main__":

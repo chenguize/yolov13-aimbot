@@ -1,7 +1,11 @@
 # output.py - Optimized
 import ctypes
+import logging
+import threading
 from ctypes import c_long, c_ulong, c_ulonglong, Structure, Union, sizeof, byref
 from typing import Optional, TYPE_CHECKING
+
+_log = logging.getLogger("SystemMouse")
 
 if TYPE_CHECKING:
     from perception.ring_buffer import RingBuffer
@@ -31,7 +35,19 @@ class INPUT(Structure):
 
 
 class SystemMouse:
+    _singleton: Optional['SystemMouse'] = None
+    _new_lock = threading.Lock()
+
+    def __new__(cls):
+        with cls._new_lock:
+            if cls._singleton is None:
+                cls._singleton = object.__new__(cls)
+            return cls._singleton
+
     def __init__(self):
+        if getattr(self, "_init_once", False):
+            return
+        self._init_once = True
         self.ring_buffer: Optional['RingBuffer'] = None
 
         # === 优化核心：预先分配内存 ===
@@ -45,7 +61,7 @@ class SystemMouse:
         self._send_input_func = ctypes.windll.user32.SendInput
         self._sizeof_inp = sizeof(INPUT)
 
-        print("[SystemMouse] 初始化完成 (Pre-allocated Mode)")
+        _log.info("SendInput 预分配就绪 (singleton id=%s)", id(self))
 
     def set_ring_buffer(self, ring_buffer):
         self.ring_buffer = ring_buffer

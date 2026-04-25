@@ -45,6 +45,10 @@ class ValorantStrategy:
         self.game_fov = config.getfloat("General", "game_fov", 103.0)
         self.screen_width = config.getfloat("General", "screen_width", 1920)
         self.focal_length = (self.screen_width / 2) / math.tan(math.radians(self.game_fov / 2))
+        # 开则正逆均为 1:1，便于桌面/静态图测检测框，不经 FOV/k
+        self.bypass_mapping = config.getbool("AimStrategy", "bypass_strategy_mapping", False)
+        if self.bypass_mapping:
+            logger.warning("AimStrategy: bypass_strategy_mapping 已开启（1px≈1count，仅调试）")
 
     def apply_fov_distortion(self, dx: float, dy: float) -> Tuple[float, float]:
         angle_x = math.atan(dx / self.focal_length)
@@ -53,15 +57,21 @@ class ValorantStrategy:
 
     def calculate_mouse_move(self, dx: float, dy: float, bbox_w: float | None = None) -> Tuple[float, float]:
         """位置正变换：像素偏移 → 物理 Count (含 FOV 非线性)"""
+        if self.bypass_mapping:
+            return float(dx), float(dy)
         c_dx, c_dy = self.apply_fov_distortion(dx, dy)
         return c_dx * self.calib.k_x, c_dy * self.calib.k_y
 
     def calculate_velocity_move(self, vx: float, vy: float, bbox_w: float | None = None) -> Tuple[float, float]:
         """速度正变换：px/s → counts/s (线性近似)"""
+        if self.bypass_mapping:
+            return float(vx), float(vy)
         return vx * self.calib.k_x, vy * self.calib.k_y
 
     def reverse_map(self, counts_x: float, counts_y: float, bbox_w: float | None = None) -> Tuple[float, float]:
         """位置逆变换：物理 Count → 屏幕像素"""
+        if self.bypass_mapping:
+            return float(counts_x), float(counts_y)
         kx = self.calib.k_x if abs(self.calib.k_x) > 0.01 else 1.0
         ky = self.calib.k_y if abs(self.calib.k_y) > 0.01 else 1.0
         corrected_dx = counts_x / kx
@@ -73,6 +83,8 @@ class ValorantStrategy:
     def reverse_map_velocity(self, counts_x: float, counts_y: float, bbox_w: float | None = None) -> Tuple[
         float, float]:
         """速度逆变换：counts/s → px/s"""
+        if self.bypass_mapping:
+            return float(counts_x), float(counts_y)
         kx = self.calib.k_x if abs(self.calib.k_x) > 0.01 else 1.0
         ky = self.calib.k_y if abs(self.calib.k_y) > 0.01 else 1.0
         return counts_x / kx, counts_y / ky

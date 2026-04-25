@@ -55,9 +55,12 @@
 # └──────────────────────────────────────────────────────────────────────────────┘
 
 
+import logging
 import time
 import threading
 import numpy as np
+
+_log_cipher = logging.getLogger("PROController")
 from typing import Optional, Tuple
 from config import config
 
@@ -330,13 +333,13 @@ class PROController:
         seed = int(time.perf_counter() * 1_000_000) & 0xFFFF_FFFF
         self._rng = np.random.RandomState(seed)
 
-        print(
-            f"[CIPHER v1.0] MPE: a={self._fitts_a:.2f}s  b={self._fitts_b:.2f}s/bit  "
-            f"T=[{self._T_min:.2f},{self._T_max:.2f}]s"
+        _log_cipher.info(
+            "CIPHER v1.0 MPE: a=%.2fs b=%.2fs/bit T=[%.2f,%.2f]s",
+            self._fitts_a, self._fitts_b, self._T_min, self._T_max,
         )
-        print(
-            f"[CIPHER v1.0] AIC: K_pursuit={self._K_pursuit:.0f}  K_flick={self._K_flick:.0f}  "
-            f"τ_arm={self._tau_arm*1000:.0f}ms  τ_wrist={self._tau_wrist*1000:.0f}ms"
+        _log_cipher.info(
+            "CIPHER v1.0 AIC: K_pursuit=%.0f K_flick=%.0f τ_arm=%.0fms τ_wrist=%.0fms",
+            self._K_pursuit, self._K_flick, self._tau_arm * 1000.0, self._tau_wrist * 1000.0,
         )
 
     # ──────────────────────────────────────────────────────────────────────────

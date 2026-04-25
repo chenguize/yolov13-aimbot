@@ -32,6 +32,7 @@ class InferenceThread(threading.Thread):
         self.shutdown_event = shutdown_event
         self.frame_ready_event = frame_ready_event
         self.last_processed_id = -1
+        self._first_push_logged = False
 
         model_path = config.getstr("Inference", "model_path", "models/yolo26n.engine")
         img_size = config.getint("General", "capture_size", 256)
@@ -48,6 +49,7 @@ class InferenceThread(threading.Thread):
 
     def run(self):
         if self.model is None:
+            logger.error("InferenceThread not started: YOLO model is None (check model_path / TensorRT)")
             return
 
         conf_thres = config.getfloat("Inference", "conf_threshold", 0.40)
@@ -112,6 +114,14 @@ class InferenceThread(threading.Thread):
                     t_capture=frame_info.t_cap,
                     t_done=t_inference_done,
                 )
+                if not self._first_push_logged:
+                    self._first_push_logged = True
+                    logger.info(
+                        "Pipeline: first YOLO → world_model.update_detections (frame_id=%d, dets=%d, infer=%.1fms). Main.tick should wake next.",
+                        frame_info.frame_id,
+                        len(detections),
+                        last_inference_ms,
+                    )
                 self.last_processed_id = frame_info.frame_id
 
             except Exception as e:
