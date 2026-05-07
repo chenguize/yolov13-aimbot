@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import logging
 import math
 import time
 from collections import deque
@@ -14,8 +13,9 @@ from typing import Deque, List, Optional
 import numpy as np
 
 from config import config
+from utils.logger import get_logger
 
-_log = logging.getLogger("AimDiag")
+_log = get_logger("AimDiag")
 
 
 def _flips_1d(arr: List[float], eps: float = 0.4) -> int:
@@ -259,7 +259,7 @@ class AimDiagnostics:
             _log.info("AimDiag | hints: %s", tip)
         elif w_only and warn:
             _log.warning(
-                "AimDiag[WARN] 振荡: px=%d py=%d avx=%d avy=%d mode_sw=%d | %s",
+                "AimDiag[WARN] 穿零(次数非像素): flips p=%d py=%d avx=%d avy=%d mode_sw=%d | %s",
                 fp,
                 fpy,
                 fvx,

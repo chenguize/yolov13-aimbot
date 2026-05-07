@@ -1,7 +1,6 @@
 # world_model.py
 # Tier S 修复版：Y轴松绑 + 加速度补偿自然 + 延迟自适应进化引擎
 
-import logging
 import time
 import threading
 import numpy as np
@@ -11,9 +10,17 @@ from typing import Optional, Dict, List, Tuple
 from config import config
 from utils.aim_class_filter import get_aim_target_class_set
 from perception.ring_buffer import RingBuffer
+from perception.track_manager import TrackManager, Track
 
-_log = logging.getLogger("WorldModel")
+from utils.logger import get_logger
+
+_log = get_logger("WorldModel")
 from utils.types import Detection, InferenceContext
+
+
+def _ring_intent_human_delta(ring: RingBuffer, t_start: float, t_end: float) -> Tuple[int, int]:
+    """人手意图增量：委托 RingBuffer 自动处理后端差异。"""
+    return ring.get_intent_delta(t_start, t_end)
 
 
 def _reorder_dets_by_sticky_prev(
@@ -165,7 +172,6 @@ class SimpleKalman:
 
 class WorldModel:
     def __init__(self):
-        self.kalman = SimpleKalman()
         self.strategy = create_aim_strategy()
         from controllers.controller_factory import get_controller
         self.controller = get_controller()
@@ -173,7 +179,7 @@ class WorldModel:
         self.capture_size = config.getint("General", "capture_size", 256)
         self.crop_center = self.capture_size / 2.0
         self.ego_pos_px = np.array([self.crop_center, self.crop_center], dtype=np.float64)
-        self.targets: Dict[int, TargetState] = {}
+        self.track_manager = TrackManager()
         self.last_ts = 0.0
         self.last_ring_time = 0.0
         self.ring_buffer: Optional[RingBuffer] = None
@@ -201,16 +207,53 @@ class WorldModel:
         # ==============================================================================
         # 🧬 自适应延迟进化引擎 (Adaptive Latency Engine)
         # ==============================================================================
-        self.dynamic_vh_latency = 0.008
         self.ego_velocity_ema = np.zeros(2, dtype=np.float64)
         self._latency_print_timer = 0.0
 
+        # ── WAN 模式（Sunshine+Moonlight 远程串流）────────────────────────────
+        self._wan_mode = config.getbool("WorldModel", "wan_mode", False)
+        if self._wan_mode:
+            self._wan_min_latency_s = max(
+                0.010,
+                config.getfloat("WorldModel", "wan_min_latency_ms", 60.0) / 1000.0,
+            )
+            self._wan_jitter_s = max(
+                0.005,
+                config.getfloat("WorldModel", "wan_jitter_ms", 25.0) / 1000.0,
+            )
+            # WAN: 自适应延迟范围放宽到 [5ms, 150ms]
+            self._vh_lat_min = 0.005
+            self._vh_lat_max = 0.150
+            self._vh_lat_alpha = 0.03  # 更慢的适应速率（不追逐帧 jitter）
+            self._lead_clamp_max = 0.300  # pipeline lead 上限放开
+            # 初始化到预估延迟的 60%，避免前 0.3s 回退不足
+            self.dynamic_vh_latency = max(0.008, self._wan_min_latency_s * 0.6)
+            # jitter-safe latency EMA（比 dynamic_vh_latency 更稳定，用于 lead 计算）
+            self._vh_lat_smoothed: float = self._wan_min_latency_s
+        else:
+            self._vh_lat_min = 0.002
+            self._vh_lat_max = 0.050
+            self._vh_lat_alpha = 0.02
+            self._lead_clamp_max = 0.200
+            self.dynamic_vh_latency = 0.008
+
         self.current_bbox_w: float = 60.0
-        self._prev_meas_by_id: Dict[int, np.ndarray] = {}
-        self._prev_meas_time_by_id: Dict[int, float] = {}
 
         # 推理耗时 EMA（毫秒），用于诊断与可选的 lead 自适应
         self.inference_ms_ema: float = 0.0
+
+        # ── Controller speed calibration EMA ──
+        # controller 的解析 lead（get_expected_lead）假设理想阻抗响应，但实际
+        # arm_vel 受 LPF / speed_cap / anti-orbit / 离散化影响，响应偏慢。
+        # 此 EMA 学习实际响应速度与目标速度的比率，反比缩放 ctrl_lead。
+        self._ctrl_speed_scale: float = 1.0
+        self._ctrl_speed_print_timer: float = 0.0
+
+        # ── Arrival-based calibration (混合校准第二路) ──
+        # 用实际 AI 位移 vs 预期 arm_vel·dt 的差异，校准控制管道的有效传输率。
+        # 比纯 speed_scale 更直接：不依赖 Kalman 速度估计，直接从 SendInput 结果反推。
+        self._prev_arm_vel_cts = np.zeros(2, dtype=np.float64)  # 上帧 controller arm_vel
+        self._arrival_calib_timer: float = 0.0
 
         # 多目标时按上一帧首选框 (cx,cy,w,h) 粘滞 best，减轻 conf 微差导致 cls/框切换 → 量测跳变
         self._sticky_crop: Optional[Tuple[float, float, float, float]] = None
@@ -236,6 +279,15 @@ class WorldModel:
         context.is_coasting = False
         now = time.perf_counter()
 
+        # ── 延迟模式判定（每帧读 config，兼容运行时 reload）────────────────
+        _predict_ahead = config.getbool("WorldModel", "predict_ahead", True)
+        # 零延迟：本机无硬件延迟 + 无串流 + 非 WAN → 跳过全部延迟补偿管线
+        _zero_latency = (
+            not config.getbool("WorldModel", "wan_mode", False)
+            and self._stream_ingress_s <= 0.0
+            and self.base_hardware_lag <= 0.0
+        )
+
         if self.last_ts == 0:
             dt = 0.001
         else:
@@ -247,7 +299,13 @@ class WorldModel:
             self.last_ring_time = now - dt
 
         # ── 1. 物理时钟：维持准星的“绝对实时位置” ──────────────────────────────
-        dx_counts, dy_counts = ring_buffer.get_cursor_delta_sum(self.last_ring_time, now)
+        # 用 get_total_delta_sum（人+AI）而非 get_cursor_delta_sum（仅人）：
+        # AI SendInput 同样转动游戏相机，只有全量位移才能正确追踪真实相机旋转，
+        # 避免 AI 造成的相机旋转泄漏进卡尔曼速度估计。
+        if config.getbool("WorldModel", "use_total_delta", True):
+            dx_counts, dy_counts = ring_buffer.get_total_delta_sum(self.last_ring_time, now)
+        else:
+            dx_counts, dy_counts = ring_buffer.get_cursor_delta_sum(self.last_ring_time, now)
         self.last_ring_time = now
 
         px_dx, px_dy = self.strategy.reverse_map_velocity(
@@ -256,8 +314,8 @@ class WorldModel:
         self.ego_pos_px[0] += px_dx
         self.ego_pos_px[1] += px_dy
 
-        # 平滑记录当前的鼠标物理初速度 (用于残差分析)
-        if dt > 0:
+        # 平滑记录当前的鼠标物理初速度 (用于残差分析；仅自适应延迟引擎需要)
+        if _predict_ahead and not _zero_latency and dt > 0:
             v_ego_x = px_dx / dt
             v_ego_y = px_dy / dt
             self.ego_velocity_ema[0] = 0.85 * self.ego_velocity_ema[0] + 0.15 * v_ego_x
@@ -271,25 +329,38 @@ class WorldModel:
             # 本帧无新推理包：禁止沿用旧 context.targets，否则无检测帧仍会拿上一框当 best
             context.targets = []
 
-        # 单主目标槽位。原先用 class_id 作 dict 键，多同类别目标（多敌人均为 class 0）
-        # 会共用一个 Kalman，量测在目标间乱切 → 实战「完全不锁人」。
-        PRIMARY_TRACK = 0
-
         # ── 2. 时空回溯：计算拍照瞬间的准星位置 ────────────────────────────────
         ego_at_capture = self.ego_pos_px.copy()
+
+        track_dets: List[dict] = []  # TrackManager 格式检测列表
 
         if data is not None:
             t_capture = data.get("t_capture", now)
 
-            # 【核心】：扣除从 (t_capture - 动态延迟) 到 现在 之间产生的所有位移
-            past_dx, past_dy = ring_buffer.get_cursor_delta_sum(
-                t_capture - self.dynamic_vh_latency, now
-            )
-            r_px_dx, r_px_dy = self.strategy.reverse_map_velocity(
-                float(past_dx), float(past_dy), bbox_w=self.current_bbox_w
-            )
-            ego_at_capture[0] -= r_px_dx
-            ego_at_capture[1] -= r_px_dy
+            if _zero_latency:
+                # 零延迟：无需回溯，拍照时刻视角 = 当前视角
+                pass
+            else:
+                # 【核心】：扣除从 (t_capture - 延迟) 到 现在 之间产生的所有位移
+                # 延迟来源：predict_ahead 开启时用自适应 dynamic_vh_latency；
+                #          关闭时用固定 base_hardware_lag + stream_ingress_s
+                _backtrack_lat = (
+                    self.dynamic_vh_latency if _predict_ahead
+                    else self.base_hardware_lag + self._stream_ingress_s
+                )
+                if config.getbool("WorldModel", "use_total_delta", True):
+                    past_dx, past_dy = ring_buffer.get_total_delta_sum(
+                        t_capture - _backtrack_lat, now
+                    )
+                else:
+                    past_dx, past_dy = ring_buffer.get_cursor_delta_sum(
+                        t_capture - _backtrack_lat, now
+                    )
+                r_px_dx, r_px_dy = self.strategy.reverse_map_velocity(
+                    float(past_dx), float(past_dy), bbox_w=self.current_bbox_w
+                )
+                ego_at_capture[0] -= r_px_dx
+                ego_at_capture[1] -= r_px_dy
 
             if len(data["detections"]) > 0:
                 dets: List[Detection] = []
@@ -303,11 +374,16 @@ class WorldModel:
                         continue
                     cx = (x1 + x2) / 2.0
                     cy = (y1 + y2) / 2.0
-                    dets.append(Detection(x=cx, y=cy, w=x2 - x1, h=y2 - y1, conf=conf, class_id=ci))
+                    dets.append(Detection(
+                        x=cx, y=cy, w=x2 - x1, h=y2 - y1, conf=conf, class_id=ci,
+                        xyxy=np.array([x1, y1, x2, y2], dtype=np.float64),
+                    ))
+
                 if not dets:
                     context.targets = []
                     self._sticky_crop = None
                 else:
+                    # 粘滞排序：多目标 conf 接近时保持同一物理目标优先
                     dets.sort(key=lambda d: d.conf, reverse=True)
                     if config.getbool("WorldModel", "sticky_target_enable", True) and len(dets) >= 2:
                         dets = _reorder_dets_by_sticky_prev(
@@ -321,89 +397,44 @@ class WorldModel:
                     self._sticky_crop = (
                         float(dets[0].x), float(dets[0].y), float(dets[0].w), float(dets[0].h),
                     )
+
+                    # ── 构建 TrackManager 格式的检测列表 ──
+                    for det in dets:
+                        w2, h2 = det.w / 2.0, det.h / 2.0
+                        bbox = (det.x - w2, det.y - h2, det.x + w2, det.y + h2)
+                        meas = np.array([det.x - self.crop_center,
+                                         det.y - self.crop_center], dtype=np.float64)
+                        abs_meas = meas + ego_at_capture
+                        track_dets.append({
+                            "abs_meas": abs_meas,
+                            "bbox": bbox,
+                            "conf": det.conf,
+                            "class_id": det.class_id,
+                        })
             else:
                 context.targets = []
                 self._sticky_crop = None
 
-        best_detection = context.targets[0] if context.targets else None
-        target = None
-        is_coasting = False
-        measurement = np.zeros(2, dtype=np.float64)
-
-        if best_detection:
-            target_id = PRIMARY_TRACK
-            target = self.targets.get(target_id)
-
-            # 使用回溯坐标与画面残差进行合成
-            measurement = np.array([best_detection.x - self.crop_center,
-                                    best_detection.y - self.crop_center], dtype=np.float64)
-            abs_measurement = measurement + ego_at_capture
-
-            if target is None:
-                self.kalman.reset_adaptive_state()
-                target = TargetState(id=int(best_detection.class_id), first_seen=now, last_seen=now)
-                target.state[:2] = abs_measurement
-                prev_m = self._prev_meas_by_id.get(PRIMARY_TRACK)
-                prev_t = self._prev_meas_time_by_id.get(PRIMARY_TRACK, 0.0)
-                if prev_m is not None and 0 < now - prev_t < 0.08:
-                    v_init = (abs_measurement - prev_m) / (now - prev_t)
-                    speed = float(np.linalg.norm(v_init))
-                    if speed < 800.0:
-                        target.state[2:4] = v_init
-                        target.covariance[2, 2] = 300.0
-                        target.covariance[3, 3] = 300.0
-                self.targets[target_id] = target
-            else:
-                target.last_seen = now
-                # 类别可随框跳变，保持语义
-                try:
-                    target.id = int(best_detection.class_id)
-                except (TypeError, ValueError):
-                    pass
-
-            self._prev_meas_by_id[PRIMARY_TRACK] = abs_measurement.copy()
-            self._prev_meas_time_by_id[PRIMARY_TRACK] = now
-
-            self.kalman.predict(target, dt)
-
-            # ── 3. 卡尔曼残差提取与延迟自适应进化 ──────────────────────────────
-            innovation = self.kalman.update(target, abs_measurement)
-
-            vx, vy = self.ego_velocity_ema
-            speed_sq = vx ** 2 + vy ** 2
-
-            if speed_sq > 6400.0:
-                time_error = (innovation[0] * vx + innovation[1] * vy) / speed_sq
-                time_error = np.clip(time_error, -0.015, 0.015)
-
-                self.dynamic_vh_latency += 0.02 * time_error
-                self.dynamic_vh_latency = np.clip(self.dynamic_vh_latency, 0.002, 0.050)
-
-                if now - self._latency_print_timer > 1.0:
-                    _log.info("自适应 vh 延迟: %.1f ms", self.dynamic_vh_latency * 1000.0)
-                    self._latency_print_timer = now
-
+        # ── 3. TrackManager：多目标 IoU 匹配 + 独立 Kalman 池 ─────────────────
+        if track_dets:
+            self.track_manager.match_and_update(track_dets, now, dt)
         else:
-            if self.targets:
-                target = max(self.targets.values(), key=lambda t: t.last_seen)
-                if now - target.last_seen < 0.150:
-                    is_coasting = True
-                    self.kalman.predict(target, dt)
-                else:
-                    target = None
+            self.track_manager.predict_all(dt)
 
-        if not target:
+        best_track = self.track_manager.select_best(self.ego_pos_px, self.crop_center)
+
+        # 无任何活跃轨迹
+        if best_track is None:
             context.p_predict = None
             context.v_real = (0.0, 0.0)
             context.conf = 0.0
             context.is_valid = False
-            if not any(now - t.last_seen < 2.0 for t in self.targets.values()):
+            if not self.track_manager.tracks:
                 self.ego_pos_px[:] = self.crop_center
             return
 
-        # 丢框后的 150ms 纯预测 (coast)：不输出 p_predict 给主循环，避免盲飞阶段乱吸鼠标 /
-        # 「无目标也在动」；Kalman 已在上面 predict 过，保持内部状态即可。
-        if is_coasting:
+        # 丢框后的 coast：coast_count 1~5 仍输出预测（短暂丢框），>5 才设 is_coasting
+        if best_track.coast_count > 5:
             context.is_coasting = True
             context.p_predict = None
             context.v_real = (0.0, 0.0)
@@ -412,15 +443,97 @@ class WorldModel:
             context.is_valid = False
             return
 
-        abs_position = target.state[:2].copy()
-        abs_velocity = target.state[2:4].copy()
-        abs_accel = target.state[4:6].copy()
+        # ── 3.5 卡尔曼残差提取与延迟自适应进化 ──────────────────────────────
+        # 仅 predict_ahead 开启且非零延迟时运行；关闭预测时锁死 dynamic_vh_latency=0
+        # 防止历史自适应值残留污染 ego 回溯（症状：关预测后准星仍偏→关不干净）。
+        if _predict_ahead and not _zero_latency:
+            innov = getattr(best_track, 'last_innovation', None)
+            if innov is not None and config.getbool("WorldModel", "adaptive_latency_enable", True):
+                vx, vy = self.ego_velocity_ema
+                speed_sq = vx ** 2 + vy ** 2
 
-        if not config.getbool("WorldModel", "predict_ahead", True):
+                if speed_sq > 6400.0:
+                    time_error = (innov[0] * vx + innov[1] * vy) / speed_sq
+                    if self._wan_mode:
+                        time_error = np.clip(time_error, -0.025, 0.025)
+                        self.dynamic_vh_latency += self._vh_lat_alpha * time_error
+                        self.dynamic_vh_latency = float(np.clip(
+                            self.dynamic_vh_latency,
+                            max(self._vh_lat_min, self._wan_min_latency_s * 0.3),
+                            self._vh_lat_max,
+                        ))
+                        self._vh_lat_smoothed = (
+                            0.95 * self._vh_lat_smoothed + 0.05 * self.dynamic_vh_latency
+                        )
+                    else:
+                        time_error = np.clip(time_error, -0.015, 0.015)
+                        self.dynamic_vh_latency += 0.02 * time_error
+                        self.dynamic_vh_latency = np.clip(self.dynamic_vh_latency, self._vh_lat_min, self._vh_lat_max)
+
+                    if now - self._latency_print_timer > 1.0:
+                        _log.kalman_adaptive_latency(
+                            self.dynamic_vh_latency * 1000.0, wan_mode=self._wan_mode,
+                        )
+                        if self._wan_mode:
+                            _log.kalman_wan_jitter_safe(
+                                self._vh_lat_smoothed * 1000.0,
+                                self._wan_min_latency_s * 1000.0,
+                            )
+                        self._latency_print_timer = now
+        elif not _predict_ahead:
+            # 关闭预测：锁死自适应延迟为 0，并用固定硬件延迟做 ego 回溯
+            self.dynamic_vh_latency = 0.0
+            # 同时清理校准状态，防止残留值在下一次开启预测时造成跳变
+            self.smoothed_lead_time = 0.0
+            self._ctrl_speed_scale = 1.0
+            self._prev_arm_vel_cts[:] = 0.0
+
+        abs_position = best_track.abs_position.copy()
+        abs_velocity = best_track.abs_velocity.copy()
+        abs_accel = best_track.abs_accel.copy()
+
+        if not _predict_ahead:
             # 关「时间前视」：瞄准误差 = 当前 KF 平滑后的物面位置 − 准星（不做 v·T/½aT²/ctrl_lead）。
             # 动目标/高延迟下会**滞后**，可用来对照过冲/穿零是否由 lead 引起；v_real/a_real 仍给控制器前馈。
             rel_pred_pos = abs_position - self.ego_pos_px
             context.dynamic_lag_ms = 0.0
+        elif _zero_latency:
+            # ── 零延迟快速路径：跳过平滑/惩罚/校准，但保留 ctrl_lead ──
+            # 控制器执行时间（BALLISTIC 剩余时长 / TRACKING settling）仍需补偿，
+            # 否则动目标场景准星落点时球已跑远 → 顶着 SteadyMAE 高拖尾 → 空枪。
+            #
+            # 近距须削弱 v·T 项：本机 Aimlab/色块 KF 速度噪声大；BALLISTIC 内 ff 已部分
+            # 补偿动目标，WM 再用满 lead 乘 v 易「标点飞过」过冲（日志里 lead≈150ms 典型）。
+            t_capture = data.get("t_capture", now) if data is not None else now
+            software_lag = max(0.0, now - t_capture)
+
+            ctrl_lead = 0.0
+            if config.getbool("WorldModel", "ctrl_lead_enable", True):
+                if hasattr(self.controller, 'get_expected_lead'):
+                    try:
+                        ctrl_lead = float(self.controller.get_expected_lead())
+                    except Exception:
+                        ctrl_lead = 0.0
+            _zl_cap = config.getfloat("WorldModel", "zero_latency_ctrl_lead_cap_s", 0.085)
+            ctrl_lead = float(np.clip(ctrl_lead, 0.0, max(0.0, _zl_cap)))
+
+            _zl_smart_max = config.getfloat("WorldModel", "zero_latency_max_smart_lead_s", 0.110)
+            smart_lead = float(np.clip(software_lag + ctrl_lead, 0.0, max(0.005, _zl_smart_max)))
+
+            px_err_kf = float(np.linalg.norm(abs_position - self.ego_pos_px))
+            _d0 = config.getfloat("WorldModel", "zero_latency_vel_damp_start_px", 24.0)
+            _d1 = config.getfloat("WorldModel", "zero_latency_vel_damp_full_px", 140.0)
+            _dlo = config.getfloat("WorldModel", "zero_latency_vel_damp_min", 0.20)
+            if _d1 > _d0 + 1.0:
+                vel_lead_scale = float(
+                    np.clip((px_err_kf - _d0) / (_d1 - _d0), _dlo, 1.0)
+                )
+            else:
+                vel_lead_scale = 1.0
+
+            pred_abs_pos = abs_position + abs_velocity * (smart_lead * vel_lead_scale)
+            context.dynamic_lag_ms = smart_lead * vel_lead_scale * 1000.0
+            rel_pred_pos = pred_abs_pos - self.ego_pos_px
         else:
             t_capture = now
             if data is not None:
@@ -429,19 +542,28 @@ class WorldModel:
             software_lag = now - t_capture
             # 串流 ingress + 本机 t_cap→本步 的软件排队/推理/线程间隙 + 键鼠/显示刚性延迟
             raw_lead_time = self._stream_ingress_s + software_lag + self.base_hardware_lag
-            # 高串流场景可能 >120ms，钳太死会系统性地短 lead → 准星在目标后「追逐振荡」
-            raw_lead_time = float(np.clip(raw_lead_time, 0.005, 0.200))
+            # WAN 模式：施加最小延迟地板 + 上限放宽到 300ms
+            if self._wan_mode:
+                raw_lead_time = max(raw_lead_time, self._wan_min_latency_s)
+                raw_lead_time = float(np.clip(raw_lead_time, 0.010, self._lead_clamp_max))
+            else:
+                raw_lead_time = float(np.clip(raw_lead_time, 0.005, self._lead_clamp_max))
             # 网络/调度抖动大时加快跟上，减小编码抖动的预测滞后
             lead_gap = abs(raw_lead_time - self.smoothed_lead_time)
-            ema = 0.50 if lead_gap > 0.025 else 0.15
+            # 大跳变（>25ms）时快速跟上，避免延迟突变后 3-4 帧才响应
+            ema = 0.80 if lead_gap > 0.025 else 0.20
             self.smoothed_lead_time = (1.0 - ema) * self.smoothed_lead_time + ema * raw_lead_time
 
             base_lead = self.smoothed_lead_time
 
             accel_norm = np.linalg.norm(abs_accel)
-            accel_penalty = 1.0 / (1.0 + 0.001 * accel_norm)
-            cov_trace = np.trace(target.covariance)
-            cov_penalty = np.clip(1.0 - (cov_trace - 450.0) / 1400.0, 0.45, 1.0)
+            # 目标加速度越大，越需要更多预测提前量（加速度意味着方向/速度在变，
+            # 管道延迟叠加收敛时间会让准星落点大幅滞后）。原 1/(1+a) 是反向惩罚。
+            accel_penalty = float(np.clip(1.0 + 0.0003 * accel_norm, 1.0, 1.4))
+            cov_trace = np.trace(best_track.target.covariance)
+            # 协方差 trace 初值 2404 → 原下限 0.45 意味着新目标前几百毫秒预测被
+            # 打 55% 折扣。下限提到 0.75，新目标至少保留 75% 预测容量。
+            cov_penalty = np.clip(1.0 - (cov_trace - 450.0) / 1400.0, 0.75, 1.0)
 
             # ── 架构改进：复合 lead = 管道延迟 + 控制器剩余执行时长 ───────────────
             # 原 smart_lead 只覆盖 "拍照 → 命令发出" 的管道延迟（~15-30ms），但
@@ -451,16 +573,86 @@ class WorldModel:
             # 把这段偏差磨掉 —— 这就是 pure_ai 0.617s TTK 的核心源头。
             #
             # ctrl_lead 默认 0（保持对无此接口的控制器的兼容）；CIPHER 的
-            # get_expected_lead() 在 BALLISTIC 返回 remain·0.5（质心时刻），
-            # 在 TRACKING/空转时返回 0。
+            # get_expected_lead() 用二阶阻抗动力学解析求解 ——
+            # BALLISTIC: remain（全剩余时长，因 ff_vel 已补偿目标位移）
+            # TRACKING:  4/(ζ·ω_n) + 饱和段 err/v_max
             ctrl_lead = 0.0
-            if hasattr(self.controller, 'get_expected_lead'):
-                try:
-                    ctrl_lead = float(self.controller.get_expected_lead())
-                except Exception:
-                    ctrl_lead = 0.0
+            if config.getbool("WorldModel", "ctrl_lead_enable", True):
+                if hasattr(self.controller, 'get_expected_lead'):
+                    try:
+                        ctrl_lead = float(self.controller.get_expected_lead())
+                    except Exception:
+                        ctrl_lead = 0.0
             # ctrl_lead 上限 150ms，防极端 Fitts 尾巴把 p_predict 推太远造成过冲
             ctrl_lead = float(np.clip(ctrl_lead, 0.0, 0.150))
+
+            # ── Controller speed calibration: 闭环校 control latency ───────────
+            # ctrl_lead 基于阻抗解析解（理想响应），实际 arm_vel 受 LPF / speed_cap
+            # / anti-orbit / 离散化影响而偏慢。EMA 学习 (target_speed / arm_speed)
+            # 的比率，反比放大 ctrl_lead 补偿控制响应不足。
+            ctrl_lead *= self._ctrl_speed_scale
+            ctrl_lead = float(np.clip(ctrl_lead, 0.0, 0.250))
+
+            # 更新 speed_scale: 用 Kalman 目标速度 vs 控制器上一帧 arm 速度
+            arm_vel = getattr(self.controller, 'crosshair_velocity', None)
+            if arm_vel is not None:
+                arm_spd = float(np.linalg.norm(arm_vel))
+                tgt_spd = float(np.linalg.norm(abs_velocity))
+                if tgt_spd > 10.0 and arm_spd > 0.5:
+                    # ratio > 1: 目标快但 arm 慢 → 响应不足 → 需要更大 lead
+                    ratio = tgt_spd / max(arm_spd, 1.0)
+                    ratio_clamped = float(np.clip(ratio, 0.5, 2.0))
+                    self._ctrl_speed_scale = (
+                        0.95 * self._ctrl_speed_scale + 0.05 * ratio_clamped
+                    )
+                    self._ctrl_speed_scale = float(np.clip(self._ctrl_speed_scale, 0.80, 1.40))
+                    if now - self._ctrl_speed_print_timer > 2.0:
+                        _log.ctrl_speed_scale_diag(self._ctrl_speed_scale, arm_spd, tgt_spd)
+                        self._ctrl_speed_print_timer = now
+
+            # ── Arrival-based calibration: 实测 AI 位移 vs 预期 ──────────────
+            # 上一帧 controller 输出 arm_vel，MouseWorker 1000Hz 循环发送 SendInput。
+            # 本帧从 ring_buffer 取出实际 AI 位移（总位移 − 人手位移），比较预期位移。
+            # 若比例系统性地偏小 → 管道传输率低于预期 → 反比放大 ctrl_speed_scale。
+            prev_arm = self._prev_arm_vel_cts
+            prev_arm_spd = float(np.linalg.norm(prev_arm))
+            if prev_arm_spd > 50.0 and dt > 0.001:
+                # 预期 AI 位移（counts）：arm_vel（counts/s）× dt（s）
+                expected_dx = prev_arm[0] * dt
+                expected_dy = prev_arm[1] * dt
+                expected_spd = float(np.hypot(expected_dx, expected_dy))
+                if expected_spd > 5.0:
+                    # 实际 AI 位移：总位移 − 人手意图（pynput 时人位移需减 AI 重影）
+                    human_dx, human_dy = _ring_intent_human_delta(ring_buffer, now - dt, now)
+                    total_dx, total_dy = ring_buffer.get_total_delta_sum(
+                        now - dt, now
+                    )
+                    ai_dx = float(total_dx - human_dx)
+                    ai_dy = float(total_dy - human_dy)
+                    ai_spd = float(np.hypot(ai_dx, ai_dy))
+                    if ai_spd > 3.0:
+                        arrival_ratio = ai_spd / max(expected_spd, 1.0)
+                        # arrival < 1: 输出未完全到达（管道吞吐不足）→ 需要更大 lead
+                        arrival_correction = 1.0 / max(arrival_ratio, 0.15)
+                        self._ctrl_speed_scale = (
+                            0.97 * self._ctrl_speed_scale
+                            + 0.03 * float(np.clip(arrival_correction, 0.5, 3.0))
+                        )
+                        # 钳制范围随模式：本地紧、WAN 宽
+                        _lo, _hi = (0.70, 1.60) if self._wan_mode else (0.80, 1.40)
+                        self._ctrl_speed_scale = float(np.clip(self._ctrl_speed_scale, _lo, _hi))
+                        if now - self._arrival_calib_timer > 3.0:
+                            _log.arrival_calib_diag(
+                                arrival_ratio, expected_spd, ai_spd,
+                                self._ctrl_speed_scale,
+                            )
+                            self._arrival_calib_timer = now
+
+            # 保存本帧 arm_vel 供下帧 arrival calibration 使用
+            arm_now = getattr(self.controller, 'crosshair_velocity', None)
+            if arm_now is not None:
+                self._prev_arm_vel_cts[0] = float(arm_now[0])
+                self._prev_arm_vel_cts[1] = float(arm_now[1])
 
             # accel/cov penalty 只作用于管道 lead 部分（物理噪声相关），不惩罚
             # 控制器自身的确定性剩余时间 —— 否则 BALLISTIC 会永远"差一截"。
@@ -469,8 +661,10 @@ class WorldModel:
 
             accel_bonus = 0.5 * abs_accel * (smart_lead ** 2)
             bonus_norm = float(np.linalg.norm(accel_bonus))
-            if bonus_norm > 28.0:
-                accel_bonus = accel_bonus * (28.0 / bonus_norm)
+            # 上限从 28px 提到 60px，配合更大的 smart_lead（含收敛时间）
+            # ½at² 在 lead=120ms, accel=3000px/s² 时 ≈ 22px，60px 留有足够余量
+            if bonus_norm > 60.0:
+                accel_bonus = accel_bonus * (60.0 / bonus_norm)
 
             pred_abs_pos = abs_position + abs_velocity * smart_lead + accel_bonus
 
@@ -478,20 +672,29 @@ class WorldModel:
             rel_pred_pos = pred_abs_pos - self.ego_pos_px
 
         # 此处 is_coasting 已提前 return，仅保留有量测的帧
-        error_distance = np.linalg.norm(measurement)
+        rel_pos = abs_position - self.ego_pos_px
+        error_distance = float(np.linalg.norm(rel_pos))
         threshold = self.mode_threshold_high if self.last_mode == "track" else self.mode_threshold_low
-        self.controller.mode = "flick" if error_distance > threshold else "track"
-        self.last_mode = self.controller.mode
+        new_mode = "flick" if error_distance > threshold else "track"
+        if new_mode != self.last_mode:
+            _log.controller_mode(self.last_mode, new_mode,
+                                error_distance, threshold)
+        self.controller.mode = new_mode
+        self.last_mode = new_mode
 
         context.p_predict = (rel_pred_pos[0], rel_pred_pos[1])
         context.v_real = (abs_velocity[0], abs_velocity[1])
         context.a_real = (abs_accel[0], abs_accel[1])
         # 实战触发与 gate 用真实检测置信；旧逻辑写死 1.0 时 Triggerbot/调试全失真
-        context.conf = float(best_detection.conf) if best_detection is not None else 0.0
+        context.conf = float(best_track.conf_ema)
         context.is_valid = True
 
     def cleanup_old_targets(self, max_age: float = 2.0):
+        """手动清理长期 coast 的轨迹（通常 TrackManager 自动处理，此方法为兼容旧调用）。"""
         now = time.perf_counter()
-        to_remove = [tid for tid, tgt in self.targets.items() if now - tgt.last_seen > max_age]
-        for tid in to_remove:
-            del self.targets[tid]
+        dead_ids = [
+            tid for tid, t in self.track_manager.tracks.items()
+            if now - t.last_matched > max_age
+        ]
+        for tid in dead_ids:
+            del self.track_manager.tracks[tid]

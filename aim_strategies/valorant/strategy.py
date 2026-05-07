@@ -1,10 +1,10 @@
 import math
-import logging
 from typing import Tuple
 import numpy as np
 from config import config
+from utils.logger import get_logger
 
-logger = logging.getLogger("AimStrategy")
+logger = get_logger("AimStrategy")
 
 
 class CalibrationState:

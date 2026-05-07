@@ -1,11 +1,11 @@
-import logging
 import time
 import threading
 import numpy as np
 import dxcam
 from config import config
+from utils.logger import get_logger
 
-_log = logging.getLogger("Capture")
+_log = get_logger("Capture")
 from perception.bus import FrameBus, FrameInfo
 
 
@@ -107,6 +107,6 @@ class CaptureThread(threading.Thread):
 
         try:
             self.camera.stop()
-        except:
-            pass
+        except Exception as e:
+            _log.debug("DXCam stop: %s", e)
         _log.info("Stopped, total frames=%d", frame_count)

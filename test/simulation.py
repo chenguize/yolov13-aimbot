@@ -6,25 +6,13 @@
 #   · 两种模式（pure_ai / human_flick）统一用 phase_times = see_idx → lock_idx
 #   · TTK 满分阈值 0.18s，零分阈值 0.40s
 #   · 权重 TTK 40% / Precision 20% / Natural 25% / Bio 15%
-#   · pure_ai 的 spawn_radius 已限制为 60~256px（sim_agent），反映 AI 只接管
-#     "256px 内瞄准"的实战语境
-#
-# 配套算法改动（不调参，只改架构）：
-#   · PROController.get_expected_lead() —— 把 BALLISTIC 剩余执行时间暴露给 WM
-#   · WorldModel 把 ctrl_lead 叠加到 smart_lead，BALLISTIC 瞄准 "动作结束时刻"
-#   · TargetState 协方差合理初始化，避免刚 spawn 时 cov_penalty 被虚假压低
-#
-# 与上一版的根本差异：
-#   · warm-start：用 pro_controller.py 的默认值作为 CMA-ES 的 x0；
-#   · enqueue baseline：第 0 号 trial 强制用 baseline 跑一次，锁住一个保底分；
-#   · bounds 全部在 baseline 周边 ×0.5 / ×2.0 范围，避免远离局部最优；
-#   · 10 个验证种子 + 多段场景，降低目标函数噪声；
-#   · objective 只在 trial 结束后算 robust（减小 pruner 误判）。
 #
 # ─── 使用 ────────────────────────────────────────────────────────────────
-#   python test/simulation.py                 ← 多进程炼丹
-#   python test/simulation.py --single        ← 单进程跑（方便 debug）
-#   python test/simulation.py --resume        ← 续跑现有 study（不重建 sampler）
+#   python test/simulation.py                              ← 小球追踪炼丹 (默认)
+#   python test/simulation.py --scenario takeover          ← AI接管炼丹
+#   python test/simulation.py --scenario pure_ai           ← 纯AI瞄准(预测管线)
+#   python test/simulation.py --scenario takeover --single ← 单进程 debug
+#   python test/simulation.py --resume                     ← 续跑现有 study
 # ═══════════════════════════════════════════════════════════════════════════════
 import argparse
 import contextlib
@@ -38,10 +26,17 @@ import numpy as np
 import optuna
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+# 同上：保证根目录优先于 `test/` 脚本目录，否则 `from test import …` 会失败
+if _ROOT in sys.path:
+    sys.path.remove(_ROOT)
+sys.path.insert(0, _ROOT)
 
 from test import control as c
+
+# ── 场景选择（模块级全局，供多进程 worker 访问）──
+_SCENARIO_TYPE: str = "ball"          # "ball" | "takeover" | "pure_ai"
+_SCENARIO_MAX_KILLS: int = 20         # takeover 每 seed 击杀数 (ball_tracking 用内置默认 30)
+_SCENARIO_DURATION: float = 10.0      # 每 seed 仿真时长
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -175,9 +170,21 @@ PARAM_BOUNDS: dict[str, tuple[float, float, bool]] = {
 VALIDATION_SEEDS = (11, 23, 47, 71, 103, 137, 199, 251, 317, 401)
 
 
+def _make_scenario():
+    """根据全局 _SCENARIO_TYPE 创建场景实例。"""
+    if _SCENARIO_TYPE == "takeover":
+        from test.scenarios.takeover import TakeoverScenario
+        return TakeoverScenario(max_kills=_SCENARIO_MAX_KILLS)
+    if _SCENARIO_TYPE == "pure_ai":
+        from test.scenarios.pure_ai_ball import PureAIBallScenario
+        return PureAIBallScenario(max_kills=_SCENARIO_MAX_KILLS)
+    return None  # 默认 BallTrackingScenario
+
+
 def run_once(params: dict, seed: int, duration: float = 30.0) -> dict:
     np.random.seed(seed)
     pyrand.seed(seed)
+    scenario = _make_scenario()
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         _, _, analysis = c.run_simulation_with_diagnostics(
@@ -186,6 +193,7 @@ def run_once(params: dict, seed: int, duration: float = 30.0) -> dict:
             verbose=False,
             use_fixed=True,
             params=params,
+            scenario=scenario,
         )
     return analysis
 
@@ -285,7 +293,9 @@ def build_study(db_url: str, study_name: str, resume: bool) -> optuna.Study:
 # ══════════════════════════════════════════════════════════════════════════════
 # § 6  Worker / entrypoint
 # ══════════════════════════════════════════════════════════════════════════════
-def optimize_worker(db_url: str, study_name: str, n_trials: int):
+def optimize_worker(db_url: str, study_name: str, n_trials: int, scenario_type: str = "ball"):
+    global _SCENARIO_TYPE
+    _SCENARIO_TYPE = scenario_type
     study = optuna.load_study(study_name=study_name, storage=db_url)
     study.optimize(objective, n_trials=n_trials)
 
@@ -320,18 +330,30 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--single", action="store_true", help="单进程跑，方便 debug")
     parser.add_argument("--resume", action="store_true", help="续跑现有 study")
+    parser.add_argument("--scenario", type=str, default="ball",
+                        choices=["ball", "takeover", "pure_ai"],
+                        help="场景: ball=混合小球, takeover=接管, pure_ai=纯AI(预测)")
     parser.add_argument("--trials", type=int, default=400, help="总 trial 数")
     parser.add_argument("--workers", type=int, default=0, help="worker 数量（0 = 自动）")
     args = parser.parse_args()
 
-    db_url     = "sqlite:///aimbot_cipher_v1.db"
-    # v4.1 架构改动（WorldModel↔Controller 时间轴对齐、Kalman cov 合理初值、
-    # pure_ai 限制 256px、评分统一 phase_times）后，旧 study 的 trial 参数与
-    # 当前代码已不同源，不应 resume。用新 study_name 起新曲线；旧 study 仍然
-    # 保留在 db 里方便对比。
-    study_name = "cipher_v4_1_archfix"
+    global _SCENARIO_TYPE
+    _SCENARIO_TYPE = args.scenario
 
-    print("\n🚀 启动 CMA-ES 炼丹炉 (CIPHER v1.0, warm-start)")
+    db_url = "sqlite:///aimbot_cipher_v1.db"
+
+    if args.scenario == "takeover":
+        study_name = "cipher_v5_takeover"
+        scenario_label = "AI接管 (TakeoverScenario)"
+    elif args.scenario == "pure_ai":
+        study_name = "cipher_v6_pure_ai_ball"
+        scenario_label = "纯AI瞄准 (PureAIBallScenario)"
+    else:
+        study_name = "cipher_v4_1_archfix"
+        scenario_label = "小球追踪 (BallTrackingScenario)"
+
+    print(f"\n🚀 启动 CMA-ES 炼丹炉 (CIPHER v1.0, warm-start)")
+    print(f"   场景: {scenario_label}")
     print(f"   x0 = BASELINE（{len(PARAM_BOUNDS)} 维），10 seeds × 30s")
     print(f"   storage = {db_url}, study = {study_name}\n")
 
@@ -347,7 +369,7 @@ def main():
         for _ in range(n_workers):
             p = multiprocessing.Process(
                 target=optimize_worker,
-                args=(db_url, study_name, per),
+                args=(db_url, study_name, per, _SCENARIO_TYPE),
             )
             p.start()
             procs.append(p)

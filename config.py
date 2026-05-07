@@ -12,6 +12,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+def _strip_inline_comment(raw: str) -> str:
+    """去掉行尾「空白 + # …」注释（configparser 不会自动分割同值行内注释）。"""
+    s = raw.strip()
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "#" and (i == 0 or s[i - 1].isspace()):
+            return s[:i].rstrip()
+        i += 1
+    return s
+
+
 class Config:
     """全局配置单例类 - 从 config.ini 读取所有参数，支持类型自动转换"""
     
@@ -48,24 +60,30 @@ class Config:
         if not self.parser.has_section(section) or not self.parser.has_option(section, key):
             return default
 
-        val = self.parser.get(section, key).strip()
+        val = _strip_inline_comment(self.parser.get(section, key))
 
         # 空值处理
         if not val:
             return default
 
-        # bool 转换 - 检查布尔值表示
-        if val.lower() in ('true', 'false', 'yes', 'no', '1', '0'):
-            return val.lower() in ('true', 'yes', '1')
-
-        # 尝试数字转换
+        # 尝试整数转换（必须在 bool 之前：否则 "0"/"1" 被误判为 False/True）
         try:
             return int(val)
         except ValueError:
-            try:
-                return float(val)
-            except ValueError:
-                return val
+            pass
+
+        # 尝试浮点数转换
+        try:
+            return float(val)
+        except ValueError:
+            pass
+
+        # bool 转换 — 仅关键字，不含 "0"/"1"（已在上面被 int 捕获）
+        if val.lower() in ('true', 'false', 'yes', 'no'):
+            return val.lower() in ('true', 'yes')
+
+        # 字符串原样返回
+        return val
 
     def getstr(self, section: str, key: str, default: str = "") -> str:
         """获取字符串类型配置值"""

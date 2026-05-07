@@ -1,11 +1,20 @@
 # output.py - Optimized
 import ctypes
-import logging
 import threading
 from ctypes import c_long, c_ulong, c_ulonglong, Structure, Union, sizeof, byref
 from typing import Optional, TYPE_CHECKING
 
-_log = logging.getLogger("SystemMouse")
+from utils.logger import get_logger
+
+_log = get_logger("SystemMouse")
+
+# 模块级硬门（deprecated：agent 恒 False）。多 SystemMouse 单例时仍同步本标志。
+_AIM_MOVE_BLOCK: bool = False
+
+
+def set_aimbot_move_block(block: bool) -> None:
+    global _AIM_MOVE_BLOCK
+    _AIM_MOVE_BLOCK = bool(block)
 
 if TYPE_CHECKING:
     from perception.ring_buffer import RingBuffer
@@ -49,6 +58,7 @@ class SystemMouse:
             return
         self._init_once = True
         self.ring_buffer: Optional['RingBuffer'] = None
+        self._block_aimbot_move: bool = False
 
         # === 优化核心：预先分配内存 ===
         self._inp = INPUT()
@@ -66,8 +76,17 @@ class SystemMouse:
     def set_ring_buffer(self, ring_buffer):
         self.ring_buffer = ring_buffer
 
+    def set_block_aimbot_move(self, block: bool) -> None:
+        """
+        True 时拦 aim 的相对 mouse_xy。主循环现恒 False。点射不受此位影响。
+        """
+        self._block_aimbot_move = bool(block)
+        set_aimbot_move_block(bool(block))
+
     def mouse_xy(self, x: int, y: int):
         if x == 0 and y == 0:
+            return
+        if _AIM_MOVE_BLOCK or getattr(self, "_block_aimbot_move", False):
             return
 
         # === 极速发送 ===

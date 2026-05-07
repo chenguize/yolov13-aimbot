@@ -1,8 +1,8 @@
 # aim_strategies/factory.py
-import logging
 from config import config
+from utils.logger import get_logger
 
-_log = logging.getLogger("AimStrategyFactory")
+_log = get_logger("AimStrategyFactory")
 
 
 def create_aim_strategy():

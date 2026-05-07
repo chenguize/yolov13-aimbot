@@ -55,12 +55,13 @@
 # └──────────────────────────────────────────────────────────────────────────────┘
 
 
-import logging
 import time
 import threading
 import numpy as np
 
-_log_cipher = logging.getLogger("PROController")
+from utils.logger import get_logger
+
+_log_cipher = get_logger("PROController")
 from typing import Optional, Tuple
 from config import config
 
@@ -151,6 +152,41 @@ def _impedance_vel(
         vcy *= sc
 
     return vcx, vcy
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 2.5 │ Rust Native Engine Dispatch
+# ══════════════════════════════════════════════════════════════════════════════
+# When [Controller] rust_enable=True and the Rust crate is compiled, replace
+# the Numba-JIT kernels with their Rust-native equivalents for lower latency.
+# Falls back silently to Numba if CipherEngine is not available or disabled.
+
+try:
+    from utils.rust_engine import CipherEngine
+except ImportError:
+    CipherEngine = None
+
+_USE_RUST = (
+    config.getbool("Controller", "rust_enable", False)
+    and CipherEngine is not None
+)
+
+if _USE_RUST:
+    _log_cipher.info("Rust engine ENABLED — using native kernels (minjerk_vel, minjerk_pos, impedance_vel)")
+    _minjerk_vel   = CipherEngine.minjerk_vel    # type: ignore[assignment]
+    _minjerk_pos   = CipherEngine.minjerk_pos    # type: ignore[assignment]
+    _impedance_vel = CipherEngine.impedance_vel  # type: ignore[assignment]
+else:
+    if config.getbool("Controller", "rust_enable", False):
+        _log_cipher.warning(
+            "rust_enable=True but CipherEngine NOT compiled. "
+            "Build with: cd utils/rust_engine && maturin develop --release. Falling back to Numba."
+        )
+    else:
+        _log_cipher.debug("Rust engine disabled (rust_enable=False), using Numba JIT")
+
+# 供 Agent 管线日志等读取：cipher 热路径内核来自 Rust 扩展还是 Numba
+CIPHER_KERNEL_BACKEND: str = "rust" if _USE_RUST else "numba"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -267,6 +303,28 @@ class PROController:
         # 噪声"增益"统一从 config 读取，让 CMA-ES 能搜。
         self._ou_vel_scale    = config.getfloat("Controller", "cipher_ou_vel_scale",    120.0)
         self._drift_pos_scale = config.getfloat("Controller", "cipher_drift_pos_scale",   0.025)
+
+        # ── 参数降维：函数化替代独立 magic number ────────────────────────────
+        # 从 K 和阻尼比 ζ 推导 B：B = 2ζ√(K·τ_arm) - 1，下限 0.05 防止零阻尼振荡
+        _zeta_corr = config.getfloat("Controller", "cipher_zeta_correction", 0.0)
+        if _zeta_corr > 0:
+            self._B_correction = max(0.05, 2.0 * _zeta_corr * np.sqrt(self._K_correction * self._tau_arm) - 1.0)
+            _log_cipher.debug("B_correction derived from ζ=%.3f: %.4f", _zeta_corr, self._B_correction)
+        _zeta_purs = config.getfloat("Controller", "cipher_zeta_pursuit", 0.0)
+        if _zeta_purs > 0:
+            self._B_pursuit = max(0.05, 2.0 * _zeta_purs * np.sqrt(self._K_pursuit * self._tau_arm) - 1.0)
+            _log_cipher.debug("B_pursuit derived from ζ=%.3f: %.4f", _zeta_purs, self._B_pursuit)
+        # 阈值滞回比率
+        _hyst_ratio = config.getfloat("Controller", "cipher_thresh_hyst_ratio", 0.0)
+        if _hyst_ratio > 0:
+            self._thresh_low = self._thresh_high * _hyst_ratio
+            _log_cipher.debug("thresh_low derived from ratio=%.3f: %.1f", _hyst_ratio, self._thresh_low)
+        # 滤波器 τ 比率
+        _wrist_ratio = config.getfloat("Controller", "cipher_tau_wrist_ratio", 0.0)
+        if _wrist_ratio > 0:
+            self._tau_wrist = self._tau_arm * _wrist_ratio
+            _log_cipher.debug("tau_wrist derived from ratio=%.3f: %.4f", _wrist_ratio, self._tau_wrist)
+
         # ── Motor program state ────────────────────────────────────────────────
         self._phase       = self._TRACKING    # safe default; ballistic on first target
         self._prog_t      = 0.0              # elapsed time since program start
@@ -339,6 +397,7 @@ class PROController:
         self.last_error_dist = 0.0
         self._head_radius    = 15.0
         self._head_radius_px = 15.0
+        self._last_bbox_w    = 60.0  # 供 get_expected_lead 计算 depth_gain
 
         # ── Per-session RNG (seeded from wall time for varied behavior) ────────
         seed = int(time.perf_counter() * 1_000_000) & 0xFFFF_FFFF
@@ -352,6 +411,12 @@ class PROController:
             "CIPHER v1.0 AIC: K_pursuit=%.0f K_flick=%.0f τ_arm=%.0fms τ_wrist=%.0fms",
             self._K_pursuit, self._K_flick, self._tau_arm * 1000.0, self._tau_wrist * 1000.0,
         )
+
+    # ── Public chase_mode accessor (read-only) ─────────────────────────────────
+    @property
+    def chase_mode(self) -> str:
+        """外部只读访问：当前 chase_mode（pure_ai / human_flick）。"""
+        return self._chase_mode
 
     # ──────────────────────────────────────────────────────────────────────────
     # Internal: motor program sampler
@@ -425,6 +490,9 @@ class PROController:
         self._arm_vel *= damp
 
         self._phase = self._BALLISTIC
+        _log_cipher.phase_switch("TRACKING", "BALLISTIC",
+                                dist=round(dist), T_ms=round(T*1000, 1),
+                                peak_v=round(self._prog_peak_v))
 
     # ──────────────────────────────────────────────────────────────────────────
     def reset_target_state(self, mode: Optional[str] = None):
@@ -450,31 +518,85 @@ class PROController:
             self._ou_state    *= 0.25           # partial tremor reset (not instant: unnatural)
             self._drift_state *= 0.85
             if mode in ('pure_ai', 'human_flick'):
+                _prev = self._chase_mode
                 self._chase_mode = mode
+                if _prev != mode:
+                    _log_cipher.info(
+                        "reset_target_state: chase_mode %s → %s (arm_vel*=0.05, spf=0, phase=TRACKING)",
+                        _prev, mode,
+                    )
+                else:
+                    _log_cipher.debug(
+                        "reset_target_state: chase_mode=%s (re-confirm, arm_vel*=0.05, spf=0)",
+                        mode,
+                    )
             # 其他值（None / 未知）维持前次模式，避免老 agent 调用出现奇怪行为
 
     # ──────────────────────────────────────────────────────────────────────────
     def get_expected_lead(self) -> float:
         """
-        告诉 WorldModel "控制器还要多久才能让准星到达目标"（秒）。
+        告诉 WorldModel "准星还要多久才能到达目标位置"（秒）。
 
-        这是 CIPHER ↔ WorldModel 时间轴对齐的关键接口：WorldModel 原本只做
-        "管道延迟补偿"（~15-30ms），但 BALLISTIC 本身是一段 80~200ms 的开环
-        min-jerk 轨迹；执行这段轨迹期间目标会持续移动，若 p_predict 不把这段
-        时间算进去，BALLISTIC 着陆时天然产生 D·v_target 级别的系统性偏差
-        （@10m, 8.5m/s 横向 → ~60-90px 稳态错位）。
+        不用任何硬编码系数，完全从控制器自身的实时动力学状态推导：
 
-        约定：
-          · BALLISTIC: 返回 min-jerk 剩余时长的 "有效质心时刻"（≈remain·0.5），
-            因为 BALLISTIC 结束瞬间的 v=0，在时间轴上的加权中心是 remain/2。
-          · TRACKING:  返回 0（闭环，WorldModel 自带的 smart_lead 已足够）。
+        BALLISTIC：
+          pure_ai 的 ff_coef_ball=1.0，速度层已完全补偿目标位移，
+          空间预测只需覆盖剩余程序时长 remain。
+          （human_flick 的 ff_coef_ball=0.6 留 40% 给 TRACKING 收，也按全时长预测）
 
-        WorldModel 会把这个值叠加到 smart_lead 上参与 p_predict 计算。
+        TRACKING：
+          系统方程：d²e/dt² + (1/τ)·de/dt + (K·dg·power/τ)·e = 0
+          自然频率  ω_n = √(K·dg·power / τ)
+          阻尼比    ζ   = 1 / (2·√(K·dg·power·τ))
+
+          分两段求解：
+          · 线性区（err ≤ v_max/gain）：二阶系统 2% settling time = 4/(ζ·ω_n)
+          · 饱和区（err > v_max/gain）：先走 v_max 限速段 = (err-e_sat)/v_max，
+            再接线性段 settling time
+
+          所有参数（K、τ、dg、power、v_max）均从 self 实时读取，
+          适配任何 config.ini 改动或在线调参。
         """
         if self._phase == self._BALLISTIC:
             remain = max(0.0, self._prog_T - self._prog_t)
-            return remain * 0.5
-        return 0.0
+            return remain
+
+        # ── TRACKING 阶段：二阶阻抗动力学解析 ────────────────────────────
+        err = self.last_error_dist
+        if err < 1.0:
+            return 0.0
+
+        is_pure_ai = (self._chase_mode == 'pure_ai')
+        v_max = self._v_max_ai if is_pure_ai else self._v_max
+
+        # 与 compute() 中完全一致的参数
+        dg = float(np.clip(
+            self._depth_ref / max(self._last_bbox_w, 10.0), 0.45, 2.8))
+        K = self._K_pursuit
+        tau = self._tau_arm
+        power = float(np.clip(self._spf, 0.0, 1.0))
+
+        # 闭环增益
+        gain = K * dg * max(power, 0.01)
+
+        # 二阶特征参数
+        omega_n = np.sqrt(gain / tau)
+        zeta = 1.0 / (2.0 * np.sqrt(gain * tau))
+        zeta = float(np.clip(zeta, 0.1, 1.0))
+
+        # 临界误差：v_cmd 开始被 v_max 削顶的点
+        e_sat = v_max / max(gain, 1e-6)
+
+        if err <= e_sat:
+            # 纯线性区
+            ts = 4.0 / max(zeta * omega_n, 1e-6)
+        else:
+            # 饱和区 + 线性尾段
+            t_sat = (err - e_sat) / max(v_max, 1e-6)
+            t_linear = 4.0 / max(zeta * omega_n, 1e-6)
+            ts = t_sat + t_linear
+
+        return float(np.clip(ts, 0.0, 0.250))
 
     # ──────────────────────────────────────────────────────────────────────────
     def notify_flick_end(self):
@@ -519,6 +641,39 @@ class PROController:
         """是否允许 tick_mouse 执行 OU/腕滤波与相对位移。无目标/暂停 必须为 False。"""
         with self._lock:
             self._emit_mouse = bool(enable)
+
+    def warm_start_from_velocity(self, vx: float, vy: float):
+        """
+        AI 接管/唤醒热启动：用卡尔曼目标速度预种 _arm_vel。
+
+        停手唤醒或 flick 结束接管时调用。跳过冷启动的 0→v_target 爬升，
+        让阻抗控制器直接处理残差而非从头加速。
+
+        seed * 0.7：留 30% 收敛余量，让阻尼控制器有空间减速而不冲过目标。
+        """
+        with self._lock:
+            seed = np.array([vx, vy], dtype=np.float64)
+            speed = float(np.linalg.norm(seed))
+            if speed < 5000.0:
+                self._arm_vel[:] = seed * 0.7
+                self._wrist_vel[:] = self._arm_vel
+                self.crosshair_velocity[:] = self._arm_vel
+                self._spf = 0.30     # 跳过 power_factor 低位
+                self._age_ms = 20.0  # 跳过冷启动斜坡
+                self._phase = self._TRACKING
+                self._prog_t = 0.0
+
+    def soft_freeze(self, dt: float):
+        """
+        渐变冻结：让臂速在三帧内自然衰减到零，替代 freeze_output_integrators 的
+        瞬间清零。停手过渡更丝滑，避免「准星刚要锁上突然停止」的感知断裂。
+        """
+        tau_hold = 0.012  # 12ms 衰减常数
+        alpha = float(np.clip(1.0 - np.exp(-dt / tau_hold), 0.01, 0.40))
+        with self._lock:
+            self._arm_vel *= (1.0 - alpha)
+            self._wrist_vel *= (1.0 - alpha)
+            self.crosshair_velocity[:] = self._arm_vel
 
     def _accum_emit_tick(self, mx: int, my: int, fdx: float, fdy: float) -> None:
         self._emit_ix += mx
@@ -621,8 +776,15 @@ class PROController:
             # 头部半径以 bbox 的 26% 估算（像素空间），再乘常数 px_to_ct 进入 count 空间
             self._head_radius = max(4.0, bbox_w * 0.26)
             self._head_radius_px = self._head_radius
+            self._last_bbox_w = float(bbox_w)
 
             head_r_counts          = self._head_radius * px_to_ct
+            # 窄 bbox（Aimlab 色球）：head_r 只有几 px → d_norm=dist/head_r 虚高 → near_w 长期为 0，
+            # 阻抗卡在 pursuit（刚）+ ff_scale=1，末端易「钉穿」过冲。TRACKING 增益调度单独用下限半径，
+            # 不改变 _start_motor_program 欠射与 BALLISTIC 里用的 head_r_counts。
+            head_r_gain_sched = float(
+                max(head_r_counts, np.clip(12.0 * px_to_ct, 5.0, 80.0))
+            )
             dz_r_counts            = max(2.5, bbox_w * self._dz_base) * px_to_ct
             thresh_high_counts     = self._thresh_high * px_to_ct
             thresh_low_counts      = self._thresh_low  * px_to_ct
@@ -657,6 +819,10 @@ class PROController:
                 prog_remain = self._prog_D * (1.0 - _minjerk_pos(tau_now))
                 startle_thr = max(head_r_counts * 6.0, prog_remain * 0.65, 30.0 * px_to_ct)
                 if dist > prog_remain + startle_thr:
+                    _log_cipher.phase_switch(
+                        "BALLISTIC", "BALLISTIC(re-plan)",
+                        reason="startle", dist=round(dist),
+                        remain=round(prog_remain), thr=round(startle_thr))
                     self._start_motor_program(dist, error, head_r_counts)
             else:
                 # TRACKING：只有穿越 thresh_high 才重新启动弹道（大距离才值得重规划）
@@ -676,72 +842,88 @@ class PROController:
             # impedance + ff_vel*ff_scale，20ms 内产生 5000+ ct/s² 的 accel 脉冲
             # 顶穿 Natural 的 hf_penalty）。不碰 brake 轮廓（保持 min-jerk 位移闭环）
             if self._phase == self._BALLISTIC:
-                self._prog_t += dt
-                tau = self._prog_t / max(self._prog_T, 1e-6)
-
-                vel_shape = _minjerk_vel(tau)
-
-                blend = float(np.clip(tau * 2.5, 0.0, 1.0))
-                if dist > 2.0:
-                    cur_dir = error / dist
-                    mixed = (1.0 - blend) * self._prog_dir + blend * cur_dir
-                    mixed_norm = float(np.linalg.norm(mixed))
-                    direction = mixed / mixed_norm if mixed_norm > 1e-6 else self._prog_dir
-                else:
-                    direction = self._prog_dir
-
-                brake = 1.0
-                if tau > 0.65 and dist > 1e-3:
-                    remaining_past_undershoot = max(dist - self._prog_undershoot, 0.0)
-                    frac = remaining_past_undershoot / max(dist, 1.0)
-                    brake = float(np.clip(0.20 + 0.80 * frac, 0.20, 1.0))
-
-                # ff_vel 系数：pure_ai 完全前馈（1.0），彻底消灭"BALLISTIC 执行期
-                # 目标移动造成的 landing 残差"（原 0.6 意味着 40% 目标速度得不到
-                # 补偿，220ms 下累积 60-90px 偏差 → 触发 TRACKING→BALLISTIC 重启环）。
-                # human_flick 保留 0.6（模拟人类甩枪时"视觉速度估计偏保守"的特征）。
-                ff_coef_ball = 1.0 if is_pure_ai else 0.6
-                v_ballistic = direction * vel_shape * self._prog_peak_v * brake + ff_vel * ff_coef_ball
-
-                # 尾段混入 TRACKING impedance，消除 v_cmd 跳变
-                if tau > 0.80:
-                    blend_imp = float((tau - 0.80) / 0.20)  # 0 → 1 在最后 20%
-                    vcx_imp, vcy_imp = _impedance_vel(
-                        error[0], error[1],
-                        self._arm_vel[0], self._arm_vel[1],
-                        0.0, 0.0,
-                        self._K_correction, self._B_correction,
-                        v_max_eff, dz_r_counts * 0.75, depth_gain, eff_power,
-                    )
-                    v_tracking_preview = (
-                        np.array([vcx_imp, vcy_imp])
-                        + ff_vel * eff_power * max(self._ff_scale_min, 0.60)
-                    )
-                    v_cmd = (1.0 - blend_imp) * v_ballistic + blend_imp * v_tracking_preview
-                else:
-                    v_cmd = v_ballistic
-
-                if tau >= 1.0:
+                # ── 紧急接管 / 人手强拉：中止开环弹道 ────────────────────────
+                # ChatGPT 指出的核心 bug：BALLISTIC min-jerk 运动程序是纯开环，
+                # v_ballistic = dir·shape·peak_v·brake + ff_vel·ff_coef，完全不看
+                # eff_power。紧急时 ai_weight=0 → power_factor=0 → eff_power=0，
+                # 但弹道仍按原速执行 → "权重让了，力没让"。
+                if eff_power < 0.02:
+                    _log_cipher.phase_switch("BALLISTIC", "TRACKING",
+                                            reason="emergency_yield", eff_power=float(eff_power))
                     self._phase = self._TRACKING
-                    # v4.1 P0：entry_ticks 微调窗口只在 human_flick 模式下激活。
-                    # - human_flick: AI 是在人类甩枪后"接棒补枪"，保留 24ms 的
-                    #   "微调人味"窗口（error 保持 1-3px），靠 Bio Bonus 扳回分数
-                    # - pure_ai:     AI 在 256px 内独立瞄准，核心指标是 TTK；
-                    #   entry_ticks 会浪费 24ms，直接归零走最快路径
-                    if self._chase_mode == 'human_flick':
-                        self._entry_ticks_remaining = self._entry_ticks_init
+                    self._prog_t = 0.0
+                    self._arm_vel *= 0.15   # 保留残余动量做丝滑过渡，非瞬间停
+                    v_cmd = np.zeros(2, dtype=np.float64)
+                else:
+                    self._prog_t += dt
+                    tau = self._prog_t / max(self._prog_T, 1e-6)
+
+                    vel_shape = _minjerk_vel(tau)
+
+                    blend = float(np.clip(tau * 2.5, 0.0, 1.0))
+                    if dist > 2.0:
+                        cur_dir = error / dist
+                        mixed = (1.0 - blend) * self._prog_dir + blend * cur_dir
+                        mixed_norm = float(np.linalg.norm(mixed))
+                        direction = mixed / mixed_norm if mixed_norm > 1e-6 else self._prog_dir
                     else:
-                        self._entry_ticks_remaining = 0
-                        # BALLISTIC→TRACKING 软着陆（pure_ai 专用）：
-                        # 因 pure_ai 放开了 v_max 到 9500，BALLISTIC 峰值可达 ~9k counts/s，
-                        # arm LPF (τ=12ms) 在 tau=1.0 时仍残留 30~50% 的尾段动能 →
-                        # TRACKING 第一帧 arm_vel 比 target 速度大，会冲过目标 3-8px。
-                        #
-                        # 策略：arm_vel 保留 35% 原动量（方向由 BALLISTIC 给出，贴近目标），
-                        # 不强制对齐 ff_vel —— 因为 Kalman 在目标突变后 ~50ms 内
-                        # ff_vel 会滞后，若强制对齐会跟着错方向冲 30+px（直接顶穿 precision）。
-                        # 35% 是 "不过冲" 与 "保持前进动量收 undershoot" 的平衡点。
-                        self._arm_vel *= 0.35
+                        direction = self._prog_dir
+
+                    brake = 1.0
+                    if tau > 0.65 and dist > 1e-3:
+                        remaining_past_undershoot = max(dist - self._prog_undershoot, 0.0)
+                        frac = remaining_past_undershoot / max(dist, 1.0)
+                        brake = float(np.clip(0.20 + 0.80 * frac, 0.20, 1.0))
+
+                    # ff_vel 系数：pure_ai 完全前馈（1.0），彻底消灭"BALLISTIC 执行期
+                    # 目标移动造成的 landing 残差"（原 0.6 意味着 40% 目标速度得不到
+                    # 补偿，220ms 下累积 60-90px 偏差 → 触发 TRACKING→BALLISTIC 重启环）。
+                    # human_flick 保留 0.6（模拟人类甩枪时"视觉速度估计偏保守"的特征）。
+                    ff_coef_ball = 1.0 if is_pure_ai else 0.6
+                    v_ballistic = direction * vel_shape * self._prog_peak_v * brake + ff_vel * ff_coef_ball
+
+                    # 尾段混入 TRACKING impedance，消除 v_cmd 跳变
+                    if tau > 0.80:
+                        blend_imp = float((tau - 0.80) / 0.20)  # 0 → 1 在最后 20%
+                        vcx_imp, vcy_imp = _impedance_vel(
+                            error[0], error[1],
+                            self._arm_vel[0], self._arm_vel[1],
+                            0.0, 0.0,
+                            self._K_correction, self._B_correction,
+                            v_max_eff, dz_r_counts * 0.75, depth_gain, eff_power,
+                        )
+                        v_tracking_preview = (
+                            np.array([vcx_imp, vcy_imp])
+                            + ff_vel * eff_power * max(self._ff_scale_min, 0.60)
+                        )
+                        v_cmd = (1.0 - blend_imp) * v_ballistic + blend_imp * v_tracking_preview
+                    else:
+                        v_cmd = v_ballistic
+
+                    if tau >= 1.0:
+                        _log_cipher.phase_switch("BALLISTIC", "TRACKING",
+                                                prog_T_ms=round(self._prog_T*1000, 1),
+                                                elapsed_ms=round(self._prog_t*1000, 1))
+                        self._phase = self._TRACKING
+                        # v4.1 P0：entry_ticks 微调窗口只在 human_flick 模式下激活。
+                        # - human_flick: AI 是在人类甩枪后"接棒补枪"，保留 24ms 的
+                        #   "微调人味"窗口（error 保持 1-3px），靠 Bio Bonus 扳回分数
+                        # - pure_ai:     AI 在 256px 内独立瞄准，核心指标是 TTK；
+                        #   entry_ticks 会浪费 24ms，直接归零走最快路径
+                        if self._chase_mode == 'human_flick':
+                            self._entry_ticks_remaining = self._entry_ticks_init
+                        else:
+                            self._entry_ticks_remaining = 0
+                            # BALLISTIC→TRACKING 软着陆（pure_ai 专用）：
+                            # 因 pure_ai 放开了 v_max 到 9500，BALLISTIC 峰值可达 ~9k counts/s，
+                            # arm LPF (τ=12ms) 在 tau=1.0 时仍残留 30~50% 的尾段动能 →
+                            # TRACKING 第一帧 arm_vel 比 target 速度大，会冲过目标 3-8px。
+                            #
+                            # 策略：arm_vel 保留部分原动量（方向由 BALLISTIC 给出，贴近目标），
+                            # 不强制对齐 ff_vel —— 因为 Kalman 在目标突变后 ~50ms 内
+                            # ff_vel 会滞后，若强制对齐会跟着错方向冲 30+px（直接顶穿 precision）。
+                            # Aimlab 小目标下 35% 仍常尾冲过零；降至 ~26% 换更软的着陆。
+                            self._arm_vel *= 0.26
 
             # ─ H.2: TRACKING — continuous gain-scheduled closed loop ──────────
             # 核心思想：K, B, ff_scale, v_ref 全部按"归一化距离"平滑插值，
@@ -749,7 +931,8 @@ class PROController:
             else:
                 # 归一化距离：d_norm=0 在目标中心；d_norm=1 在头部边缘；
                 #              d_norm=3 相当于 45 counts（~13px），约 flick 门槛底
-                d_norm = dist / max(head_r_counts, 1e-6)
+                # d_norm 分母用 head_r_gain_sched（小 bbox 有下限），参见 § D
+                d_norm = dist / max(head_r_gain_sched, 1e-6)
                 near_w = float(np.clip(1.0 - d_norm, 0.0, 1.0))  # 1 inside head, 0 outside
 
                 # 远端 flick 权重：sigmoid(dist 超过 thresh_high 的比例)
@@ -763,14 +946,14 @@ class PROController:
                 B_eff = self._B_correction  * near_w + self._B_pursuit * (1.0 - near_w)
 
                 if is_pure_ai:
-                    # pure_ai：最快锁定 + 最小稳态滞后
-                    #   · ff_scale 全距离恒 1.0（完全前馈目标速度）
-                    #   · vref = ff_vel（相对阻尼，消除 25+px 稳态滞后）
-                    #   · dz_eff = dz_r（不放大；视觉蠕动感交给硬件原生 500Hz 处理）
-                    ff_scale = 1.0
-                    vrefx = ff_vel[0] * eff_power
-                    vrefy = ff_vel[1] * eff_power
-                    dz_eff = dz_r_counts
+                    # pure_ai：远端保持全前馈；近端减弱 ff + vref，避免 Kalman 微抖与
+                    # impedance 双通路同向叠加 → 穿零高频振荡（体感「贴脸狂抖」）。
+                    near_ff = float(np.clip(1.0 - 0.88 * near_w, 0.12, 1.0))
+                    ff_scale = near_ff
+                    vrefx = ff_vel[0] * eff_power * near_ff
+                    vrefy = ff_vel[1] * eff_power * near_ff
+                    # 略微加大软死区，压低 |e|≈0 时的等效刚度，牺牲极少 TTK 换稳态
+                    dz_eff = dz_r_counts * (1.0 + 0.42 * near_w * near_w)
                 else:
                     # human_flick：保留"近端抗噪 + dz 放大 + entry 微调"拟人设计
                     # ff_scale：近端按目标速度动态（避免 Kalman 噪声注入），远端全开
@@ -837,7 +1020,10 @@ class PROController:
 
             # mode contract
             threshold = thresh_high_counts if self.mode == "track" else thresh_low_counts  # [FIX]
-            self.mode = "flick" if dist > threshold else "track"
+            new_mode = "flick" if dist > threshold else "track"
+            if new_mode != self.mode:
+                _log_cipher.controller_mode(self.mode, new_mode, dist, threshold, "ct")
+            self.mode = new_mode
 
             self._move_diag_dt = float(dt)
             self._move_diag_cvx = float(self._arm_vel[0])
@@ -890,9 +1076,10 @@ class PROController:
                 ou_sigma = self._ou_sigma_ball
             else:
                 head_r_ct = max(self._head_radius_px * self._px_to_ct, 1e-6)
-                if self.last_error_dist < head_r_ct * 0.5:
-                    # 极近（<半个头半径，约 7px 内）：tremor 压到 40%，避免
-                    # "锁定后的 crosshair 还在微抖"的视觉蠕动感
+                if self.last_error_dist < head_r_ct * 0.45:
+                    # 极近：再压 tremor，减轻「锁住还在抖」
+                    ou_sigma = self._ou_sigma_track * 0.22
+                elif self.last_error_dist < head_r_ct * 0.5:
                     ou_sigma = self._ou_sigma_track * 0.40
                 elif self.last_error_dist < head_r_ct:
                     ou_sigma = self._ou_sigma_track * 0.70

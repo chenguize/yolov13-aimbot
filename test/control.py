@@ -9,12 +9,18 @@ import threading
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.dirname(_THIS_DIR)
-if _ROOT_DIR not in sys.path:
-    sys.path.insert(0, _ROOT_DIR)
+# 必须保证仓库根在 sys.path 最前：直接跑 `python test/control.py` 时 Python 会把
+# test/ 放在 path[0]，若只「根在 path 里但不在首位」会错 import 标准库同名的 `test`。
+if _ROOT_DIR in sys.path:
+    sys.path.remove(_ROOT_DIR)
+sys.path.insert(0, _ROOT_DIR)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from config import config
+from test.scenarios.base import BaseScenario
+from test.scenarios.takeover import TakeoverScenario
+from test.scenarios.pure_ai_ball import PureAIBallScenario
 # from .base_controller import BaseController
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
@@ -73,6 +79,14 @@ def analyze_tracking_quality(logs: List[Dict]) -> Dict:
         ai_factors = np.array([l.get('ai_factor', 1.0) for l in k_logs])
 
         see_idx = next((i for i, l in enumerate(k_logs) if l.get('is_valid', False)), 0)
+
+        # ── 接管场景专用: 如果场景标记了人类松手时间, AI 时钟从此开始 ──
+        # 取每个 kill 日志中最大的 takeover_release_time (跨 kill 不泄露)
+        release_t = max((l.get('takeover_release_time', 0.0) for l in k_logs), default=0.0)
+        if release_t > 0:
+            release_idx = next((i for i, l in enumerate(k_logs) if l['t'] >= release_t), see_idx)
+            if release_idx > see_idx:
+                see_idx = release_idx
 
         # 【锁定判定重构】：Valorant的头部很小，锁定阈值从 42px 缩紧到 15px
         lock_idx = None
@@ -215,7 +229,10 @@ def analyze_tracking_quality(logs: List[Dict]) -> Dict:
 
     print("\n" + "=" * 102)
     print(f"🎯 Valorant Biomimetic v3.0 Final Score: {overall_score:.1f}/100")
-    print(f"   TTK (Acq/Rec) : {acq_score:.1f} | Headshot Precision : {precision_score:.1f}")
+    print(
+        f"   TTK (Acq/Rec) : {acq_score:.1f} | Headshot Precision : {precision_score:.1f} "
+        f"(锁定后稳态误差 P70 均值≈{mean_err:.1f}px；公式≥20px→精度归零，与表列 SteadyMAE 不同)"
+    )
     print(f"   Smooth & Stop : {natural_avg:.1f} | Micro-adjust Bonus : +{bio_avg:.1f}")
     print("=" * 102)
 
@@ -305,6 +322,7 @@ def run_simulation_with_diagnostics(
     use_fixed: bool = True,
     duration: float = 60.0,
     params: Dict = None,
+    scenario: BaseScenario = None,
 ) -> Tuple[float, float, Dict]:
     try:
         from test.sim_agent import SimAIAgent
@@ -313,59 +331,160 @@ def run_simulation_with_diagnostics(
     from config import config
     config.reload()
 
-    if params is not None:
-        # v4.1 适配：原先只拦截 getfloat，但 pro_controller 有 getint 读取的
-        # 参数（如 cipher_entry_ticks）。如果不一并拦截，simulation 传来的 int
-        # 参数永远被忽略 —— 静默 bug。这里把 getfloat 和 getint 两条路径都 patch。
-        original_getfloat = config.getfloat
-        original_getint   = config.getint
+    wm_align = config.getbool("Test", "align_worldmodel_to_zero_sim_delay", False)
+    has_params = params is not None
+    original_getfloat = config.getfloat
+    original_getint = config.getint
+    original_getbool = config.getbool
 
-        def override_getfloat(section, key, fallback=None):
-            if key in params:
-                return float(params[key])
-            if key == "base_hardware_lag" and "fixed_lead_time" in params:
-                return float(params["fixed_lead_time"])
-            return original_getfloat(section, key, fallback)
+    def combined_getfloat(section, key, fallback=None):
+        if has_params and key in params:
+            return float(params[key])
+        if wm_align and section == "WorldModel":
+            if key in ("moonlight_latency_ms", "virtualhere_latency_ms"):
+                return 0.0
+            if key == "base_hardware_lag":
+                return min(float(original_getfloat(section, key, fallback)), 0.003)
+        if has_params and key == "base_hardware_lag" and "fixed_lead_time" in params:
+            return float(params["fixed_lead_time"])
+        return original_getfloat(section, key, fallback)
 
-        def override_getint(section, key, fallback=None):
-            if key in params:
-                return int(params[key])
-            return original_getint(section, key, fallback)
+    def combined_getint(section, key, fallback=None):
+        if has_params and key in params:
+            return int(params[key])
+        return original_getint(section, key, fallback)
 
-        config.getfloat = override_getfloat
-        config.getint   = override_getint
+    def combined_getbool(section, key, fallback=False):
+        if wm_align and section == "WorldModel" and key in (
+            "adaptive_latency_enable",
+            "wan_mode",
+        ):
+            return False
+        return original_getbool(section, key, fallback)
 
-    agent = SimAIAgent()
-    sim_time, fixed_dt, logs = 0.0, 0.002, []
+    if wm_align or has_params:
+        config.getfloat = combined_getfloat
+        config.getbool = combined_getbool
+        if has_params:
+            config.getint = combined_getint
 
-    if verbose:
-        print(f"▶ 正在载入实战模拟环境...")
+    try:
+        agent = SimAIAgent(scenario=scenario)
+        sim_time, fixed_dt, logs = 0.0, 0.002, []
 
-    while not agent.is_done and sim_time < duration:
-        agent.step()
-        logs.append({
-            't':        sim_time,
-            'target':   agent.enemy_pos.copy(),
-            'crosshair':agent.crosshair_pos.copy(),
-            'kill_id':  agent.kill_count,
-            'mode':     agent.chase_mode,
-            'is_valid': agent.ctx.p_predict is not None,
-            'ai_factor':getattr(agent, 'last_ai_factor', 1.0),
-        })
-        sim_time += fixed_dt
+        if verbose:
+            print(f"▶ 正在载入实战模拟环境...")
+            if wm_align:
+                print(
+                    "  [Test] align_worldmodel_to_zero_sim_delay=ON → "
+                    "WorldModel 串流/硬件延迟已压到≈0（仅本轮仿真）"
+                )
 
-    analysis = analyze_tracking_quality(logs)
-    if verbose:
-        print_analysis_report(analysis, "Optuna 调参版" if params else "诊断版")
-    if plot:
-        plot_diagnostics(logs, analysis, "诊断版")
+        while not agent.is_done and sim_time < duration:
+            agent.step()
+            logs.append({
+                't':        sim_time,
+                'target':   agent.enemy_pos.copy(),
+                'crosshair':agent.crosshair_pos.copy(),
+                'kill_id':  agent.kill_count,
+                'mode':     agent.chase_mode,
+                'is_valid': agent.ctx.p_predict is not None,
+                'ai_factor':getattr(agent, 'last_ai_factor', 1.0),
+                'takeover_release_time': getattr(agent, 'takeover_release_time', 0.0),
+            })
+            sim_time += fixed_dt
 
-    if params is not None:
-        config.getfloat = original_getfloat
-        config.getint   = original_getint
+        analysis = analyze_tracking_quality(logs)
+        scenario_name = type(scenario).__name__ if scenario else "BallTrackingScenario"
+        tag = "Optuna调参" if params else f"{scenario_name}"
 
-    return 0.0, 0.0, analysis
+        if verbose:
+            print_analysis_report(analysis, tag)
+        if plot:
+            plot_diagnostics(logs, analysis, tag)
+
+        return 0.0, 0.0, analysis
+    finally:
+        if wm_align or has_params:
+            config.getfloat = original_getfloat
+            config.getbool = original_getbool
+            if has_params:
+                config.getint = original_getint
+
+
+
+
+def run_takeover_test(
+    plot: bool = True,
+    verbose: bool = True,
+    duration: float = 45.0,
+    max_kills: int = 25,
+) -> Dict:
+    """
+    运行 AI 接管能力专项测试。
+
+    与默认的 BallTrackingScenario 不同:
+      - 目标 spawn 距离 200-600px（始终在 AI FOV 内）
+      - 人类故意打偏: undershoot(15-40%短) / overshoot(5-20%过) / near_miss(10-35px擦边)
+      - 测试人类→AI 中途接管的平滑度与延迟
+    """
+    scenario = TakeoverScenario(max_kills=max_kills)
+    _, _, analysis = run_simulation_with_diagnostics(
+        plot=plot,
+        verbose=verbose,
+        duration=duration,
+        scenario=scenario,
+    )
+
+    # 打印接管专项报告
+    scenario.print_takeover_report()
+
+    return analysis
+
+
+def run_pure_ai_ball_test(
+    plot: bool = True,
+    verbose: bool = True,
+    duration: float = 60.0,
+    max_kills: int = 30,
+) -> Dict:
+    """
+    纯 AI 瞄准专项测试（Neon 身法单球，无 human_flick）。
+
+    在 config.ini 中切换 [WorldModel] predict_ahead / ctrl_lead_enable /
+    adaptive_latency_enable 等，对比本场景的得分与 TTK，即可评估「开预测」的收益。
+    """
+    scenario = PureAIBallScenario(max_kills=max_kills)
+    _, _, analysis = run_simulation_with_diagnostics(
+        plot=plot,
+        verbose=verbose,
+        duration=duration,
+        scenario=scenario,
+    )
+    return analysis
 
 
 if __name__ == "__main__":
-    run_simulation_with_diagnostics(use_fixed=True)
+    import argparse
+    parser = argparse.ArgumentParser(description="测试场景运行器")
+    parser.add_argument(
+        "--scenario", type=str, default="ball",
+        choices=["ball", "takeover", "pure_ai"],
+        help="场景: ball=混合模式小球, takeover=人机接管, pure_ai=纯AI瞄准(测预测)",
+    )
+    parser.add_argument(
+        "--kills", type=int, default=30,
+        help="最大击杀数 (takeover / pure_ai；混合 ball 场景仍用内置 30)",
+    )
+    parser.add_argument(
+        "--duration", type=float, default=60.0,
+        help="仿真时长上限 (秒)。takeover 可缩短如 45",
+    )
+    args = parser.parse_args()
+
+    if args.scenario == "takeover":
+        run_takeover_test(duration=args.duration, max_kills=args.kills)
+    elif args.scenario == "pure_ai":
+        run_pure_ai_ball_test(duration=args.duration, max_kills=args.kills)
+    else:
+        run_simulation_with_diagnostics(use_fixed=True)

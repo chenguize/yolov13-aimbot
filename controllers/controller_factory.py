@@ -8,15 +8,15 @@
 # 架构特点：工厂模式，支持多种控制器类型
 #
 
-import logging
 from typing import Optional
 from .base_controller import BaseController
 from .simple_controller import SimpleController
 from .pid_controller import PIDController
 from .pro_controller import PROController
 from config import config
+from utils.logger import get_logger
 
-_log = logging.getLogger("ControllerFactory")
+_log = get_logger("ControllerFactory")
 
 
 class ControllerFactory:

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from typing import Optional, Tuple
@@ -11,11 +10,12 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
-from config import config
 from perception.bus import FrameBus
+from utils import runtime_defaults as D
+from utils.logger import get_logger
 from world_model import WorldModel
 
-logger = logging.getLogger("InferenceAimlab")
+logger = get_logger("InferenceAimlab")
 
 
 def _build_hsv_mask(
@@ -146,9 +146,8 @@ class AimlabBallInferenceThread(threading.Thread):
     与 InferenceThread 相同接口，消费 FrameBus，写 world_model.update_detections。
     不依赖 TensorRT/Ultralytics。
 
-    使用前请在 config.ini 中：
-      [Inference] backend = aimlab
-      [WorldModel] aim_target_classes 留空或包含 synthetic 使用的 class（见 [Aimlab] synthetic_class_id）
+    使用前：[Inference] backend=aimlab|opencv|…；HSV/色域 见 utils/runtime_defaults.AIMLAB_*。
+    [WorldModel] aim_target_classes 留空或含 runtime_defaults.AIMLAB_SYNTHETIC_CLASS_ID。
     """
 
     def __init__(
@@ -168,12 +167,12 @@ class AimlabBallInferenceThread(threading.Thread):
         self._hsv_log_once = False
 
     def _read_hsv_bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        h0 = int(config.getint("Aimlab", "h_min", 0))
-        h1 = int(config.getint("Aimlab", "h_max", 180))
-        s0 = int(config.getint("Aimlab", "s_min", 50))
-        s1 = int(config.getint("Aimlab", "s_max", 255))
-        v0 = int(config.getint("Aimlab", "v_min", 50))
-        v1 = int(config.getint("Aimlab", "v_max", 255))
+        h0 = int(D.AIMLAB_H_MIN)
+        h1 = int(D.AIMLAB_H_MAX)
+        s0 = int(D.AIMLAB_S_MIN)
+        s1 = int(D.AIMLAB_S_MAX)
+        v0 = int(D.AIMLAB_V_MIN)
+        v1 = int(D.AIMLAB_V_MAX)
         h0, h1 = max(0, h0), min(180, h1)
         s0, s1 = max(0, s0), min(255, s1)
         v0, v1 = max(0, v0), min(255, v1)
@@ -188,18 +187,17 @@ class AimlabBallInferenceThread(threading.Thread):
         return lo, hi
 
     def run(self):
-        min_area = max(1, int(config.getint("Aimlab", "min_area", 20)))
-        morph_ksize = int(config.getint("Aimlab", "morph_ksize", 3))
-        synthetic_class_id = int(config.getint("Aimlab", "synthetic_class_id", 0))
+        min_area = max(1, int(D.AIMLAB_MIN_AREA))
+        morph_ksize = int(D.AIMLAB_MORPH_KSIZE)
+        synthetic_class_id = int(D.AIMLAB_SYNTHETIC_CLASS_ID)
         hsv_lo, hsv_hi = self._read_hsv_bounds()
-        color_mode = (config.getstr("Aimlab", "color_mode", "red_wrap") or "red_wrap").strip()
-        red_h1_max = int(config.getint("Aimlab", "red_h1_max", 15))
-        red_h2_min = int(config.getint("Aimlab", "red_h2_min", 165))
-        ign_margin = float(config.getfloat("Aimlab", "ignore_center_margin_px", 14.0))
-        mask_ctr_r = int(config.getint("Aimlab", "mask_out_center_radius", 0))
-        rej_center = config.getbool("Aimlab", "reject_only_center_blobs", True)
-        # output_conf<=0：用面积公式 conf；>0：固定写 WM 的 conf（易锁、但会掩盖真实起伏）
-        out_conf_mode = float(config.getfloat("Aimlab", "output_conf", 0.0))
+        color_mode = (D.AIMLAB_COLOR_MODE or "red_wrap").strip()
+        red_h1_max = int(D.AIMLAB_RED_H1_MAX)
+        red_h2_min = int(D.AIMLAB_RED_H2_MIN)
+        ign_margin = float(D.AIMLAB_IGNORE_CENTER_MARGIN_PX)
+        mask_ctr_r = int(D.AIMLAB_MASK_OUT_CENTER_RADIUS)
+        rej_center = bool(D.AIMLAB_REJECT_ONLY_CENTER_BLOBS)
+        out_conf_mode = float(D.AIMLAB_OUTPUT_CONF)
 
         if not self._hsv_log_once:
             self._hsv_log_once = True
@@ -231,7 +229,7 @@ class AimlabBallInferenceThread(threading.Thread):
                 rej_center,
             )
             logger.info(
-                "须 Inference.backend=aimlab 或 opencv；仍无目标可降 min_area、略降 s_min/v_min。"
+                "须 Inference.backend=aimlab|opencv|…；仍无目标可改 runtime_defaults 中 AIMLAB_MIN_AREA 或 S/V 下限。"
             )
             logger.info(
                 "若 aim_target_classes 非空，须含 class=%d 或留空。",

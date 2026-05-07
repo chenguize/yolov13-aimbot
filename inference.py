@@ -1,4 +1,3 @@
-import logging
 import threading
 import time
 
@@ -7,10 +6,11 @@ from ultralytics import YOLO
 
 from config import config
 from utils.aim_class_filter import filter_yolo_boxes
+from utils.logger import get_logger
 from perception.bus import FrameBus
 from world_model import WorldModel
 
-logger = logging.getLogger("Inference")
+logger = get_logger("Inference")
 
 
 class InferenceThread(threading.Thread):
@@ -103,12 +103,9 @@ class InferenceThread(threading.Thread):
                     if len(detections) > 0:
                         best_conf = detections[0][4]
                         best_cls = int(detections[0][5])
-                        logger.info(
-                            "%d target(s) | best: cls=%d conf=%.2f | infer=%.1fms",
-                            len(detections), best_cls, best_conf, last_inference_ms,
-                        )
+                        logger.inference_result(len(detections), best_cls, best_conf, last_inference_ms)
                     else:
-                        logger.debug("No targets in FOV | infer=%.1fms", last_inference_ms)
+                        logger.inference_no_target(last_inference_ms)
                     last_print_time = now
 
                 self.world_model.update_detections(
@@ -119,8 +116,7 @@ class InferenceThread(threading.Thread):
                 )
                 if not self._first_push_logged:
                     self._first_push_logged = True
-                    logger.info(
-                        "Pipeline: first YOLO → world_model.update_detections (frame_id=%d, dets=%d, infer=%.1fms). Main.tick should wake next.",
+                    logger.inference_first_push(
                         frame_info.frame_id,
                         len(detections),
                         last_inference_ms,

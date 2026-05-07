@@ -20,7 +20,8 @@ filterpy>=1.4.5
 
 # 其他实用工具
 supervision>=0.24.0
-# 人机分离离合器：Agent RawInput 鼠标监听
+# 人机分离离合器；若 n_h=0 可再 pip install pynput 并设 [General] human_input_backend=pynput
 inputs
+pynput
 #pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 #pip install tensorrt==10.13.2.6 --extra-index-url https://pypi.nvidia.com

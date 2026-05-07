@@ -1,15 +1,15 @@
 import time
 import signal
 import sys
-import logging
 import keyboard
 from ctypes import windll  # [关键] 引入 Windows底层库
 
 from utils.logging_bootstrap import setup_root_logging
+from utils.logger import get_logger
 
 # 在 import Agent（进而 import output/推理栈）之前配置 root logger，否则子模块 log 与格式不一致
 setup_root_logging()
-logger = logging.getLogger("Main")
+logger = get_logger("Main")
 
 # 核心 Agent（依赖较多，放日志初始化之后）
 from agent import AIAgent

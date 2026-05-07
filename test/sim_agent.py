@@ -1,5 +1,22 @@
 # sim_agent.py
-# 串流延迟模拟版：独立模拟 Moonlight 网络抖动延迟 (10~30ms) + 推理处理延迟
+"""
+仿真引擎 —— 管道延迟模拟 + WorldModel/Controller 驱动 + 场景委托。
+
+架构：
+  SimAIAgent (引擎)       MoonlightLatencyModel (网络)
+       │                        │
+       ├─ scenario.spawn()      ├─ sample()
+       ├─ scenario.tick_physics()
+       ├─ scenario.tick_human_input()
+       └─ WorldModel / RingBuffer / Controller
+
+场景 (test/scenarios/) 只定义「目标怎么动、人类怎么甩、怎么判击杀」，
+引擎负责「延迟怎么变、AI 怎么算、鼠标怎么发」。
+
+仿真管道延迟（串流 / 推理 / CV 噪声）默认由 config.ini [Test] 控制；
+实战 agent 不读 [Test]。
+"""
+
 import time
 import threading
 import numpy as np
@@ -7,35 +24,41 @@ import random
 import math
 from collections import deque
 from config import config
+from utils import runtime_defaults as _rtd
+from utils.human_intent import HumanIntentTracker
 
 try:
     import noise
 except ImportError:
-    print("⚠️ 警告: 未安装 noise 库，仿真中的 Perlin 噪点将失效，请使用 pip install noise 安装")
+    noise = None
 
 from perception.ring_buffer import RingBuffer
 from utils.types import Detection, InferenceContext
+from test.scenarios.base import BaseScenario
+from test.scenarios.ball_tracking import BallTrackingScenario
 
 
 # ==============================================================================
-# 🌐 Moonlight 串流延迟模型
-#
-# 模拟真实 Moonlight 串流的延迟特征：
-#   - 基础帧延迟 (编码 + 网络传输)：10~20ms
-#   - 随机抖动 (Jitter)：±3~8ms，采用对数正态分布（符合实际网络包分布）
-#   - 偶发毛刺 (Spike)：每隔若干帧出现一次 25~40ms 的突增延迟，模拟无线包重传
-#   - 帧间平滑：EMA 滤波避免前后帧延迟剧烈跳变
+#  Moonlight 串流延迟模型
 # ==============================================================================
 class MoonlightLatencyModel:
+    """
+    模拟真实 Moonlight 串流的延迟特征：
+      - 基础帧延迟 (编码 + 网络传输)：10~20ms
+      - 随机抖动 (Jitter)：+/-3~8ms，对数正态分布
+      - 偶发毛刺 (Spike)：每隔若干帧一次 25~40ms 突增
+      - 帧间平滑：EMA 滤波
+    """
+
     def __init__(
         self,
-        base_ms: float = 15.0,       # 基础串流延迟 (ms)
-        jitter_std_ms: float = 4.0,  # 正常抖动标准差 (ms)
-        spike_prob: float = 0.04,    # 每帧发生毛刺的概率
-        spike_extra_ms: float = 18.0,# 毛刺时额外增加的延迟 (ms)
-        min_ms: float = 8.0,         # 下限保护 (ms)
-        max_ms: float = 45.0,        # 上限保护 (ms)
-        ema_alpha: float = 0.25,     # EMA 平滑系数 (越大越跳跃，越小越平滑)
+        base_ms: float = 15.0,
+        jitter_std_ms: float = 4.0,
+        spike_prob: float = 0.04,
+        spike_extra_ms: float = 18.0,
+        min_ms: float = 8.0,
+        max_ms: float = 45.0,
+        ema_alpha: float = 0.25,
     ):
         self.base    = base_ms    / 1000.0
         self.jitter  = jitter_std_ms / 1000.0
@@ -45,26 +68,17 @@ class MoonlightLatencyModel:
         self.max_lat = max_ms / 1000.0
         self.alpha   = ema_alpha
 
-        # 初始化 EMA 状态为基础延迟
         self._ema = self.base
-        # 用对数正态的 sigma 参数来匹配目标 std
-        # ln-normal: mean=base, std=jitter → sigma = sqrt(ln(1 + (jitter/base)^2))
         _var_ratio = (self.jitter / max(self.base, 1e-6)) ** 2
         self._ln_sigma = math.sqrt(math.log(1.0 + _var_ratio)) if _var_ratio > 0 else 0.001
         self._ln_mu    = math.log(max(self.base, 1e-6)) - 0.5 * self._ln_sigma ** 2
 
     def sample(self) -> float:
         """采样本帧的实际串流延迟 (秒)"""
-        # 对数正态基础抖动
         raw = np.random.lognormal(self._ln_mu, self._ln_sigma)
-
-        # 偶发毛刺 (模拟无线重传 / 编码器 I-frame 突增)
         if np.random.random() < self.spike_p:
             raw += self.spike_e * np.random.uniform(0.5, 1.5)
-
-        # EMA 平滑：避免前后帧延迟从 10ms 瞬跳到 35ms
         self._ema = self.alpha * raw + (1.0 - self.alpha) * self._ema
-
         return float(np.clip(self._ema, self.min_lat, self.max_lat))
 
     def reset(self):
@@ -72,24 +86,65 @@ class MoonlightLatencyModel:
 
 
 # ==============================================================================
-# 仿真 AI Agent
+#  仿真 AI Agent (引擎层)
 # ==============================================================================
 class SimAIAgent:
+    """
+    串流延迟模拟版仿真代理。
+
+    用法:
+        scenario = BallTrackingScenario(max_kills=30)
+        agent   = SimAIAgent(scenario)
+        while not agent.is_done:
+            agent.step()
+    """
+
     def __init__(
         self,
-        noise_level: float = 5.0,
-        dropout_rate: float = 0.08,
-        # --- 延迟参数 (全部可从外部传入或由 config 读取) ---
-        stream_base_ms: float = None,   # 串流基础延迟；None 则读 config
-        stream_jitter_ms: float = 4.0,  # 串流抖动 std (ms)
-        stream_spike_prob: float = 0.04,
-        stream_spike_ms: float = 18.0,
-        inference_base_ms: float = 6.0, # YOLO 推理耗时基础值 (ms)
-        inference_std_ms: float = 1.5,  # 推理耗时抖动
+        scenario: BaseScenario = None,
+        noise_level: float = None,
+        dropout_rate: float = None,
+        stream_base_ms: float = None,
+        stream_jitter_ms: float = None,
+        stream_spike_prob: float = None,
+        stream_spike_ms: float = None,
+        inference_base_ms: float = None,
+        inference_std_ms: float = None,
     ):
-        # ── 从 config 读取串流延迟基础值（可被参数覆盖）──────────────────────
+        self.scenario = scenario or BallTrackingScenario()
+
+        self._test_sim_stream = config.getbool("Test", "simulate_stream_latency", True)
+        self._test_sim_infer = config.getbool("Test", "simulate_inference_latency", True)
+        self._test_print_stream_stats = config.getbool(
+            "Test", "print_stream_latency_stats", True
+        )
+
+        if noise_level is None:
+            noise_level = config.getfloat("Test", "cv_noise_level", 5.0)
+        if dropout_rate is None:
+            dropout_rate = config.getfloat("Test", "cv_dropout_rate", 0.08)
+        if stream_jitter_ms is None:
+            stream_jitter_ms = config.getfloat("Test", "stream_jitter_ms", 4.0)
+        if stream_spike_prob is None:
+            stream_spike_prob = config.getfloat("Test", "stream_spike_prob", 0.04)
+        if stream_spike_ms is None:
+            stream_spike_ms = config.getfloat("Test", "stream_spike_extra_ms", 18.0)
+        if inference_base_ms is None:
+            inference_base_ms = config.getfloat("Test", "inference_base_ms", 6.0)
+        if inference_std_ms is None:
+            inference_std_ms = config.getfloat("Test", "inference_std_ms", 1.5)
+
+        # ── 串流延迟（仿真）；关 simulate_stream_latency 时不参与采样 ──
         if stream_base_ms is None:
-            stream_base_ms = config.getfloat("WorldModel", "moonlight_latency_ms", 15.0)
+            if self._test_sim_stream:
+                base_ov = config.getfloat("Test", "stream_base_ms", 0.0)
+                stream_base_ms = (
+                    base_ov
+                    if base_ov > 0.0
+                    else config.getfloat("WorldModel", "moonlight_latency_ms", 15.0)
+                )
+            else:
+                stream_base_ms = 0.0
 
         self.sim_time = 0.0
         self._original_perf_counter = time.perf_counter
@@ -98,28 +153,30 @@ class SimAIAgent:
         from world_model import WorldModel
         self.world_model = WorldModel()
         self.ring_buffer  = RingBuffer()
+        _hib = (config.getstr("General", "human_input_backend", "inputs") or "inputs").strip().lower()
+        self._human_intent_subtract_ai = (
+            _hib in ("pyn", "pynput", "hook")
+            and config.getbool("General", "human_intent_subtract_ai", True)
+        )
 
         self.sim_steps   = 0
         self.noise_level  = noise_level
         self.dropout_rate = dropout_rate
+        self.burst_state = 0
 
-        # ── 双延迟模型 ────────────────────────────────────────────────────────
-        # 1) 串流网络延迟 (Moonlight)
+        # ── 双延迟模型 ──
         self.stream_latency_model = MoonlightLatencyModel(
-            base_ms       = stream_base_ms,
-            jitter_std_ms = stream_jitter_ms,
-            spike_prob    = stream_spike_prob,
-            spike_extra_ms= stream_spike_ms,
+            base_ms=stream_base_ms,
+            jitter_std_ms=stream_jitter_ms,
+            spike_prob=stream_spike_prob,
+            spike_extra_ms=stream_spike_ms,
         )
-        # 2) 本地推理延迟 (YOLO forward pass)
         self._inf_base = inference_base_ms / 1000.0
         self._inf_std  = inference_std_ms  / 1000.0
-
-        # 延迟统计（供 print 用）
         self._lat_history: deque = deque(maxlen=500)
         self._lat_print_timer = 0.0
 
-        # ── 准星与场景 ────────────────────────────────────────────────────────
+        # ── 准星与场景 ──
         self.crosshair_pos = np.zeros(2, dtype=np.float64)
         self.center = np.array(
             [self.world_model.crop_center, self.world_model.crop_center],
@@ -129,221 +186,87 @@ class SimAIAgent:
         self.ctx = InferenceContext()
         self.ctx.center_pos = self.center
 
-        self.burst_state = 0
-
-        # ── 实战靶场状态机 ────────────────────────────────────────────────────
-        self.max_kills        = 30
-        self.kill_count       = 0
-        self.is_done          = False
-        self.current_target_id = 0
-
-        # 🌟 3D 摄像机投影常量 (Valorant FOV = 103)
-        self.fov          = 103.0
+        # ── 3D 摄像机 (场景共享) ──
         self.screen_w     = config.getfloat("General", "screen_width",  1920.0)
-        self.screen_height= config.getfloat("General", "screen_height", 1080.0)
-        self.focal_length = (self.screen_w / 2.0) / math.tan(math.radians(self.fov / 2.0))
+        self.screen_height = config.getfloat("General", "screen_height", 1080.0)
+        self.focal_length = (self.screen_w / 2.0) / math.tan(math.radians(103.0 / 2.0))
 
-        # 🌟 3D 物理空间变量
-        self.target_z      = 10.0
-        self.enemy_vel_3d  = np.zeros(2, dtype=np.float64)
-        self.target_vel_3d = np.zeros(2, dtype=np.float64)
-        self.current_action= 'stop'
-        self.height_3d     = 0.0
-
+        # ── 场景写入属性 ──
         self.enemy_pos = np.zeros(2, dtype=np.float64)
         self.enemy_vel = np.zeros(2, dtype=np.float64)
+        self.target_hitbox_x: float = 5.0
+        self.target_hitbox_y: float = 5.0
+        self.chase_mode: str = "pure_ai"
+        self.target_first_seen_time: float = 0.0
+        self.kill_count: int = 0
+        self._prev_flick_active: bool = False
+        self.takeover_release_time: float = 0.0   # 接管场景: 人类松手时刻 (0=未设置/非接管)
 
-        self.tot_threshold         = 0.08
-        self.target_first_seen_time = 0.0
+        # ── 噪声 ──
         self.noise_offset_x = random.uniform(0, 1000.0)
         self.noise_offset_y = random.uniform(0, 1000.0)
 
-        self._prev_flick_active = False
+        # ── 意图追踪 ──
+        self._intent_tracker = HumanIntentTracker()
 
-        self.spawn_new_target()
+        # ── 评分用 ──
+        self.last_ai_factor: float = 0.0
 
-    # ==========================================================================
-    # 内部工具：采样本帧的完整管道延迟
-    # ==========================================================================
-    def _sample_pipeline_delay(self):
-        """
-        返回 (stream_latency, inference_delay, total_delay) 单位：秒
-
-        管道时序：
-            t_real_capture  ──[stream_latency]──▶  帧到达本机
-                            ──[inference_delay]──▶  检测结果可用  (= sim_time)
-
-        因此：
-            t_capture = sim_time - stream_latency - inference_delay
-        """
-        stream_lat = self.stream_latency_model.sample()
-        # 推理耗时：高斯分布，下限 2ms
-        inf_delay  = max(0.002, np.random.normal(self._inf_base, self._inf_std))
-        total      = stream_lat + inf_delay
-        self._lat_history.append(stream_lat * 1000.0)
-        return stream_lat, inf_delay, total
+        # 初始化场景
+        self.scenario.init(self)
 
     # ==========================================================================
-    def spawn_new_target(self):
-        """生成新目标：初始化 3D 距离与霓虹物理参数"""
-        if self.kill_count >= self.max_kills:
-            self.is_done = True
-            self.ctx.targets = []
-            return
-
-        self.current_target_id += 1
-        self.world_model.targets.clear()
-
-        # Bug 6 修复：重置 Kalman 的自适应状态（innov_ema, Q_scale），避免上一
-        # 目标（高速 adad/slide）的 innov 尾巴污染下一目标前 100ms 的 v_est。
-        # innov_ema EMA 下降常数 α=0.1 → 100ms 才衰减 ~30%，期间 Q 偏高会让
-        # 新 target 的协方差膨胀更快，ff_vel 被放大噪声 → precision 方差变大。
-        if hasattr(self.world_model, 'kalman') and hasattr(self.world_model.kalman, 'reset_adaptive_state'):
-            self.world_model.kalman.reset_adaptive_state()
-
-        self.chase_mode = np.random.choice(['pure_ai', 'human_flick'])
-        # 把 chase_mode 传给控制器（决定是否激活 entry_ticks 微调窗口）
-        if hasattr(self.world_model.controller, 'reset_target_state'):
-            try:
-                self.world_model.controller.reset_target_state(mode=self.chase_mode)
-            except TypeError:
-                # 兼容不支持 mode 参数的老控制器
-                self.world_model.controller.reset_target_state()
-
-        self.target_z    = np.random.uniform(5.0, 35.0)
-        scale_factor     = self.focal_length / self.target_z
-        base_radius_px   = 3.0 * scale_factor
-
-        if self.chase_mode == 'pure_ai':
-            # 实战语境：AI 的 YOLO 识别半径 ≈ 256px；pure_ai 模拟"目标从侧面
-            # 切入 FOV / 已经被人类粗略对过枪 → AI 独立精修最后一段"。
-            # 初始距离限制在 60~256 px，避免让 AI 替人类走 1000+px 的甩枪段。
-            spawn_radius_px = np.random.uniform(60, 256)
-        else:
-            spawn_radius_px = np.random.uniform(600, 1400)
-
-        angle    = np.random.uniform(0, 2 * np.pi)
-        offset_x = np.cos(angle) * spawn_radius_px
-        offset_y = np.sin(angle) * spawn_radius_px
-
-        half_w, half_h = self.screen_w / 2.0, self.screen_height / 2.0
-        margin   = 50
-        offset_x = np.clip(offset_x, -half_w + margin, half_w - margin)
-        offset_y = np.clip(offset_y, -half_h + margin, half_h - margin)
-
-        self.enemy_pos = self.crosshair_pos + np.array([offset_x, offset_y])
-
-        initial_dist = np.linalg.norm(self.enemy_pos - self.crosshair_pos)
-        print(
-            f"New target spawned | mode: {self.chase_mode} | z: {self.target_z:.1f}m"
-            f" | initial_dist: {initial_dist:.0f} px"
+    #  助手
+    # ==========================================================================
+    def _intent_delta(self, t_start: float, t_end: float):
+        return self.ring_buffer.get_intent_delta_sum(
+            t_start, t_end, subtract_injected_ai=self._human_intent_subtract_ai
         )
 
-        self.enemy_vel_3d  = np.array([np.random.choice([-1, 1]) * 8.5, 0.0])
-        self.target_vel_3d = self.enemy_vel_3d.copy()
-        self.height_3d     = 0.0
-        self.current_action= 'sprint'
+    def _sample_pipeline_delay(self):
+        """返回 (stream_latency, inference_delay, total_delay) 秒。"""
+        if self._test_sim_stream:
+            stream_lat = self.stream_latency_model.sample()
+            self._lat_history.append(stream_lat * 1000.0)
+        else:
+            stream_lat = 0.0
 
-        self.tot_timer              = 0.0
-        self.target_first_seen_time = 0.0
-        self.move_timer             = 0.5
+        if self._test_sim_infer:
+            inf_delay = max(0.002, np.random.normal(self._inf_base, self._inf_std))
+        else:
+            inf_delay = 0.002
 
-        if self.chase_mode == 'human_flick':
-            error_offset      = np.random.randn(2) * 20.0
-            self.flick_target = self.enemy_pos + error_offset
-            self.flick_duration  = np.random.uniform(0.15, 0.22)
-            self.flick_timer     = 0.0
-            self.flick_start_pos = self.crosshair_pos.copy()
+        total = stream_lat + inf_delay
+        return stream_lat, inf_delay, total
 
-        self._prev_flick_active = False
-
-        # 新目标出现时重置串流延迟模型的 EMA（避免上一局高延迟污染新局）
-        self.stream_latency_model.reset()
+    def _print_latency_stats(self):
+        if not self._test_print_stream_stats or not self._test_sim_stream:
+            return
+        if self.sim_time - self._lat_print_timer < 1.0:
+            return
+        self._lat_print_timer = self.sim_time
+        if len(self._lat_history) > 10:
+            arr = np.array(self._lat_history)
+            print(
+                f"[串流延迟] 均值={arr.mean():.1f}ms  "
+                f"P50={np.percentile(arr, 50):.1f}ms  "
+                f"P95={np.percentile(arr, 95):.1f}ms  "
+                f"最大={arr.max():.1f}ms"
+            )
 
     # ==========================================================================
-    def tick_enemy(self, dt: float):
-        if self.is_done: return
-
-        # 霓虹 (Neon) 3D 物理与身法模型
-        if getattr(self, 'move_timer', 0) <= 0:
-            self.move_timer = np.random.uniform(0.15, 0.4)
-            action = np.random.choice(
-                ['sprint', 'slide', 'adad', 'jump', 'stop'],
-                p=[0.30, 0.20, 0.30, 0.15, 0.05]
-            )
-            self.current_action = action
-
-            if action == 'sprint':
-                self.target_vel_3d[0] = np.random.choice([-1, 1]) * 8.5
-            elif action == 'adad':
-                self.target_vel_3d[0] = np.random.choice([-1, 1]) * 5.4
-            elif action == 'slide':
-                dir_x = np.sign(self.enemy_vel_3d[0]) if self.enemy_vel_3d[0] != 0 else np.random.choice([-1, 1])
-                self.enemy_vel_3d[0] = dir_x * 14.0
-                self.target_vel_3d[0] = 0.0
-                self.move_timer = 0.6
-            elif action == 'jump':
-                if self.height_3d <= 0.01:
-                    self.enemy_vel_3d[1] = -5.8
-            elif action == 'stop':
-                self.target_vel_3d[0] = 0.0
-
-        self.move_timer -= dt
-
-        # ----- 1. 3D 水平引擎 -----
-        if self.current_action == 'slide':
-            accel_x = (self.target_vel_3d[0] - self.enemy_vel_3d[0]) * 5.0
-        else:
-            accel_x = (self.target_vel_3d[0] - self.enemy_vel_3d[0]) * 40.0
-        self.enemy_vel_3d[0] += accel_x * dt
-
-        # ----- 2. 3D 垂直抛物线引擎 -----
-        if self.height_3d > 0.0 or self.enemy_vel_3d[1] < 0:
-            self.enemy_vel_3d[1] += 16.0 * dt
-            self.height_3d -= self.enemy_vel_3d[1] * dt
-            if self.height_3d <= 0.0:
-                self.height_3d     = 0.0
-                self.enemy_vel_3d[1] = 0.0
-
-        # ----- 3. 3D → 2D 摄像机投影 -----
-        scale_factor   = self.focal_length / self.target_z
-        self.enemy_vel[0] = self.enemy_vel_3d[0] * scale_factor
-        self.enemy_vel[1] = self.enemy_vel_3d[1] * scale_factor
-        self.enemy_pos   += self.enemy_vel * dt
-
-        # 动态判定体积
-        self.target_hitbox_x = 0.15 * scale_factor
-        self.target_hitbox_y = 0.15 * scale_factor
-
-        err_x = abs(self.enemy_pos[0] - self.crosshair_pos[0])
-        err_y = abs(self.enemy_pos[1] - self.crosshair_pos[1])
-
-        if err_x <= self.target_hitbox_x and err_y <= self.target_hitbox_y:
-            self.tot_timer += dt
-            if self.tot_timer >= self.tot_threshold:
-                self.kill_count += 1
-                mode_str = "🧑 人机" if self.chase_mode == 'human_flick' else "🤖 纯AI"
-                print(
-                    f"🎯 击杀 {self.kill_count:2d}/30! [{mode_str}] | "
-                    f"距离: {self.target_z:.1f}m | 动作: {self.current_action}"
-                )
-                self.spawn_new_target()
-        else:
-            self.tot_timer = max(0.0, self.tot_timer - dt * 2.0)
-
+    #  计算机视觉模拟 (CV)
     # ==========================================================================
     def tick_cv(self):
-        """带有真实 3D 尺寸计算的机器视觉"""
-        if self.is_done: return
+        """带有 3D 尺寸计算的机器视觉。委托场景 chase_mode 获取目标。"""
+        if self.scenario.is_done:
+            return
 
         relative_pos = self.enemy_pos - self.crosshair_pos
         dist_px      = np.linalg.norm(relative_pos)
 
         if dist_px > 1000.0:
             self.ctx.targets = []
-            # Bug 1 修复：目标飞出识别半径时防御性重置 first_seen_time，
-            # 避免目标重新进入时 reaction_factor 跳过冷启动斜坡。
-            # sim 场景极少触发，但避免未来修改 spawn 逻辑后引入静默 bug。
             self.target_first_seen_time = 0.0
             return
 
@@ -362,32 +285,28 @@ class SimAIAgent:
         screen_x = relative_pos[0] + self.center[0]
         screen_y = relative_pos[1] + self.center[1]
 
-        scale_factor = self.focal_length / self.target_z
-        box_w        = 0.45 * scale_factor
-
-        height_3d = 0.8 if self.current_action == 'slide' else 1.7
-        box_h     = height_3d * scale_factor
+        # 场景通过 spawn 设置了 target_z；用 focal_length/任意参考 做 bbox
+        scale_factor = self.focal_length / 10.0  # 默认 z=10m 参考
+        box_w = 0.45 * scale_factor
+        box_h = 1.7 * scale_factor
 
         noise_off = np.random.randn(2) * self.noise_level
 
         detection = Detection(
             x=screen_x + noise_off[0], y=screen_y + noise_off[1],
-            w=box_w, h=box_h, conf=0.95, class_id=self.current_target_id,
+            w=box_w, h=box_h, conf=0.95, class_id=0,
             xyxy=np.array([
-                screen_x - box_w / 2,
-                screen_y - box_h / 2,
-                screen_x + box_w / 2,
-                screen_y + box_h / 2
+                screen_x - box_w / 2, screen_y - box_h / 2,
+                screen_x + box_w / 2, screen_y + box_h / 2,
             ])
         )
         self.ctx.targets = [detection]
 
     # ==========================================================================
+    #  鼠标输出
+    # ==========================================================================
     def tick_mouse(self):
         mx, my = self.world_model.controller.tick_mouse()
-        # Sim 用浮点位移（counts）更新 crosshair_pos，避免整数量化在 Natural
-        # 评分里被当成"高频抖动"（量化脉冲每几 ms 跳 1px → hf_penalty 爆）
-        # 真实硬件仍然消费整数 mx/my
         last_delta = getattr(self.world_model.controller, "_last_delta_float", None)
         if last_delta is not None:
             dcx, dcy = last_delta
@@ -403,111 +322,81 @@ class SimAIAgent:
         self.ring_buffer.add_event(mx, my, is_ai=True)
 
     # ==========================================================================
-    def _print_latency_stats(self):
-        """每秒打印一次当前串流延迟统计"""
-        if self.sim_time - self._lat_print_timer < 1.0:
-            return
-        self._lat_print_timer = self.sim_time
-        if len(self._lat_history) > 10:
-            arr = np.array(self._lat_history)
-            print(
-                f"🌐 [串流延迟] "
-                f"均值={arr.mean():.1f}ms  "
-                f"P50={np.percentile(arr,50):.1f}ms  "
-                f"P95={np.percentile(arr,95):.1f}ms  "
-                f"最大={arr.max():.1f}ms"
-            )
-
+    #  主步进
     # ==========================================================================
     def step(self):
         dt = 0.002
         self.sim_time += dt
         self.sim_steps += 1
 
-        # ── 采样本帧完整管道延迟 ─────────────────────────────────────────────
-        # stream_lat : Moonlight 串流网络延迟（编码 + 传输）
-        # inf_delay  : 本地 YOLO 推理耗时
-        # total_delay: 合计；决定 t_capture 的回溯量
+        # ── 管道延迟采样 ──
         stream_lat, inf_delay, total_delay = self._sample_pipeline_delay()
         t_capture = self.sim_time - total_delay
 
-        # ── 物理 & 视觉更新 ─────────────────────────────────────────────────
-        self.tick_enemy(dt)
+        # ── 委托场景: 物理 + 人类输入 ──
+        self.scenario.tick_physics(self, dt)
+        human_dx, human_dy = self.scenario.tick_human_input(self, dt)
+
+        # ── 计算机视觉 ──
         self.tick_cv()
 
-        # ── 构造检测结果并推送给 WorldModel ──────────────────────────────────
+        # ── 构造检测 → WorldModel ──
         dets = np.empty((0, 6), dtype=np.float32)
         if self.ctx.targets:
-            det  = self.ctx.targets[0]
-            dets = np.array(
-                [[det.xyxy[0], det.xyxy[1], det.xyxy[2], det.xyxy[3], det.conf, 0.0]],
-                dtype=np.float32
-            )
+            det = self.ctx.targets[0]
+            if det.xyxy is not None:
+                dets = np.array(
+                    [[det.xyxy[0], det.xyxy[1], det.xyxy[2], det.xyxy[3], det.conf, 0.0]],
+                    dtype=np.float32,
+                )
 
         self.world_model.update_detections(
             detections=dets,
             frame_id=self.sim_steps,
             t_capture=t_capture,
-            t_done=self.sim_time
+            t_done=self.sim_time,
         )
         self.world_model.step(self.ctx, self.ring_buffer)
 
-        # ── 人类物理输入注入 ─────────────────────────────────────────────────
+        # ── 人类输入注入 RingBuffer ──
         if not hasattr(self, '_human_subpixel'):
             self._human_subpixel = np.zeros(2, dtype=np.float64)
 
-        cur_flick_active = (
-            not self.is_done
-            and self.chase_mode == 'human_flick'
-            and getattr(self, 'flick_timer', 999) < getattr(self, 'flick_duration', 0)
-        )
-
-        if cur_flick_active:
-            progress      = self.flick_timer / self.flick_duration
-            next_progress = min(1.0, (self.flick_timer + dt) / self.flick_duration)
-
-            def ease_out(t): return 1 - (1 - t) ** 3
-
-            curr_pos = self.flick_start_pos + (self.flick_target - self.flick_start_pos) * ease_out(progress)
-            next_pos = self.flick_start_pos + (self.flick_target - self.flick_start_pos) * ease_out(next_progress)
-
-            dx_px = next_pos[0] - curr_pos[0]
-            dy_px = next_pos[1] - curr_pos[1]
-            self.crosshair_pos[0] += dx_px
-            self.crosshair_pos[1] += dy_px
-
-            delta_x = dx_px + self._human_subpixel[0]
-            delta_y = dy_px + self._human_subpixel[1]
+        if human_dx or human_dy:
+            delta_x = human_dx + self._human_subpixel[0]
+            delta_y = human_dy + self._human_subpixel[1]
             mx = int(np.floor(delta_x))
             my = int(np.floor(delta_y))
             self._human_subpixel[0] = delta_x - mx
             self._human_subpixel[1] = delta_y - my
-
             self.ring_buffer.add_event(mx, my, is_ai=False)
-            self.flick_timer += dt
 
-        # flick 结束边沿检测 → 通知控制器清除积分
-        if self._prev_flick_active and not cur_flick_active:
+        # 场景通过 _prev_flick_active 控制 flick end 通知
+        cur_flick_active = getattr(self, '_prev_flick_active', False)
+        prev_flick_active = getattr(self, '_prev_flick_was', False)
+        if prev_flick_active and not cur_flick_active:
             if hasattr(self.world_model.controller, 'notify_flick_end'):
                 self.world_model.controller.notify_flick_end()
-        self._prev_flick_active = cur_flick_active
+        self._prev_flick_was = cur_flick_active
 
-        # ── 控制器联合发力 ────────────────────────────────────────────────────
+        # ── AI 联合发力 ──
         if self.ctx.p_predict is not None and self.ctx.v_real is not None:
-            dx_h_inst, dy_h_inst = self.ring_buffer.get_pure_human_delta_sum(
-                self.sim_time - dt, self.sim_time
-            )
+            dx_h_inst, dy_h_inst = self._intent_delta(self.sim_time - dt, self.sim_time)
             human_vx_inst = dx_h_inst / dt if dt > 0 else 0.0
             human_vy_inst = dy_h_inst / dt if dt > 0 else 0.0
 
             bbox_w = self.ctx.targets[0].w if self.ctx.targets else 60.0
 
+            # Perlin 漂移噪声
             try:
-                noise_scale = 0.5
-                amplitude   = 3.0
-                drift_x = noise.pnoise1(self.sim_time * noise_scale + self.noise_offset_x) * amplitude
-                drift_y = noise.pnoise1(self.sim_time * noise_scale + self.noise_offset_y) * amplitude
-            except NameError:
+                if noise is not None:
+                    ns = 0.5
+                    amp = 3.0
+                    drift_x = noise.pnoise1(self.sim_time * ns + self.noise_offset_x) * amp
+                    drift_y = noise.pnoise1(self.sim_time * ns + self.noise_offset_y) * amp
+                else:
+                    drift_x, drift_y = 0.0, 0.0
+            except Exception:
                 drift_x, drift_y = 0.0, 0.0
 
             drifted_p_x = self.ctx.p_predict[0] + drift_x
@@ -516,11 +405,11 @@ class SimAIAgent:
             intent_x, intent_y = self.world_model.strategy.calculate_mouse_move(
                 drifted_p_x, drifted_p_y, bbox_w=bbox_w
             )
-            v_real_pixels  = self.ctx.v_real
+            v_real_pixels = self.ctx.v_real
             intent_vx, intent_vy = self.world_model.strategy.calculate_velocity_move(
                 v_real_pixels[0], v_real_pixels[1], bbox_w=bbox_w
             )
-            a_real_pixels  = getattr(self.ctx, 'a_real', (0.0, 0.0))
+            a_real_pixels = getattr(self.ctx, 'a_real', (0.0, 0.0))
             intent_ax, intent_ay = self.world_model.strategy.calculate_velocity_move(
                 a_real_pixels[0], a_real_pixels[1], bbox_w=bbox_w
             )
@@ -528,42 +417,27 @@ class SimAIAgent:
             pixel_error_dist = np.linalg.norm([drifted_p_x, drifted_p_y])
             spatial_factor   = np.clip(1.0 - (pixel_error_dist / 800.0) ** 2, 0.1, 1.0)
 
-            time_since_seen  = self.sim_time - self.target_first_seen_time
-            # pure_ai 模式：AI 是软件层独立瞄准，没有"眼→脑→手"的 150ms 视觉反
-            # 应延迟；reaction_factor 是人类生理特征，强加给 AI 会让 power_factor
-            # 在前 150ms 里被压到 0~1 斜坡，等效于 BALLISTIC 尾段被硬压速度。
-            # 实测这一条对 256px pure_ai TTK 的影响约 80~120ms。
-            if self.chase_mode == 'pure_ai':
+            time_since_seen = self.sim_time - self.target_first_seen_time
+            # 纯 AI 模式：目标"凭空出现"，模拟人类反应延迟 (0→1 ramp over 0.15s)
+            # 人机协同：人类已经做了认知决策，AI 即时辅助无需额外延迟
+            if self.scenario.chase_mode == 'pure_ai':
+                # 纯 AI 评测：默认 0 延迟（测真实管线性能）。
+                # 需要拟人反应时间时，在 [Test] 里设 pure_ai_reaction_ramp_sec=0.15
+                _ramp = config.getfloat("Test", "pure_ai_reaction_ramp_sec", 0.0)
+                if _ramp > 0.0:
+                    reaction_factor = float(np.clip(time_since_seen / _ramp, 0.0, 1.0))
+                else:
+                    reaction_factor = 1.0
+            else:
                 reaction_factor = 1.0
-            else:
-                reaction_factor = float(np.clip(time_since_seen / 0.15, 0.0, 1.0))
 
-            dx_h_recent, dy_h_recent = self.ring_buffer.get_pure_human_delta_sum(
-                self.sim_time - 0.1, self.sim_time
+            ai_weight = self._intent_tracker.update(
+                human_vx_inst, human_vy_inst,
+                drifted_p_x, drifted_p_y,
+                dt,
             )
-            human_speed = math.hypot(dx_h_recent, dy_h_recent) / 0.1
 
-            if pixel_error_dist < 40.0:
-                speed_thresh_min = 1200.0
-                speed_thresh_max = 2500.0
-            elif pixel_error_dist > 150.0:
-                speed_thresh_min = 150.0
-                speed_thresh_max = 800.0
-            else:
-                progress = (150.0 - pixel_error_dist) / 110.0
-                speed_thresh_min = 150.0 + progress * 1050.0
-                speed_thresh_max = 800.0 + progress * 1700.0
-
-            if human_speed > speed_thresh_max:
-                human_override_factor = 0.0
-            elif human_speed < speed_thresh_min:
-                human_override_factor = 1.0
-            else:
-                human_override_factor = 1.0 - (
-                    (human_speed - speed_thresh_min) / (speed_thresh_max - speed_thresh_min)
-                )
-
-            power_factor = spatial_factor * reaction_factor * human_override_factor
+            power_factor = spatial_factor * reaction_factor * ai_weight
 
             ctrl = self.world_model.controller
             if hasattr(ctrl, "set_mouse_emit"):
@@ -574,18 +448,10 @@ class SimAIAgent:
                 v_real=np.array([intent_vx, intent_vy]),
                 a_real=np.array([intent_ax, intent_ay]),
                 power_factor=power_factor,
-                bbox_w=bbox_w
+                bbox_w=bbox_w,
             )
             self.last_ai_factor = power_factor
         else:
-            # Bug 5 修复：p_predict is None（目标丢失 >150ms 且非 coasting 期）
-            # 不再每帧调用 reset_target_state() —— 每次 reset 会把 arm_vel × 0.05，
-            # 连续 6 帧变成 ~1e-8，高速追踪突然丢帧后要从"绝对静止"重建速度，
-            # 造成 SteadyMAE 飙升。reset 的正确时机只在 spawn_new_target 时调用
-            # 一次（已在 spawn_new_target 里做了）。
-            # 这里只记录 "AI 没发力"，保留 controller 的 arm_vel 与 Kalman 状态。
-            # 与实战一致：关 emit 避免 tick_mouse 对 OU/漂移 1kHz 积分，但不 freeze
-            #（保留 arm_vel 供重锁时续上）。
             ctrl = self.world_model.controller
             if hasattr(ctrl, "set_mouse_emit"):
                 ctrl.set_mouse_emit(False)
@@ -593,3 +459,7 @@ class SimAIAgent:
 
         self.tick_mouse()
         self._print_latency_stats()
+
+    @property
+    def is_done(self) -> bool:
+        return self.scenario.is_done

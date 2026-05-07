@@ -5,6 +5,9 @@ import copy
 from collections import deque  # <--- 引入双端队列
 from typing import List, Optional
 from utils.types import InferenceContext
+from utils.logger import get_logger
+
+_log = get_logger("Recorder")
 
 
 class TraceRecorder:
@@ -27,7 +30,7 @@ class TraceRecorder:
 
     def enable(self):
         self.enabled = True
-        print(f"[Trace] 🔧 追踪回放系统已开启 (保留最近 {self.max_frames} 帧)")
+        _log.info("追踪回放系统已开启 (保留最近 %d 帧)", self.max_frames)
 
     def record_frame(self, ctx: InferenceContext):
         """
@@ -54,10 +57,10 @@ class TraceRecorder:
                 return
             data_to_save = list(self.buffer)  # 转回 list 以便 pickle 兼容
 
-        print(f"[Trace] 正在导出最近 {len(data_to_save)} 帧数据到 {self.save_path}...")
+        _log.info("正在导出最近 %d 帧数据到 %s...", len(data_to_save), self.save_path)
         try:
             with open(self.save_path, "wb") as f:
                 pickle.dump(data_to_save, f)
-            print("[Trace] ✅ 导出完成")
+            _log.info("导出完成")
         except Exception as e:
-            print(f"[Trace] ❌ 导出失败: {e}")
+            _log.error("导出失败: %s", e)
