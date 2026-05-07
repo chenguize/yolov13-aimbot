@@ -1,0 +1,20 @@
+[package]
+name = "rust_engine"
+version = "0.1.0"
+edition = "2021"
+description = "CIPHER v1.0 — Rust-native PROController: min-jerk + impedance + OU noise"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+rand = "0.8"
+rand_xoshiro = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rust_engine"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "CIPHER v1.0 Rust native extension (maturin/pyo3)"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+# 与仓库里的 import 路径一致：utils.rust_engine._core（相对本文件：仓库根在 ../..）
+module-name = "utils.rust_engine._core"
+python-source = "../.."
