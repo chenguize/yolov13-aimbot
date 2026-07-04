@@ -51,15 +51,20 @@ TOT_DECAY_RATE = 2.0        # 驻留衰减速率 (/s)
 MODE_UNDERSHOOT = "undershoot"
 MODE_OVERSHOOT  = "overshoot"
 MODE_NEAR_MISS  = "near_miss"
-TAKEOVER_MODES  = [MODE_UNDERSHOOT, MODE_OVERSHOOT, MODE_NEAR_MISS]
+MODE_VISIBILITY = "visibility_entry"
+TAKEOVER_MODES  = [MODE_UNDERSHOOT, MODE_OVERSHOOT, MODE_NEAR_MISS, MODE_VISIBILITY]
 
 
 class TakeoverScenario(BaseScenario):
     """AI 接管能力测试场景。"""
 
-    def __init__(self, max_kills: int = 25):
+    def __init__(self, max_kills: int = 25, outside_ratio: float = 0.5):
         self._max_kills = max_kills
         self._kill_count = 0
+        self._outside_ratio = float(np.clip(outside_ratio, 0.0, 1.0))
+        self.perception_radius_px = 128.0
+        self.clock_paused = False
+        self._visibility_latched = False
 
         # ── 目标物理 ──
         self._target_z: float = 10.0
@@ -85,6 +90,7 @@ class TakeoverScenario(BaseScenario):
         self._human_released: bool = False
         self._release_progress: float = 0.62               # 松手进度 (0~1), 0.55-0.70 保留适中残余速度
         self._last_flick_delta = np.zeros(2, dtype=np.float64)  # 最后一帧的准星位移 (用于算松手速率)
+        self._human_tremor_vel = np.zeros(2, dtype=np.float64)
 
         # ── 接管指标 (每 kill) ──
         self._release_dist: float = 0.0          # 人类松手时距目标距离(px)
@@ -92,6 +98,10 @@ class TakeoverScenario(BaseScenario):
         self._release_vel: float = 0.0           # 人类松手时准星速率(px/s)
         self._lock_time: float = 0.0             # AI 锁定时间
         self._takeover_duration: float = 0.0     # 接管耗时
+        self._handoff_accel_peak: float = 0.0
+        self._error_50ms: float = 0.0
+        self._error_50ms_recorded: bool = False
+        self._last_controller_velocity = np.zeros(2, dtype=np.float64)
 
         # ── 接管指标历史 (所有 kill) ──
         self.metrics_history: list = []
@@ -114,7 +124,13 @@ class TakeoverScenario(BaseScenario):
         agent.world_model.track_manager.tracks.clear()
 
         # ── 接管模式: 均匀随机 ──
-        self._takeover_mode = np.random.choice(TAKEOVER_MODES)
+        visibility_entry = np.random.random() < self._outside_ratio
+        self.clock_paused = False
+        self._takeover_mode = (
+            MODE_VISIBILITY if visibility_entry
+            else np.random.choice(TAKEOVER_MODES[:-1])
+        )
+        self._visibility_latched = not visibility_entry
         if hasattr(agent.world_model.controller, "reset_target_state"):
             try:
                 agent.world_model.controller.reset_target_state(mode="pure_ai")
@@ -130,8 +146,13 @@ class TakeoverScenario(BaseScenario):
         agent.target_hitbox_x = 0.15 * scale_factor
         agent.target_hitbox_y = 0.15 * scale_factor
 
-        # ── spawn 距离: 200-600px（始终在 AI FOV 256px cropsize 的可感知范围） ──
-        spawn_radius_px = np.random.uniform(200, 600)
+        # Half the trials begin outside the actual 128px recognition radius.
+        # The remaining trials start visible and exercise ordinary mid-flick
+        # authority transfer without conflating it with target acquisition.
+        spawn_radius_px = (
+            np.random.uniform(260, 600)
+            if visibility_entry else np.random.uniform(70, 120)
+        )
         angle = np.random.uniform(0, 2 * np.pi)
         offset_x = np.cos(angle) * spawn_radius_px
         offset_y = np.sin(angle) * spawn_radius_px
@@ -162,6 +183,7 @@ class TakeoverScenario(BaseScenario):
         self._takeover_phase = "HUMAN_FLICK"
         self._release_progress = np.random.uniform(0.55, 0.70)  # 松手时机: 中途松手, 保留适中残余速度
         self._last_flick_delta = np.zeros(2, dtype=np.float64)
+        self._human_tremor_vel.fill(0.0)
 
         # 计算人类瞄准位置 (故意偏差)
         direction = target_pos - self._flick_start_pos
@@ -170,7 +192,15 @@ class TakeoverScenario(BaseScenario):
             dist_total = 1.0
         unit_dir = direction / dist_total
 
-        if self._takeover_mode == MODE_UNDERSHOOT:
+        if self._takeover_mode == MODE_VISIBILITY:
+            # Pull only far enough to reveal the target. This camera-acquisition
+            # phase uses wall time for intent dynamics but pauses score time.
+            self._flick_target = target_pos - unit_dir * 96.0
+            self._release_progress = 0.80
+            self._flick_duration = np.random.uniform(0.16, 0.24)
+            self._takeover_phase = "NO_TARGET_PULL"
+            self.clock_paused = True
+        elif self._takeover_mode == MODE_UNDERSHOOT:
             # 人类打到 60-85% 就停
             frac = np.random.uniform(0.60, 0.85)
             self._flick_target = self._flick_start_pos + direction * frac
@@ -195,6 +225,10 @@ class TakeoverScenario(BaseScenario):
         self._release_vel = 0.0
         self._lock_time = 0.0
         self._takeover_duration = 0.0
+        self._handoff_accel_peak = 0.0
+        self._error_50ms = 0.0
+        self._error_50ms_recorded = False
+        self._last_controller_velocity.fill(0.0)
         agent.takeover_release_time = 0.0   # 每 kill 独立, 防止跨 kill 泄露
 
         agent.chase_mode = "human_flick"
@@ -236,6 +270,22 @@ class TakeoverScenario(BaseScenario):
         err_y = abs(agent.enemy_pos[1] - agent.crosshair_pos[1])
         cur_dist = float(np.hypot(err_x, err_y))
 
+        if self._release_time > 0.0:
+            elapsed = agent.sim_time - self._release_time
+            controller_velocity = np.asarray(
+                getattr(agent.world_model.controller, 'crosshair_velocity', (0.0, 0.0)),
+                dtype=np.float64,
+            )
+            if elapsed <= 0.100:
+                accel = float(np.linalg.norm(
+                    controller_velocity - self._last_controller_velocity
+                )) / max(dt, 1e-6)
+                self._handoff_accel_peak = max(self._handoff_accel_peak, accel)
+            if elapsed >= 0.050 and not self._error_50ms_recorded:
+                self._error_50ms = cur_dist
+                self._error_50ms_recorded = True
+            self._last_controller_velocity[:] = controller_velocity
+
         # 击杀检测
         if err_x <= agent.target_hitbox_x and err_y <= agent.target_hitbox_y:
             self._tot_timer += dt
@@ -272,6 +322,9 @@ class TakeoverScenario(BaseScenario):
             "release_vel":      self._release_vel,
             "release_progress": self._release_progress,
             "takeover_dur":     self._takeover_duration,
+            "handoff_accel_peak": self._handoff_accel_peak,
+            "error_50ms":       self._error_50ms,
+            "visibility_entry": self._takeover_mode == MODE_VISIBILITY,
             "final_dist":       final_dist,
             "phase":            self._takeover_phase,
         })
@@ -305,17 +358,38 @@ class TakeoverScenario(BaseScenario):
             # 记录最后一帧准星位移（用于计算松手速率）
             self._last_flick_delta = delta.copy()
 
-            # 人手震颤噪声 (标准差随速度衰减)
+            # Velocity-domain OU tremor. Position-domain white noise at 500 Hz
+            # creates impossible multi-thousand-pixel/s jumps; integrating a
+            # correlated velocity process keeps the motion bandwidth finite.
             speed = float(np.linalg.norm(delta)) / max(dt, 1e-6)
-            noise_std = np.clip(speed * 0.003, 1.5, 8.0)
-            noise = np.random.normal(0, noise_std, 2)
+            theta = 35.0
+            sigma = float(np.clip(250.0 + 0.08 * speed, 250.0, 550.0))
+            self._human_tremor_vel += (
+                -theta * self._human_tremor_vel * dt
+                + sigma * math.sqrt(dt) * np.random.normal(0.0, 1.0, 2)
+            )
+            noise = self._human_tremor_vel * dt
 
             result = delta + noise
             return (float(result[0]), float(result[1]))
 
+        # A moving target may invalidate the endpoint sampled at spawn. Keep
+        # the unscored camera pull active until the live target truly enters
+        # the recognition radius; never release against a stale endpoint.
+        if self._takeover_mode == MODE_VISIBILITY and not self._visibility_latched:
+            live_error = agent.enemy_pos - agent.crosshair_pos
+            live_dist = float(np.linalg.norm(live_error))
+            if live_dist > 1e-6:
+                pull_speed = 1200.0
+                travel = min(max(live_dist - 112.0, 0.0), pull_speed * dt)
+                delta = live_error * (travel / live_dist)
+                self._last_flick_delta = delta.copy()
+                return float(delta[0]), float(delta[1])
+
         # 甩枪到松手点 → 松手，AI 接管
         self._human_released = True
         self._takeover_phase = "TAKEOVER"
+        self.clock_paused = False
         self._prev_flick_active = False
 
         # 记录松手时刻指标
@@ -323,25 +397,60 @@ class TakeoverScenario(BaseScenario):
             self._release_dist = float(
                 np.linalg.norm(agent.enemy_pos - agent.crosshair_pos)
             )
-            self._release_time = agent.sim_time
+            self._release_time = max(agent.sim_time, 1e-6)
             agent.takeover_release_time = self._release_time  # 告知评分系统: AI 时钟从此开始
             # 准星速率 = 最后一帧位移 / 帧间隔 (px/s)
             self._release_vel = float(
                 np.linalg.norm(self._last_flick_delta) / max(dt, 1e-6)
             )
+            bbox_w = agent.ctx.targets[0].w if agent.ctx.targets else 60.0
+            strategy = agent.world_model.strategy
+            try:
+                hvx, hvy = strategy.calculate_velocity_move(
+                    self._last_flick_delta[0] / max(dt, 1e-6),
+                    self._last_flick_delta[1] / max(dt, 1e-6),
+                    px_x=0.0, px_y=0.0, bbox_w=bbox_w,
+                )
+            except TypeError:
+                hvx, hvy = strategy.calculate_velocity_move(
+                    self._last_flick_delta[0] / max(dt, 1e-6),
+                    self._last_flick_delta[1] / max(dt, 1e-6),
+                    bbox_w=bbox_w,
+                )
+            self._last_controller_velocity[:] = (hvx, hvy)
+            ctrl = agent.world_model.controller
+            if hasattr(ctrl, 'begin_handoff'):
+                tvx, tvy = strategy.calculate_velocity_move(
+                    float(agent.enemy_vel[0]), float(agent.enemy_vel[1]),
+                    px_x=0.0, px_y=0.0, bbox_w=bbox_w,
+                )
+                error_px = agent.enemy_pos - agent.crosshair_pos
+                ex, ey = strategy.calculate_mouse_move(
+                    float(error_px[0]), float(error_px[1]), bbox_w=bbox_w,
+                )
+                ctrl.begin_handoff(
+                    human_velocity=np.array([hvx, hvy], dtype=np.float64),
+                    target_velocity=np.array([tvx, tvy], dtype=np.float64),
+                    error=np.array([ex, ey], dtype=np.float64),
+                    reason='human_release',
+                )
 
         if hasattr(agent, '_prev_flick_active'):
             agent._prev_flick_active = False
-        if hasattr(agent.world_model, 'controller') and hasattr(
-            agent.world_model.controller, 'notify_flick_end'
-        ):
-            agent.world_model.controller.notify_flick_end()
-
         return (0.0, 0.0)
 
     def check_kill(self, agent: "SimAIAgent", dt: float) -> bool:
         """击杀判定已集成在 tick_physics 中。"""
         return False
+
+    def is_target_visible(self, distance_px: float) -> bool:
+        """Recognition hysteresis: enter at 128px, tolerate acquisition motion."""
+        if not self._visibility_latched and distance_px <= self.perception_radius_px:
+            self._visibility_latched = True
+        # This scenario isolates first-entry handoff. Once acquired, keep the
+        # track observable until kill; repeated FOV exits belong to the separate
+        # coast/occlusion scenarios.
+        return self._visibility_latched
 
     # ==========================================================================
     #  状态查询

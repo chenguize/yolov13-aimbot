@@ -36,7 +36,7 @@ class InferenceThread(threading.Thread):
         self._first_push_logged = False
 
         model_path = config.getstr("Inference", "model_path", "models/yolo26n.engine")
-        img_size = config.getint("General", "capture_size", 256)
+        img_size = config.getint("Hardware", "capture_size", 256)
 
         try:
             logger.info("Loading YOLO26 Model (NMS-Free)...")
@@ -55,7 +55,7 @@ class InferenceThread(threading.Thread):
 
         conf_thres = config.getfloat("Inference", "conf_threshold", 0.40)
         max_det = config.getint("Inference", "max_det", 20)
-        img_size = config.getint("General", "capture_size", 256)
+        img_size = config.getint("Hardware", "capture_size", 256)
 
         last_print_time = 0.0
         last_inference_ms = 0.0

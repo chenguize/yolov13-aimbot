@@ -30,6 +30,11 @@ INTENT_EMERGENCY_SPD_EMA_TAU_S = 0.045
 INTENT_PERSIST_MIN_SPEED_PX_S = 280.0
 # 准星误差大于此：仅允许「高速甩枪」进紧急，禁止 persist 兜底（大误差时常误判对抗）
 INTENT_SKIP_PERSIST_EMERGENCY_DIST_PX = 95.0
+# ── jerk² 快速触发（v5.0 升级）──────────────────────────────────────
+# 启用 jerk² 检测（运动起步的急动量）→ 比速度 EMA 快 20-30ms 触发紧急
+INTENT_JERK_EMERGENCY_ENABLED = True
+# jerk² 阈值（px/s³）：flick 起步的 acc 上升 → jerk 峰值 ~1-2e7，噪声 < 5e6
+INTENT_JERK_THRESHOLD_PX_S3 = 10_000_000.0
 # 安全包络：非紧急时人手对抗+score>此值 → AI功率上限压到此比例(0=关闭)
 INTENT_SAFETY_MAX_AI_POWER = 0.30
 INTENT_SAFETY_ENGAGE_SCORE = 0.20

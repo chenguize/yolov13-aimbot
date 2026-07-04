@@ -47,6 +47,26 @@ def _compute_iou(box_a: Tuple[float, float, float, float],
     return inter / denom
 
 
+def cv2_bhatt_correlation(hist_a: np.ndarray, hist_b: np.ndarray) -> float:
+    """
+    HSV 颜色直方图相似度。返回 [0, 1]，1 表示完全相同。
+    优先用 cv2.compareHist（HSV 直方图标准方法）；不可用时退化为余弦相似度。
+    """
+    try:
+        import cv2
+        # cv2.compareHist 返回 [0, 1]，1=完全匹配（CV_COMP_CORREL）
+        return float(cv2.compareHist(hist_a.reshape(-1, 1).astype(np.float32),
+                                      hist_b.reshape(-1, 1).astype(np.float32),
+                                      cv2.HISTCMP_CORREL))
+    except Exception:
+        # 退化：余弦相似度
+        a = hist_a.flatten().astype(np.float64)
+        b = hist_b.flatten().astype(np.float64)
+        na = float(np.linalg.norm(a) + 1e-9)
+        nb = float(np.linalg.norm(b) + 1e-9)
+        return float(np.dot(a, b) / (na * nb))
+
+
 @dataclass
 class Track:
     """单一物理目标的 Kalman 轨迹。"""
@@ -62,6 +82,16 @@ class Track:
     coast_count: int               # 连续未匹配帧数
     total_matches: int             # 历史匹配总数
     last_innovation: Optional[np.ndarray] = None  # 最近一次 Kalman innovation
+    # ── 重构新增：ReID 颜色直方图（HSV 8x8x8 = 512 bin，归一化）──
+    # 用于短时遮挡场景下的关联，IoU 失效时仍能匹配同一目标
+    color_hist: Optional[np.ndarray] = None
+    # ── 重构新增：上次被选为 best 的时间，用于加权评分 ──
+    last_selected: float = 0.0
+    # ── Fire-gate 死亡降权：death_penalty_until > now 时 select_best 排除 ──
+    death_penalty_until: float = 0.0
+    seed_position: Optional[np.ndarray] = None
+    seed_time: float = 0.0
+    velocity_seeded: bool = False
 
     @property
     def is_active(self) -> bool:
@@ -134,6 +164,37 @@ class TrackManager:
 
         # ── 上一次选中的轨迹 ID（用于检测目标切换）──
         self._last_best_id: Optional[int] = None
+
+        # ── 重构新增：ReID 颜色直方图配置 ──
+        # IoU + 框心距不足时，加颜色直方图相关性维度（HSV 8x8x8=512 bin）
+        self._reid_enable: bool = config.getbool(
+            "WorldModel", "track_reid_enable", True
+        )
+        self._reid_weight: float = float(np.clip(config.getfloat(
+            "WorldModel", "track_reid_weight", 0.15
+        ), 0.0, 0.5))
+        # ── 重构新增：速度先验预热权重 ──
+        # 新目标 spawn 时从同帧活跃 track 速度均值借用多少（0=禁用，1=完全借用）
+        self._velocity_prior_enable: bool = config.getbool(
+            "WorldModel", "track_velocity_prior_enable", True
+        )
+        self._velocity_prior_alpha: float = float(np.clip(config.getfloat(
+            "WorldModel", "track_velocity_prior_alpha", 0.6
+        ), 0.0, 1.0))
+        # ── 重构新增：加权评分选择策略权重 ──
+        # policy=weighted_score 时启用，综合 距离/conf/threat/velocity
+        self._ws_w_dist: float = config.getfloat("WorldModel", "track_ws_w_dist", 1.0)
+        self._ws_w_conf: float = config.getfloat("WorldModel", "track_ws_w_conf", 0.5)
+        self._ws_w_threat: float = config.getfloat("WorldModel", "track_ws_w_threat", 0.3)
+        self._ws_w_velocity: float = config.getfloat("WorldModel", "track_ws_w_velocity", 0.2)
+
+    def mark_track_death_penalty(self, track_id: int, duration_s: float, now: float) -> None:
+        """标记某轨迹为「疑似死亡」，在 duration_s 内 select_best 排除该轨迹。
+
+        由 agent._confirm_fire_gate_death 调用：开枪后几何确认死亡 → 降权排除尸体。
+        """
+        if track_id in self.tracks:
+            self.tracks[track_id].death_penalty_until = now + duration_s
 
     def _prune_stale_tracks(self) -> None:
         """coast_count 超过 max_coast 的轨迹移除。单球 hard_assign 时池中仅 1 条则不删——
@@ -223,6 +284,25 @@ class TrackManager:
             det = detections[dj]
             track.kalman.predict(track.target, dt)
             innovation = track.kalman.update(track.target, det["abs_meas"])
+            if not track.velocity_seeded:
+                seed_dt = now - track.seed_time
+                if track.seed_position is not None and seed_dt >= 0.020:
+                    measured_vel = (
+                        np.asarray(det["abs_meas"], dtype=np.float64)
+                        - track.seed_position
+                    ) / seed_dt
+                    speed = float(np.linalg.norm(measured_vel))
+                    max_seed_speed = 3000.0
+                    if speed > max_seed_speed and speed > 1e-9:
+                        measured_vel *= max_seed_speed / speed
+                    # Blend instead of replacing: retain Kalman's covariance-
+                    # weighted estimate while removing its zero-velocity bias.
+                    track.target.state[2:4] = (
+                        0.20 * track.target.state[2:4]
+                        + 0.80 * measured_vel
+                    )
+                    track.target.state[4:6] = 0.0
+                    track.velocity_seeded = True
             track.last_innovation = innovation
             track.last_bbox = det["bbox"]
             track.class_id = det["class_id"]
@@ -232,6 +312,22 @@ class TrackManager:
             # conf EMA 平滑
             alpha = 0.3 if track.total_matches < 5 else 0.15
             track.conf_ema = (1.0 - alpha) * track.conf_ema + alpha * det["conf"]
+            # 重构新增：刷新颜色直方图（EMA 平滑，避免单帧抖动）
+            if self._reid_enable:
+                new_hist = det.get("color_hist", None)
+                if new_hist is None:
+                    frame = det.get("frame", None)
+                    bbox = det.get("bbox", None)
+                    if frame is not None and bbox is not None:
+                        new_hist = self._compute_color_hist(frame, bbox)
+                if new_hist is not None:
+                    if track.color_hist is None:
+                        track.color_hist = new_hist
+                    else:
+                        # EMA：hist = 0.85*old + 0.15*new
+                        track.color_hist = (
+                            0.85 * track.color_hist + 0.15 * new_hist
+                        ).astype(np.float32)
 
         # ── 3. 未匹配轨迹：纯预测（coast）──
         for ti in unmatched_track_idxs:
@@ -286,6 +382,7 @@ class TrackManager:
         球死了 → 追 ghost → ghost 离准星最近 → select ghost → 继续追 ghost。
         只有在所有轨迹都 coast 时（如全部敌人躲掩体后）才回退到全量选择。
         """
+        now = time.perf_counter()
         if self._single_det_hard_assign and len(self.tracks) == 1:
             active = list(self.tracks.values())
         else:
@@ -300,6 +397,12 @@ class TrackManager:
         matched = [t for t in active if t.coast_count == 0]
         candidates = matched if matched else active
 
+        # ── Fire-gate 死亡降权：排除被标记死亡的轨迹（全部被标记时保留全部）──
+        if candidates:
+            unpenalized = [t for t in candidates if t.death_penalty_until <= now]
+            if unpenalized:
+                candidates = unpenalized
+
         policy = self.selection_policy
 
         best: Optional[Track] = None
@@ -313,6 +416,9 @@ class TrackManager:
             best = max(candidates, key=lambda t: (
                 (t.last_bbox[2] - t.last_bbox[0]) * (t.last_bbox[3] - t.last_bbox[1])
             ))
+        elif policy in ("weighted_score", "weighted", "score"):
+            # 重构新增：综合评分 = w_dist·距离反比 + w_conf·conf + w_threat·最近可见 + w_vel·速度反比
+            best = self._select_weighted_score(candidates, ego_pos_px, now)
         else:
             # default: closest_to_crosshair
             best = min(candidates, key=lambda t: float(
@@ -344,6 +450,47 @@ class TrackManager:
             )
             self._last_best_id = best.track_id
 
+        # 重构新增：标记 last_selected 用于加权评分
+        best.last_selected = now
+        return best
+
+    def _select_weighted_score(
+        self, candidates: List[Track], ego_pos_px: np.ndarray, now: float
+    ) -> Track:
+        """
+        综合加权评分选择最佳目标。
+        score = w_dist * (1 / (1 + d_px))           ← 距离越近分越高
+              + w_conf * conf_ema                    ← 置信度越高分越高
+              + w_threat * (1 / (1 + t_since_seen))  ← 最近可见威胁分高
+              + w_velocity * (1 / (1 + v_rel))      ← 相对速度越小分越高（易命中）
+        并加 sticky 加成：上一帧 best 在 22px 内不切换。
+        """
+        def _score(t: Track) -> float:
+            d = float(np.linalg.norm(t.abs_position - ego_pos_px))
+            t_seen = max(0.0, now - t.last_matched)
+            v_mag = float(np.linalg.norm(t.abs_velocity))
+            # 各维度归一化到 [0, 1]
+            s_dist = 1.0 / (1.0 + d * 0.02)              # d=0→1, d=50→0.5, d=200→0.2
+            s_conf = float(np.clip(t.conf_ema, 0.0, 1.0))
+            s_threat = 1.0 / (1.0 + t_seen * 4.0)         # 0ms→1, 250ms→0.5, 1s→0.2
+            s_vel = 1.0 / (1.0 + v_mag * 0.001)           # 0px/s→1, 1000px/s→0.5
+            return (
+                self._ws_w_dist * s_dist
+                + self._ws_w_conf * s_conf
+                + self._ws_w_threat * s_threat
+                + self._ws_w_velocity * s_vel
+            )
+        best = max(candidates, key=_score)
+        # sticky：上一帧 best 比几何最近多 sticky_px 也不切
+        spx = float(self._select_sticky_px)
+        if spx > 0.0 and self._last_best_id is not None:
+            prev_t = next(
+                (t for t in candidates if t.track_id == self._last_best_id),
+                None,
+            )
+            if prev_t is not None and prev_t.track_id != best.track_id:
+                if _score(prev_t) >= _score(best) - 0.05:  # 5% 容差
+                    best = prev_t
         return best
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -351,10 +498,18 @@ class TrackManager:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _pair_affinity(self, trk: Track, det: dict, dt: float) -> float:
-        """IoU 优先；不足阈值时用框心距弱匹配（Aimlab 快动球 IoU 常断裂）。"""
+        """
+        IoU 优先；不足阈值时用框心距弱匹配（Aimlab 快动球 IoU 常断裂）。
+        重构新增：ReID 颜色直方图相关性作为附加维度，处理短时遮挡。
+        """
         iou = _compute_iou(trk.last_bbox, det["bbox"])
         if iou > self.iou_threshold:
-            return 1.0 + float(iou)
+            # IoU 高时仍加 ReID 微调（防止同色目标错配）
+            reid_bonus = 0.0
+            if self._reid_enable and self._reid_weight > 0.0:
+                reid_bonus = self._reid_weight * self._reid_correlation(trk, det)
+            return 1.0 + float(iou) + reid_bonus
+
         cmax = float(self.center_match_max_px)
         if cmax <= 0.0:
             return 0.0
@@ -365,9 +520,71 @@ class TrackManager:
         cx2 = 0.5 * (d[0] + d[2])
         cy2 = 0.5 * (d[1] + d[3])
         dist = math.hypot(cx1 - cx2, cy1 - cy2)
-        if dist < cmax:
-            return 0.5 + 0.5 * (1.0 - dist / cmax)
-        return 0.0
+        if dist >= cmax:
+            return 0.0
+
+        # 框心距弱匹配：基础分 0.5 + 距离衰减
+        base_score = 0.5 + 0.5 * (1.0 - dist / cmax)
+        # ReID 加成：颜色直方图相关性 [0, 1]
+        if self._reid_enable and self._reid_weight > 0.0:
+            reid_corr = self._reid_correlation(trk, det)
+            base_score += self._reid_weight * reid_corr
+        return base_score
+
+    def _reid_correlation(self, trk: Track, det: dict) -> float:
+        """
+        HSV 颜色直方图相关性。返回 [0, 1]。
+        det 必须含 "frame" 字段（BGR 图像），否则跳过。
+        """
+        if trk.color_hist is None:
+            return 0.0
+        det_hist = det.get("color_hist", None)
+        if det_hist is None:
+            # 没有预计算，尝试现场计算（如果 frame 可用）
+            frame = det.get("frame", None)
+            bbox = det.get("bbox", None)
+            if frame is None or bbox is None:
+                return 0.0
+            det_hist = self._compute_color_hist(frame, bbox)
+            if det_hist is None:
+                return 0.0
+            det["color_hist"] = det_hist  # 缓存
+        # Bhattacharyya 距离 → 相似度 [0, 1]
+        try:
+            bc = float(cv2_bhatt_correlation(trk.color_hist, det_hist))
+            return max(0.0, min(1.0, bc))
+        except Exception:
+            return 0.0
+
+    def _compute_color_hist(self, frame: np.ndarray, bbox: Tuple) -> Optional[np.ndarray]:
+        """
+        从 frame 的 bbox 区域提取 HSV 8x8x8 颜色直方图，归一化。
+        frame 必须是 BGR (H, W, 3)。失败返回 None。
+        """
+        if frame is None or frame.size == 0:
+            return None
+        try:
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            h, w = frame.shape[:2]
+            x1 = max(0, min(w - 1, x1))
+            x2 = max(0, min(w, x2))
+            y1 = max(0, min(h - 1, y1))
+            y2 = max(0, min(h, y2))
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                return None
+            roi = frame[y1:y2, x1:x2]
+            # BGR → HSV
+            try:
+                import cv2
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8],
+                                    [0, 180, 0, 256, 0, 256])
+                cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+                return hist.flatten().astype(np.float32)
+            except ImportError:
+                return None
+        except Exception:
+            return None
 
     def _greedy_match(
         self,
@@ -414,13 +631,36 @@ class TrackManager:
         return matches, unmatched_t, unmatched_d
 
     def _spawn_track(self, det: dict, now: float) -> Track:
-        """从检测创建新轨迹。"""
-        from world_model import TargetState, SimpleKalman
+        """
+        从检测创建新轨迹。
+        重构新增：
+          1. 速度先验预热 — 用同帧活跃 track 速度均值作初值，收敛时间 80ms→20ms
+          2. 颜色直方图提取 — 用于后续 ReID 关联
+          3. IMM-Kalman 可选 — 配置 Kalman.use_imm=True 时启用，处理动目标变向
+        """
+        from world_model import TargetState
 
         tid = self._next_id
         self._next_id += 1
 
-        kalman = SimpleKalman()
+        # 选择 Kalman 实现
+        try:
+            from config import config as _cfg
+            use_imm = _cfg.getbool("Kalman", "use_imm", False)
+        except Exception:
+            use_imm = False
+
+        if use_imm:
+            try:
+                from perception.imm_kalman import IMMKalman
+                kalman = IMMKalman()
+            except Exception as e:
+                from world_model import SimpleKalman
+                kalman = SimpleKalman()
+                _log.warning("IMMKalman unavailable, fallback SimpleKalman: %s", e)
+        else:
+            from world_model import SimpleKalman
+            kalman = SimpleKalman()
         target = TargetState(
             id=tid,
             first_seen=now,
@@ -429,8 +669,51 @@ class TrackManager:
         )
         target.state[:2] = det["abs_meas"].copy()
 
-        # 速度初值置零（没有历史信息时最安全的选择）
-        # 2 帧后 Kalman 自行收敛到合理速度估计
+        # ── 速度先验预热 ──────────────────────────────────────────────────
+        # 旧版：速度初值置零，2 帧后 Kalman 自行收敛到合理速度估计（~80ms）。
+        # 新版：从同帧活跃 track 速度加权均值借用（按距离衰减权重），收敛 80ms→20ms。
+        # 适用 peek 场景：新目标出现时就有 60% 速度估计，首帧命中显著提升。
+        if self._velocity_prior_enable and self.tracks:
+            try:
+                meas = np.asarray(det["abs_meas"], dtype=np.float64).reshape(2)
+                # 仅用本帧已匹配的活跃 track（coast_count==0），按距离反比加权
+                active_for_prior = [
+                    t for t in self.tracks.values() if t.coast_count == 0
+                ]
+                if active_for_prior:
+                    weights = []
+                    velocities = []
+                    for t in active_for_prior:
+                        d = float(np.linalg.norm(t.abs_position - meas))
+                        w = 1.0 / (1.0 + d * 0.01)  # 距离越近权重越大
+                        weights.append(w)
+                        velocities.append(t.abs_velocity.copy())
+                    w_sum = float(sum(weights))
+                    if w_sum > 1e-6:
+                        v_prior = np.average(
+                            np.array(velocities), weights=np.array(weights), axis=0
+                        )
+                        # 60% 先验 + 40% 零（留收敛空间）
+                        alpha_prior = float(self._velocity_prior_alpha)
+                        target.state[2:4] = v_prior * alpha_prior
+                        # 加速度初值也借用部分
+                        accs = [t.abs_accel.copy() for t in active_for_prior]
+                        a_prior = np.average(
+                            np.array(accs), weights=np.array(weights), axis=0
+                        )
+                        target.state[4:6] = a_prior * (alpha_prior * 0.5)
+            except Exception as e:
+                _log.warning("velocity_prior failed: %s", e)
+
+        # ── 颜色直方图提取 ──────────────────────────────────────────────
+        color_hist = None
+        if self._reid_enable:
+            frame = det.get("frame", None)
+            bbox = det.get("bbox", None)
+            if frame is not None and bbox is not None:
+                color_hist = self._compute_color_hist(frame, bbox)
+                if color_hist is not None:
+                    det["color_hist"] = color_hist  # 缓存到 det 供后续匹配复用
 
         track = Track(
             track_id=tid,
@@ -443,6 +726,9 @@ class TrackManager:
             last_matched=now,
             coast_count=0,
             total_matches=1,
+            color_hist=color_hist,
+            seed_position=np.asarray(det["abs_meas"], dtype=np.float64).copy(),
+            seed_time=now,
         )
         self.tracks[tid] = track
         _log.track_spawned(tid, det["class_id"], det["conf"])

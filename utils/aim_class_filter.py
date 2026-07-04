@@ -9,7 +9,7 @@ from config import config
 
 
 def get_aim_target_class_set() -> Optional[Set[int]]:
-    s = config.getstr("WorldModel", "aim_target_classes", "").strip()
+    s = config.getstr("Inference", "aim_target_classes", "").strip()
     if not s:
         return None
     try:

@@ -14,6 +14,7 @@ import time
 import subprocess
 import shutil
 import platform
+import random
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +65,7 @@ def export_opencv_ffmpeg(
     dpi: float,
     nvenc: bool,
     fixed_dt: float = 0.002,
+    tail_seconds: float = 1.5,
 ) -> float:
     """用 OpenCV 画帧，经 pipe 喂给 ffmpeg；比 Matplotlib 光栅化快一个数量级以上。
 
@@ -103,6 +105,7 @@ def export_opencv_ffmpeg(
 
     fps = max(1, int(round(1.0 / (fixed_dt * max(1, step)))))
     hit_r_px = max(1, int(round(15.0 * scale)))
+    tail_samples = max(2, int(round(tail_seconds / fixed_dt)))
 
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -136,8 +139,9 @@ def export_opencv_ffmpeg(
         for frame_idx in range(0, len(logs), step):
             img = np.full((H, W, 3), 255, dtype=np.uint8)
 
-            t_hist = targets[0 : frame_idx + 1]
-            c_hist = crosshairs[0 : frame_idx + 1]
+            tail_start = max(0, frame_idx + 1 - tail_samples)
+            t_hist = targets[tail_start : frame_idx + 1]
+            c_hist = crosshairs[tail_start : frame_idx + 1]
             t_draw = _decimate_path(t_hist, max_path_points)
             c_draw = _decimate_path(c_hist, max_path_points)
 
@@ -157,6 +161,32 @@ def export_opencv_ffmpeg(
             cv2.circle(img, (int(tcx), int(tcy)), 4, (0, 0, 255), -1, cv2.LINE_AA)
             cv2.circle(img, (int(qx), int(qy)), 4, (255, 0, 0), -1, cv2.LINE_AA)
 
+            error_px = float(np.linalg.norm(targets[frame_idx] - crosshairs[frame_idx]))
+            if frame_idx > 0:
+                speed_px_s = float(
+                    np.linalg.norm(crosshairs[frame_idx] - crosshairs[frame_idx - 1])
+                    / fixed_dt
+                )
+            else:
+                speed_px_s = 0.0
+            errors_so_far = np.linalg.norm(
+                targets[: frame_idx + 1] - crosshairs[: frame_idx + 1], axis=1
+            )
+            hit_pct = float(np.mean(errors_so_far <= 15.0) * 100.0)
+            status_color = (25, 135, 25) if error_px <= 15.0 else (30, 30, 30)
+            cv2.putText(
+                img, f"error {error_px:6.1f}px", (18, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, status_color, 2, cv2.LINE_AA,
+            )
+            cv2.putText(
+                img, f"speed {speed_px_s:6.0f}px/s", (18, 56),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (70, 70, 70), 1, cv2.LINE_AA,
+            )
+            cv2.putText(
+                img, f"within 15px {hit_pct:5.1f}%", (18, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (70, 70, 70), 1, cv2.LINE_AA,
+            )
+
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             proc.stdin.write(rgb.tobytes())
     finally:
@@ -172,7 +202,11 @@ def export_opencv_ffmpeg(
     return time.perf_counter() - t0
 
 
-def run_minimal_simulation(duration: float = 5.0, scenario_type: str = "ball") -> List[Dict]:
+def run_minimal_simulation(
+    duration: float = 5.0,
+    scenario_type: str = "ball",
+    seed: Optional[int] = None,
+) -> List[Dict]:
     """静默运行仿真，只收集轨迹数据"""
     import os, sys
     # 仓库根必须排在 sys.path 最前；否则在 test/ 下执行时 cwd 会干扰 import test.*
@@ -195,22 +229,27 @@ def run_minimal_simulation(duration: float = 5.0, scenario_type: str = "ball") -
         from test.scenarios.pure_ai_ball import PureAIBallScenario
         scenario = PureAIBallScenario(max_kills=30)
 
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
+
     agent = SimAIAgent(scenario=scenario)
     fixed_dt = 0.002
     sim_time = 0.0
     logs = []
 
     print(f"⚙️ 正在收集轨迹数据 (场景: {scenario_type}, 时长: {duration}秒)...")
-    while sim_time < duration:
-        agent.step()
-        logs.append({
-            'target': agent.enemy_pos.copy(),
-            'crosshair': agent.crosshair_pos.copy()
-        })
-        sim_time += fixed_dt
-
-    # 【修复3】仿真结束，必须把时钟归还给系统！否则动画库会陷入时间静止
-    time.perf_counter = original_perf_counter
+    try:
+        while sim_time < duration:
+            agent.step()
+            logs.append({
+                'target': agent.enemy_pos.copy(),
+                'crosshair': agent.crosshair_pos.copy(),
+            })
+            sim_time += fixed_dt
+    finally:
+        # SimAIAgent replaces the process clock; always restore it on failure.
+        time.perf_counter = original_perf_counter
 
     print("✅ 数据收集完毕，系统时钟已恢复，准备播放动画！")
     return logs
@@ -227,6 +266,7 @@ def animate_mouse_trajectory(
     interactive: bool = False,
     engine: str = "opencv",
     auto_open: bool = True,
+    tail_seconds: float = 1.5,
 ):
     """绘制动态鼠标追踪轨迹（全局固定视角 + 完整轨迹留存）。
 
@@ -253,6 +293,7 @@ def animate_mouse_trajectory(
                 max_path_points=max_path_points,
                 dpi=dpi,
                 nvenc=nvenc,
+                tail_seconds=tail_seconds,
             )
             print(f"✅ 导出成功（{dt:.1f}s）")
             exported_ok = True
@@ -267,6 +308,7 @@ def animate_mouse_trajectory(
                         max_path_points=max_path_points,
                         dpi=dpi,
                         nvenc=False,
+                        tail_seconds=tail_seconds,
                     )
                     print(f"✅ 导出成功（libx264，{dt:.1f}s）")
                     exported_ok = True
@@ -328,8 +370,8 @@ def animate_mouse_trajectory(
         return target_path, crosshair_path, target_dot, crosshair_dot, hitbox
 
     def update(frame_idx):
-        # 【取消拖尾截断，从第0帧开始画，显示完整的“毛线团”轨迹】
-        tail_start = 0
+        tail_samples = max(2, int(round(tail_seconds / 0.002)))
+        tail_start = max(0, frame_idx + 1 - tail_samples)
 
         t_hist = targets[tail_start:frame_idx + 1]
         c_hist = crosshairs[tail_start:frame_idx + 1]
@@ -395,7 +437,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="仿真轨迹 → 视频（零参数即：pure_ai / 20s / OpenCV 快导 / 尝试 NVENC / 结束自动打开）",
     )
-    parser.add_argument("--scenario", type=str, default="takeover",
+    parser.add_argument("--scenario", type=str, default="pure_ai",
                         choices=["ball", "takeover", "pure_ai"], help="场景（默认 pure_ai）")
     parser.add_argument("--duration", type=float, default=20.0, help="仿真时长（秒），默认 20")
     parser.add_argument(
@@ -413,6 +455,11 @@ if __name__ == "__main__":
         help="禁用 NVENC，仅用 CPU libx264",
     )
     parser.add_argument("--no-open", action="store_true", help="导出完成后不自动打开视频")
+    parser.add_argument("--seed", type=int, default=7, help="随机种子，默认 7")
+    parser.add_argument(
+        "--tail-seconds", type=float, default=1.5,
+        help="轨迹尾迹长度（秒），默认 1.5",
+    )
     parser.add_argument(
         "--interactive",
         action="store_true",
@@ -426,7 +473,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    trajectory_logs = run_minimal_simulation(duration=args.duration, scenario_type=args.scenario)
+    trajectory_logs = run_minimal_simulation(
+        duration=args.duration,
+        scenario_type=args.scenario,
+        seed=args.seed,
+    )
 
     save = args.save if args.save.strip() else None
     engine = args.engine
@@ -444,4 +495,5 @@ if __name__ == "__main__":
         interactive=args.interactive,
         engine=engine,
         auto_open=not args.no_open,
+        tail_seconds=max(0.1, args.tail_seconds),
     )

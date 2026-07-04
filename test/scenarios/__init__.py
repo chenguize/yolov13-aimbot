@@ -25,6 +25,10 @@ from test.scenarios.ball_tracking import BallTrackingScenario
 from test.scenarios.multi_target import MultiTargetScenario
 from test.scenarios.takeover import TakeoverScenario
 from test.scenarios.pure_ai_ball import PureAIBallScenario
+from test.scenarios.occlusion import OcclusionScenario
+from test.scenarios.peek import PeekScenario
+from test.scenarios.directional_change import DirectionalChangeScenario
+from test.scenarios.coast import CoastScenario
 
 __all__ = [
     "BaseScenario",
@@ -32,4 +36,8 @@ __all__ = [
     "MultiTargetScenario",
     "TakeoverScenario",
     "PureAIBallScenario",
+    "OcclusionScenario",
+    "PeekScenario",
+    "DirectionalChangeScenario",
+    "CoastScenario",
 ]

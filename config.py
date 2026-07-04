@@ -55,6 +55,18 @@ class Config:
         self.parser.optionxform = str
         self.parser.read(config_path, encoding='utf-8')
 
+        # 记录哪些 (section, key) 在 get 时被自动替换（用于启动日志/调试）
+        self._replaced_keys: set = set()
+
+        # ── 自动检测屏幕分辨率（仅一次，启动期）──────────────────────────────
+        # config.ini [Hardware].screen_width / screen_height 为 0 或 "auto" 时，
+        # 实际取值由 detect_screen_size() 给出。检测结果缓存在 self._detected_screen。
+        try:
+            from utils.screen import detect_screen_size
+            self._detected_screen = detect_screen_size()
+        except Exception:
+            self._detected_screen = (1920, 1080, "default (检测异常)")
+
     def get(self, section: str, key: str, default: Any = None) -> Any:
         """通用获取方法，会尝试智能转换类型"""
         if not self.parser.has_section(section) or not self.parser.has_option(section, key):
@@ -68,13 +80,30 @@ class Config:
 
         # 尝试整数转换（必须在 bool 之前：否则 "0"/"1" 被误判为 False/True）
         try:
-            return int(val)
+            ival = int(val)
+            # ── 自动屏幕分辨率：0 或 "auto" → 替换为检测值 ──────────────────
+            if section == "Hardware" and key in ("screen_width", "screen_height") and ival <= 0:
+                self._replaced_keys.add((section, key))
+                return float(self._detected_screen[0 if key == "screen_width" else 1])
+            return ival
         except ValueError:
             pass
 
+        # 字符串 "auto" 也触发自动检测
+        if val.strip().lower() == "auto":
+            if section == "Hardware" and key in ("screen_width", "screen_height"):
+                self._replaced_keys.add((section, key))
+                return float(self._detected_screen[0 if key == "screen_width" else 1])
+            return default
+
         # 尝试浮点数转换
         try:
-            return float(val)
+            fval = float(val)
+            # 浮点 0 也触发自动检测
+            if section == "Hardware" and key in ("screen_width", "screen_height") and fval <= 0:
+                self._replaced_keys.add((section, key))
+                return float(self._detected_screen[0 if key == "screen_width" else 1])
+            return fval
         except ValueError:
             pass
 
@@ -107,6 +136,10 @@ class Config:
         if not val:
             return default or []
         return [item.strip() for item in val.split(',') if item.strip()]
+
+    def was_replaced(self, section: str, key: str) -> bool:
+        """判断指定 (section, key) 在 get 时是否被自动替换（如 screen_width 由 0 → 检测值）。"""
+        return (section, key) in self._replaced_keys
     def reload(self):
         self._load()
 

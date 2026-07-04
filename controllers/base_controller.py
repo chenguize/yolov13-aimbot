@@ -26,8 +26,8 @@ class BaseController(ABC):
         # -----------------------------
         # screen geometry
         # -----------------------------
-        w = self.config.getint("General", "screen_width", 1920)
-        h = self.config.getint("General", "screen_height", 1080)
+        w = self.config.getint("Hardware", "screen_width", 1920)
+        h = self.config.getint("Hardware", "screen_height", 1080)
         self.screen_center = (w / 2, h / 2)
 
         # -----------------------------

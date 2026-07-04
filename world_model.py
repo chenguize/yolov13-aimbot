@@ -176,7 +176,7 @@ class WorldModel:
         from controllers.controller_factory import get_controller
         self.controller = get_controller()
 
-        self.capture_size = config.getint("General", "capture_size", 256)
+        self.capture_size = config.getint("Hardware", "capture_size", 256)
         self.crop_center = self.capture_size / 2.0
         self.ego_pos_px = np.array([self.crop_center, self.crop_center], dtype=np.float64)
         self.track_manager = TrackManager()
@@ -192,7 +192,7 @@ class WorldModel:
         self.mode_threshold_high = config.getfloat("Controller", "mode_threshold_high", 50.0)
         self.mode_threshold_low = config.getfloat("Controller", "mode_threshold_low", 35.0)
 
-        self.base_hardware_lag = config.getfloat("WorldModel", "base_hardware_lag", 0.015)
+        self.base_hardware_lag = config.getfloat("Hardware", "base_hardware_lag", 0.015)
 
         self.smoothed_lead_time: float = self.base_hardware_lag
 
@@ -200,8 +200,8 @@ class WorldModel:
         #   Moonlight/串流/云：约 20–50ms，填 Moonlight 统计或 “主机→本机” 观感延迟。
         #   virtualhere / KMV：USB 等额外 2–8ms 可在此叠。
         self._stream_ingress_s = (
-            max(0.0, config.getfloat("WorldModel", "moonlight_latency_ms", 0.0))
-            + max(0.0, config.getfloat("WorldModel", "virtualhere_latency_ms", 0.0))
+            max(0.0, config.getfloat("Latency", "moonlight_latency_ms", 0.0))
+            + max(0.0, config.getfloat("Latency", "virtualhere_latency_ms", 0.0))
         ) / 1000.0
 
         # ==============================================================================
@@ -211,15 +211,15 @@ class WorldModel:
         self._latency_print_timer = 0.0
 
         # ── WAN 模式（Sunshine+Moonlight 远程串流）────────────────────────────
-        self._wan_mode = config.getbool("WorldModel", "wan_mode", False)
+        self._wan_mode = config.getbool("Latency", "wan_mode", False)
         if self._wan_mode:
             self._wan_min_latency_s = max(
                 0.010,
-                config.getfloat("WorldModel", "wan_min_latency_ms", 60.0) / 1000.0,
+                config.getfloat("Latency", "wan_min_latency_ms", 60.0) / 1000.0,
             )
             self._wan_jitter_s = max(
                 0.005,
-                config.getfloat("WorldModel", "wan_jitter_ms", 25.0) / 1000.0,
+                config.getfloat("Latency", "wan_jitter_ms", 25.0) / 1000.0,
             )
             # WAN: 自适应延迟范围放宽到 [5ms, 150ms]
             self._vh_lat_min = 0.005
@@ -283,7 +283,7 @@ class WorldModel:
         _predict_ahead = config.getbool("WorldModel", "predict_ahead", True)
         # 零延迟：本机无硬件延迟 + 无串流 + 非 WAN → 跳过全部延迟补偿管线
         _zero_latency = (
-            not config.getbool("WorldModel", "wan_mode", False)
+            not config.getbool("Latency", "wan_mode", False)
             and self._stream_ingress_s <= 0.0
             and self.base_hardware_lag <= 0.0
         )
@@ -308,8 +308,13 @@ class WorldModel:
             dx_counts, dy_counts = ring_buffer.get_cursor_delta_sum(self.last_ring_time, now)
         self.last_ring_time = now
 
+        # ego_pos_px is an accumulated world coordinate, not a screen-space
+        # offset. Incremental camera rotation is applied around screen center;
+        # using the unbounded world coordinate as a FOV Jacobian anchor makes
+        # the inverse gain explode as the camera keeps moving.
         px_dx, px_dy = self.strategy.reverse_map_velocity(
-            float(dx_counts), float(dy_counts), bbox_w=self.current_bbox_w
+            float(dx_counts), float(dy_counts),
+            px_x=0.0, px_y=0.0, bbox_w=self.current_bbox_w
         )
         self.ego_pos_px[0] += px_dx
         self.ego_pos_px[1] += px_dy
@@ -356,8 +361,11 @@ class WorldModel:
                     past_dx, past_dy = ring_buffer.get_cursor_delta_sum(
                         t_capture - _backtrack_lat, now
                     )
+                # Backtracking uses the same center-anchored incremental map
+                # as the forward ego integration above.
                 r_px_dx, r_px_dy = self.strategy.reverse_map_velocity(
-                    float(past_dx), float(past_dy), bbox_w=self.current_bbox_w
+                    float(past_dx), float(past_dy),
+                    px_x=0.0, px_y=0.0, bbox_w=self.current_bbox_w
                 )
                 ego_at_capture[0] -= r_px_dx
                 ego_at_capture[1] -= r_px_dy
@@ -433,8 +441,24 @@ class WorldModel:
                 self.ego_pos_px[:] = self.crop_center
             return
 
-        # 丢框后的 coast：coast_count 1~5 仍输出预测（短暂丢框），>5 才设 is_coasting
-        if best_track.coast_count > 5:
+        # A committed handoff motor program is intentionally open-loop. Keep
+        # its estimator alive through a short detector burst instead of cutting
+        # actuator power halfway through the transfer.
+        coast_limit = 5
+        takeover_state = str(getattr(
+            self.controller, 'takeover_state', 'ACTIVE_LOCK'
+        ))
+        handoff_reason = str(getattr(
+            self.controller, '_handoff_reason', ''
+        ))
+        if (
+            takeover_state in ('HUMAN_LEAD', 'REACTION', 'PRIMING')
+            and handoff_reason in ('human_override', 'human_release', 'legacy_flick_end')
+        ):
+            coast_limit = max(5, config.getint(
+                'Controller', 'cipher_handoff_coast_frames', 12
+            ))
+        if best_track.coast_count > coast_limit:
             context.is_coasting = True
             context.p_predict = None
             context.v_real = (0.0, 0.0)
@@ -452,34 +476,42 @@ class WorldModel:
                 vx, vy = self.ego_velocity_ema
                 speed_sq = vx ** 2 + vy ** 2
 
-                if speed_sq > 6400.0:
-                    time_error = (innov[0] * vx + innov[1] * vy) / speed_sq
-                    if self._wan_mode:
-                        time_error = np.clip(time_error, -0.025, 0.025)
-                        self.dynamic_vh_latency += self._vh_lat_alpha * time_error
-                        self.dynamic_vh_latency = float(np.clip(
-                            self.dynamic_vh_latency,
-                            max(self._vh_lat_min, self._wan_min_latency_s * 0.3),
-                            self._vh_lat_max,
-                        ))
-                        self._vh_lat_smoothed = (
-                            0.95 * self._vh_lat_smoothed + 0.05 * self.dynamic_vh_latency
-                        )
-                    else:
-                        time_error = np.clip(time_error, -0.015, 0.015)
-                        self.dynamic_vh_latency += 0.02 * time_error
-                        self.dynamic_vh_latency = np.clip(self.dynamic_vh_latency, self._vh_lat_min, self._vh_lat_max)
-
-                    if now - self._latency_print_timer > 1.0:
-                        _log.kalman_adaptive_latency(
-                            self.dynamic_vh_latency * 1000.0, wan_mode=self._wan_mode,
-                        )
+                # P1 修复：原门控 speed>80px/s 过松，把目标真实加速度带来的 innov 误
+                # 当作时间错位 → vh_latency 抖动。要求 ego 速度更高(>200px/s)且 innov
+                # 与 ego_v 强对齐(cos>0.85)，才认为是真的延迟误差。
+                _ADAPT_VEL_SQ = 40000.0  # 200 px/s 平方
+                if speed_sq > _ADAPT_VEL_SQ:
+                    innov_mag = float(np.linalg.norm(innov))
+                    v_mag = float(np.sqrt(speed_sq))
+                    cos_align = (innov[0] * vx + innov[1] * vy) / max(innov_mag * v_mag, 1e-9)
+                    if cos_align > 0.85:
+                        time_error = (innov[0] * vx + innov[1] * vy) / speed_sq
                         if self._wan_mode:
-                            _log.kalman_wan_jitter_safe(
-                                self._vh_lat_smoothed * 1000.0,
-                                self._wan_min_latency_s * 1000.0,
+                            time_error = np.clip(time_error, -0.025, 0.025)
+                            self.dynamic_vh_latency += self._vh_lat_alpha * time_error
+                            self.dynamic_vh_latency = float(np.clip(
+                                self.dynamic_vh_latency,
+                                max(self._vh_lat_min, self._wan_min_latency_s * 0.3),
+                                self._vh_lat_max,
+                            ))
+                            self._vh_lat_smoothed = (
+                                0.95 * self._vh_lat_smoothed + 0.05 * self.dynamic_vh_latency
                             )
-                        self._latency_print_timer = now
+                        else:
+                            time_error = np.clip(time_error, -0.015, 0.015)
+                            self.dynamic_vh_latency += 0.02 * time_error
+                            self.dynamic_vh_latency = np.clip(self.dynamic_vh_latency, self._vh_lat_min, self._vh_lat_max)
+
+                        if now - self._latency_print_timer > 1.0:
+                            _log.kalman_adaptive_latency(
+                                self.dynamic_vh_latency * 1000.0, wan_mode=self._wan_mode,
+                            )
+                            if self._wan_mode:
+                                _log.kalman_wan_jitter_safe(
+                                    self._vh_lat_smoothed * 1000.0,
+                                    self._wan_min_latency_s * 1000.0,
+                                )
+                            self._latency_print_timer = now
         elif not _predict_ahead:
             # 关闭预测：锁死自适应延迟为 0，并用固定硬件延迟做 ego 回溯
             self.dynamic_vh_latency = 0.0
@@ -594,6 +626,9 @@ class WorldModel:
             ctrl_lead = float(np.clip(ctrl_lead, 0.0, 0.250))
 
             # 更新 speed_scale: 用 Kalman 目标速度 vs 控制器上一帧 arm 速度
+            # P1 修复：原钳制 [0.80, 1.40] 太宽 + 无衰减回归 → 正反馈风险
+            # (tgt_spd 估计偏大 → scale 增大 → lead 增大 → 下帧 tgt_spd 更偏)。
+            # 改为：1) 缩窄钳制到 [0.90, 1.20]；2) 每帧向 1.0 衰减 0.5%，让长期无数据时回归中性。
             arm_vel = getattr(self.controller, 'crosshair_velocity', None)
             if arm_vel is not None:
                 arm_spd = float(np.linalg.norm(arm_vel))
@@ -601,19 +636,24 @@ class WorldModel:
                 if tgt_spd > 10.0 and arm_spd > 0.5:
                     # ratio > 1: 目标快但 arm 慢 → 响应不足 → 需要更大 lead
                     ratio = tgt_spd / max(arm_spd, 1.0)
-                    ratio_clamped = float(np.clip(ratio, 0.5, 2.0))
+                    ratio_clamped = float(np.clip(ratio, 0.7, 1.5))
                     self._ctrl_speed_scale = (
                         0.95 * self._ctrl_speed_scale + 0.05 * ratio_clamped
                     )
-                    self._ctrl_speed_scale = float(np.clip(self._ctrl_speed_scale, 0.80, 1.40))
+                    # P1 修复：缩窄钳制范围，抑制正反馈
+                    self._ctrl_speed_scale = float(np.clip(self._ctrl_speed_scale, 0.90, 1.20))
                     if now - self._ctrl_speed_print_timer > 2.0:
                         _log.ctrl_speed_scale_diag(self._ctrl_speed_scale, arm_spd, tgt_spd)
                         self._ctrl_speed_print_timer = now
+                else:
+                    # P1 修复：无显著运动时缓慢回归 1.0，避免历史偏差长期残留
+                    self._ctrl_speed_scale = 0.995 * self._ctrl_speed_scale + 0.005 * 1.0
 
             # ── Arrival-based calibration: 实测 AI 位移 vs 预期 ──────────────
             # 上一帧 controller 输出 arm_vel，MouseWorker 1000Hz 循环发送 SendInput。
             # 本帧从 ring_buffer 取出实际 AI 位移（总位移 − 人手位移），比较预期位移。
             # 若比例系统性地偏小 → 管道传输率低于预期 → 反比放大 ctrl_speed_scale。
+            # P1 修复：作为主校准源（不依赖 Kalman 估计），缩窄钳制范围与 speed_scale 一致
             prev_arm = self._prev_arm_vel_cts
             prev_arm_spd = float(np.linalg.norm(prev_arm))
             if prev_arm_spd > 50.0 and dt > 0.001:
@@ -633,13 +673,13 @@ class WorldModel:
                     if ai_spd > 3.0:
                         arrival_ratio = ai_spd / max(expected_spd, 1.0)
                         # arrival < 1: 输出未完全到达（管道吞吐不足）→ 需要更大 lead
-                        arrival_correction = 1.0 / max(arrival_ratio, 0.15)
+                        arrival_correction = 1.0 / max(arrival_ratio, 0.30)
                         self._ctrl_speed_scale = (
                             0.97 * self._ctrl_speed_scale
-                            + 0.03 * float(np.clip(arrival_correction, 0.5, 3.0))
+                            + 0.03 * float(np.clip(arrival_correction, 0.7, 1.5))
                         )
-                        # 钳制范围随模式：本地紧、WAN 宽
-                        _lo, _hi = (0.70, 1.60) if self._wan_mode else (0.80, 1.40)
+                        # P1 修复：缩窄钳制范围 [0.90, 1.20]，与 speed_scale 路径一致
+                        _lo, _hi = (0.85, 1.30) if self._wan_mode else (0.90, 1.20)
                         self._ctrl_speed_scale = float(np.clip(self._ctrl_speed_scale, _lo, _hi))
                         if now - self._arrival_calib_timer > 3.0:
                             _log.arrival_calib_diag(

@@ -9,8 +9,8 @@ def create_aim_strategy():
     """
     根据配置创建游戏专用瞄准策略实例
     """
-    game = config.getstr("General", "current_game", "valorant").lower()
-    package = config.getstr("AimStrategy", "strategy_package", game)
+    game = config.getstr("Game", "current_game", "valorant").lower()
+    package = config.getstr("Strategy", "strategy_package", game)
 
     try:
         if package == "valorant":

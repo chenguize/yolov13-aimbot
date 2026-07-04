@@ -20,8 +20,14 @@
 import math
 import threading
 import time
-from typing import Tuple
+from typing import Tuple, Optional
 import numpy as np
+
+try:
+    import win32api
+    _HAS_WIN32API = True
+except ImportError:
+    _HAS_WIN32API = False
 
 from config import config
 from output import gHub as output_device
@@ -100,7 +106,7 @@ class AIAgent:
         self.last_tick_time = time.perf_counter()
         self.frames_in_cycle = 0
 
-        self.enable_trigger = config.getbool("General", "enable_triggerbot", False)
+        self.enable_trigger = config.getbool("Triggerbot", "enable_triggerbot", False)
         self.trigger_fov = config.getfloat("Triggerbot", "trigger_fov_x", 3.0)
         self.trigger_conf = config.getfloat("Triggerbot", "trigger_conf_threshold", 0.50)
         self.last_shot_time = 0.0
@@ -112,10 +118,32 @@ class AIAgent:
         # ── 多帧确认计数器：首次锁目标前需连续 N 帧有效（防单帧噪声/误检锁假目标）──
         self._lock_confirm_count: int = 0
 
+        # ── Fire-gate 死亡确认（开枪门控 + 几何确认）──
+        # 开枪后 300ms 窗口内检测 bbox 高度坍缩 / 速度归零 → 确认死亡 → 释放锁定
+        # 组合「开枪事件」与「几何变化」消除单独使用时的假阳性
+        self._fire_gate_enable: bool = config.getbool("Aim", "fire_gate_enable", True)
+        self._fire_gate_duration: float = config.getfloat("Aim", "fire_gate_duration", 0.3)
+        self._fire_gate_height_ratio: float = config.getfloat("Aim", "fire_gate_height_ratio", 0.6)
+        self._fire_gate_vel_threshold: float = config.getfloat("Aim", "fire_gate_vel_threshold", 50.0)
+        self._fire_gate_penalty_duration: float = config.getfloat("Aim", "fire_gate_penalty_duration", 3.0)
+        self._fire_gate_detect_manual: bool = config.getbool("Aim", "fire_gate_detect_manual", True)
+        self._fire_gate_active: bool = False
+        self._fire_gate_start_time: float = 0.0
+        self._fire_gate_last_shot_time: float = 0.0
+        self._fire_gate_pre_bbox_h: float = 0.0
+        self._fire_gate_pre_vel_mag: float = 0.0
+        self._fire_gate_track_id: Optional[int] = None
+        self._manual_fire_pending: bool = False
+        self._prev_mouse_down: bool = False
+
         # ── 人机 Flick 状态检测 ──
         self._prev_human_flicking = False
+        # 重构新增：预测性 warm_start 状态（人手速度导数 → 预测放手时刻）
+        self._prev_human_speed_raw: float = 0.0
+        self._human_accel_ema: float = 0.0
 
         # ── 当前目标的 chase_mode（由首帧决定，丢失后下一个目标重判定）──
+        # 重构后：仍保留作诊断标签，由 alpha 派生
         self._current_chase_mode: str = 'pure_ai'
         # ── chase_mode 切换确认计数器（连续 N 帧满足条件才切换，防边界震荡）──
         self._mode_switch_confirm: int = 0
@@ -151,9 +179,155 @@ class AIAgent:
         """人手意图增量：委托 RingBuffer 自动处理后端差异。"""
         return self.ring_buffer.get_intent_delta(t_start, t_end)
 
+    def _target_velocity_counts(self, bbox_w: float = 60.0) -> np.ndarray:
+        vr = self.ctx.v_real
+        if vr is None:
+            return np.zeros(2, dtype=np.float64)
+        vx, vy = self.aim_strategy.calculate_velocity_move(
+            float(vr[0]), float(vr[1]),
+            px_x=0.0, px_y=0.0, bbox_w=bbox_w,
+        )
+        return np.array([vx, vy], dtype=np.float64)
+
+    def _publish_target_observation(self, visible: bool, confidence: float = 0.0):
+        if not hasattr(self.controller, 'observe_target'):
+            return
+        bbox_w = self.ctx.targets[0].w if self.ctx.targets else 60.0
+        velocity = self._target_velocity_counts(bbox_w) if visible else None
+        self.controller.observe_target(visible, velocity, confidence)
+
+    def _begin_controller_handoff(self, now: float, p_x: float, p_y: float,
+                                  bbox_w: float) -> bool:
+        if not hasattr(self.controller, 'begin_handoff'):
+            return False
+        hdx, hdy = self._intent_delta(now - 0.02, now)
+        hvx, hvy = self.aim_strategy.calculate_velocity_move(
+            hdx / 0.02, hdy / 0.02,
+            px_x=0.0, px_y=0.0, bbox_w=bbox_w,
+        )
+        ex, ey = self.aim_strategy.calculate_mouse_move(p_x, p_y, bbox_w=bbox_w)
+        self.controller.begin_handoff(
+            human_velocity=np.array([hvx, hvy], dtype=np.float64),
+            target_velocity=self._target_velocity_counts(bbox_w),
+            error=np.array([ex, ey], dtype=np.float64),
+            reason='human_release',
+        )
+        return True
+
     def _log_aim_lock(self, event: str, **fields) -> None:
         """委托集中化日志系统输出锁定诊断。"""
         logger.aim_lock(event, enabled=self._aim_lock_diag, **fields)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # § Fire-gate 死亡确认
+    #   开枪 → 300ms 确认窗口 → bbox 高度坍缩 / 速度归零 / 目标消失
+    #   → 确认死亡 → 释放锁定 + TrackManager 降权
+    #   组合「开枪事件」与「几何变化」，消除纯几何方案的假阳性
+    # ════════════════════════════════════════════════════════════════════════
+    def _detect_manual_fire(self, now: float) -> None:
+        """检测鼠标左键上升沿（人工开枪），设 pending 标志供 step 后处理。"""
+        if not self._fire_gate_enable or not self._fire_gate_detect_manual:
+            return
+        if not _HAS_WIN32API:
+            return
+        try:
+            VK_LBUTTON = 0x01
+            mouse_down = bool(win32api.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+        except Exception:
+            mouse_down = False
+        if mouse_down and not self._prev_mouse_down:
+            self._manual_fire_pending = True
+        self._prev_mouse_down = mouse_down
+
+    def _on_fire_event(self, now: float, source: str = "triggerbot") -> None:
+        """开枪事件：记录 pre-shot 目标状态，启动 / 延续确认窗口。"""
+        if not self._fire_gate_enable:
+            return
+        # 同一 burst 内的后续开枪：延续窗口但不覆盖 pre-shot 状态
+        if self._fire_gate_active and (now - self._fire_gate_last_shot_time) < self._fire_gate_duration:
+            self._fire_gate_last_shot_time = now
+            return
+        # 新 burst：从当前 best track 记录 pre-shot 状态
+        tm = self.world_model.track_manager
+        best_id = tm._last_best_id
+        if best_id is not None and best_id in tm.tracks:
+            track = tm.tracks[best_id]
+            self._fire_gate_pre_bbox_h = float(track.last_bbox[3] - track.last_bbox[1])
+            self._fire_gate_pre_vel_mag = float(np.linalg.norm(track.abs_velocity))
+            self._fire_gate_active = True
+            self._fire_gate_start_time = now
+            self._fire_gate_last_shot_time = now
+            self._fire_gate_track_id = best_id
+
+    def _check_fire_gate_confirmation(self, now: float) -> bool:
+        """检查是否确认目标死亡。返回 True = 确认死亡，调用方应释放锁定。"""
+        if not self._fire_gate_active:
+            return False
+
+        # 窗口过期 → 放弃（目标存活，继续 spray）
+        if (now - self._fire_gate_last_shot_time) > self._fire_gate_duration:
+            self._fire_gate_active = False
+            return False
+
+        tm = self.world_model.track_manager
+        best_id = tm._last_best_id
+
+        # 目标已切换（人手拉枪 / TrackManager 选了别的）→ 放弃
+        if best_id != self._fire_gate_track_id:
+            self._fire_gate_active = False
+            return False
+
+        # track 被 prune（彻底消失）→ 确认死亡
+        if self._fire_gate_track_id not in tm.tracks:
+            self._confirm_fire_gate_death(now, reason="track_lost")
+            return True
+
+        track = tm.tracks[self._fire_gate_track_id]
+
+        # ctx 无效（coast_count > 5，目标长时间丢框）→ 确认死亡
+        if not self.ctx.is_valid:
+            self._confirm_fire_gate_death(now, reason="invalid")
+            return True
+
+        # 几何确认：bbox 高度坍缩
+        cur_bbox_h = float(track.last_bbox[3] - track.last_bbox[1])
+        height_ratio = cur_bbox_h / max(self._fire_gate_pre_bbox_h, 1.0)
+        height_collapsed = height_ratio < self._fire_gate_height_ratio
+
+        # 几何确认：速度归零（开枪前在动，现在不动了）
+        cur_vel_mag = float(np.linalg.norm(track.abs_velocity))
+        vel_dropped = (self._fire_gate_pre_vel_mag > self._fire_gate_vel_threshold and
+                       cur_vel_mag < self._fire_gate_vel_threshold)
+
+        if height_collapsed or vel_dropped:
+            reason = "height_collapse" if height_collapsed else "vel_drop"
+            self._confirm_fire_gate_death(now, reason=reason)
+            return True
+
+        return False
+
+    def _confirm_fire_gate_death(self, now: float, reason: str) -> None:
+        """确认目标死亡：释放 agent 锁定 + 标记 TrackManager 降权。"""
+        self._fire_gate_active = False
+        self.target_first_seen_time = 0.0
+        self._lock_confirm_count = 0
+        self.is_target_in_crosshair = False
+
+        # 标记 TrackManager 对该 track 降权（3 秒内 select_best 排除）
+        tm = self.world_model.track_manager
+        if self._fire_gate_track_id is not None and self._fire_gate_track_id in tm.tracks:
+            tm.mark_track_death_penalty(
+                self._fire_gate_track_id,
+                self._fire_gate_penalty_duration,
+                now,
+            )
+
+        self._log_aim_lock(
+            "FIRE_GATE_DEATH", reason=reason,
+            track_id=self._fire_gate_track_id,
+            pre_h=round(self._fire_gate_pre_bbox_h, 1),
+            pre_vel=round(self._fire_gate_pre_vel_mag, 1),
+        )
 
     @staticmethod
     def _ctx_best_cls(ctx: InferenceContext) -> int:
@@ -170,10 +344,10 @@ class AIAgent:
             return
         st = self.aim_strategy
         bp = getattr(st, "bypass_mapping", None)
-        cap = int(self.crop_center * 2) if self.crop_center is not None else config.getint("General", "capture_size", 256)
-        mac = config.getfloat("General", "min_aim_conf", 0.32)
-        mdr = min(mac - 1e-3, config.getfloat("General", "min_aim_conf_drop", 0.20))
-        ninv = max(1, int(config.getint("General", "aim_drop_invalid_frames", 2)))
+        cap = int(self.crop_center * 2) if self.crop_center is not None else config.getint("Hardware", "capture_size", 256)
+        mac = config.getfloat("Aim", "min_aim_conf", 0.32)
+        mdr = min(mac - 1e-3, config.getfloat("Aim", "min_aim_conf_drop", 0.20))
+        ninv = max(1, int(config.getint("Aim", "aim_drop_invalid_frames", 2)))
         stream_ms = float(getattr(self.world_model, "_stream_ingress_s", 0.0)) * 1000.0
         _be = (config.getstr("Inference", "backend", "yolo") or "yolo").strip().lower()
         _model_disp = "HSV+contour (aimlab)" if _be in _AIMLAB_BACKENDS else config.getstr("Inference", "model_path", "")
@@ -193,11 +367,11 @@ class AIAgent:
             "WorldModel | predict_ahead=%s | False 时无时间前推，动目标/高延迟会偏「拖尾」，可对照过冲/穿零是否由 lead 引起",
             config.getbool("WorldModel", "predict_ahead", True),
         )
-        if stream_ms < 1.0 and config.getfloat("WorldModel", "moonlight_latency_ms", 0.0) < 0.5:
+        if stream_ms < 1.0 and config.getfloat("Latency", "moonlight_latency_ms", 0.0) < 0.5:
             logger.info(
                 "WorldModel | stream_ingress≈0：若用 Moonlight/云游戏仍摆/穿零，把 [WorldModel] moonlight_latency_ms 调到 25–45 再试"
             )
-        _hib = (config.getstr("General", "human_input_backend", "inputs") or "inputs").strip()
+        _hib = (config.getstr("Input", "human_input_backend", "inputs") or "inputs").strip()
         logger.info(
             "HumanInput | human_input_backend=%s | intent 由 RingBuffer.get_intent_delta() 统一处理",
             _hib,
@@ -305,13 +479,28 @@ class AIAgent:
                 self._freeze_mouse_motion()
                 self.last_tick_time = now
                 return
-    
+
+            # ── 人工开枪检测（step 前检测边沿，step 后记录 pre-shot 状态）──
+            self._detect_manual_fire(now)
+
             _t_wm0 = time.perf_counter()
             self.world_model.step(self.ctx, self.ring_buffer)
             _t_after_wm = time.perf_counter()
             self._dbg_wm_step_us = (_t_after_wm - _t_wm0) * 1e6
             self._dbg_after_wm_mono = _t_after_wm
-    
+
+            # ── Fire-gate 死亡确认（开枪后几何变化检测）──
+            if self._fire_gate_active:
+                if self._check_fire_gate_confirmation(now):
+                    self._freeze_mouse_motion()
+                    self.last_tick_time = now
+                    return
+
+            # ── 处理待记录的人工开枪事件（用 step 后的 track 记录 pre-shot 状态）──
+            if self._manual_fire_pending:
+                self._manual_fire_pending = False
+                self._on_fire_event(now, source="manual")
+
             # 关自瞄时仍跑 WM 推理，但绝不允许再发移动（原先只停扳机、仍会 compute → OU 白噪微颤）
             if not self.enable_aimbot:
                 self._freeze_mouse_motion()
@@ -352,7 +541,7 @@ class AIAgent:
                 self._invalid_streak = 0
     
             if invalid:
-                n_inv_drop = max(1, int(config.getint("General", "aim_drop_invalid_frames", 2)))
+                n_inv_drop = max(1, int(config.getint("Aim", "aim_drop_invalid_frames", 2)))
                 # Aimlab/HSV 色块会偶发 1~2 帧无有效框，General=2 时易拆锁 → 狂刷「Target acquired」+ reset_target_state
                 if getattr(self, "_is_aimlab_backend", False):
                     _aim_min = int(_rtd.AIMLAB_AIM_DROP_INVALID_MIN)
@@ -387,23 +576,32 @@ class AIAgent:
                 self.target_first_seen_time = 0.0
                 self._lock_confirm_count = 0
                 self.is_target_in_crosshair = False
+                self._publish_target_observation(False)
                 return
 
             # conf 滞回：未锁时须 ≥ min_aim_conf；已锁时须 ≥ min_aim_conf_drop 才继续，否者拆锁
             # 单阈值时 conf 在 0.30~0.38 间抖会每帧「丢→锁→reset」→ 日志狂刷 Target acquired
-            min_aim = config.getfloat("General", "min_aim_conf", 0.32)
+            min_aim = config.getfloat("Aim", "min_aim_conf", 0.32)
             min_drop = min(
                 min_aim - 1e-3,
-                config.getfloat("General", "min_aim_conf_drop", 0.20),
+                config.getfloat("Aim", "min_aim_conf_drop", 0.20),
             )
             if self.target_first_seen_time == 0.0:
                 if self.ctx.conf < min_aim:
                     self._lock_confirm_count = 0
                     self._freeze_mouse_motion()
                     return
+                # Begin perception/reaction on the first credible frame while
+                # lock confirmation continues independently.
+                self._publish_target_observation(True, self.ctx.conf)
                 # ── 三帧确认计数：目标需连续 N 帧有效后才锁定，防止单帧噪声/误检锁假目标 ──
-                lock_need = max(1, int(config.getint("General", "aim_lock_confirm_count", 3)))
+                lock_need = max(1, int(config.getint("Aim", "aim_lock_confirm_count", 3)))
                 self._lock_confirm_count += 1
+                if (
+                    getattr(self.controller, '_handoff_reason', '') == 'human_release'
+                    and getattr(self.controller, 'takeover_state', '') == 'REACTION'
+                ):
+                    self._lock_confirm_count = lock_need
                 if self._lock_confirm_count < lock_need:
                     if self._aim_lock_diag:
                         self._log_aim_lock(
@@ -416,7 +614,11 @@ class AIAgent:
                     self._freeze_mouse_motion()
                     return
             else:
-                if self.ctx.conf < min_drop:
+                handoff_state = getattr(
+                    self.controller, 'takeover_state', 'ACTIVE_LOCK'
+                )
+                if (self.ctx.conf < min_drop
+                        and handoff_state not in ('HUMAN_LEAD', 'REACTION', 'PRIMING')):
                     self._log_aim_lock(
                         "DROP",
                         reason="conf",
@@ -429,41 +631,69 @@ class AIAgent:
                     self.target_first_seen_time = 0.0
                     self._lock_confirm_count = 0
                     self.is_target_in_crosshair = False
+                    self._publish_target_observation(False)
                     return
     
             c = self.controller
-            # ── 首次见到目标：决定 chase_mode 并 reset controller ───────────
+            # ── 首次见到目标：决定 alpha_target 并 reset controller ───────────
+            # 重构：原 chase_mode 二值判定 → alpha 连续调度
             first_frame = (self.target_first_seen_time == 0.0)
             if first_frame:
                 self._intent_tracker.reset()
                 self.target_first_seen_time = now
-                # Bug B 修：按最近 100ms 人类速度判定模式
-                #   实战大部分场景是"人拉枪到 256px 内 AI 接管" → human_flick
-                #   目标自己走进 FOV（被动追）→ pure_ai
+                # 按最近 100ms 人类速度计算 alpha_target
+                #   speed > 500 px/s → 人拉枪中 → alpha=0.0 (human_flick)
+                #   speed < 100 px/s → AI 独立瞄准 → alpha=1.0 (pure_ai)
+                #   中间值线性插值
                 dx_100, dy_100 = self._intent_delta(now - 0.1, now)
                 recent_speed = math.hypot(dx_100, dy_100) / 0.1
-                self._current_chase_mode = 'human_flick' if recent_speed > 500.0 else 'pure_ai'
+                alpha_target = float(np.clip(
+                    1.0 - (recent_speed - 100.0) / 400.0, 0.0, 1.0
+                ))
+                handoff_in_progress = (
+                    getattr(self.controller, '_handoff_reason', '') == 'human_release'
+                    and getattr(self.controller, 'takeover_state', '') in (
+                        'REACTION', 'PRIMING', 'ACTIVE_LOCK'
+                    )
+                )
+                if handoff_in_progress:
+                    alpha_target = 1.0
+                # 兼容旧 _current_chase_mode 字符串（用于日志/诊断）
+                self._current_chase_mode = 'pure_ai' if alpha_target > 0.5 else 'human_flick'
+
+                # 用新接口 set_blend_alpha 优先；老接口 reset_target_state 兜底
+                if hasattr(self.controller, 'set_blend_alpha'):
+                    if handoff_in_progress:
+                        init_state = getattr(
+                            self.controller, 'takeover_state', 'REACTION'
+                        )
+                    else:
+                        init_state = 'HUMAN_LEAD' if alpha_target < 0.3 else 'ACTIVE_LOCK'
+                    self.controller.set_blend_alpha(alpha_target, takeover_state=init_state)
                 if hasattr(self.controller, 'reset_target_state'):
                     try:
-                        self.controller.reset_target_state(mode=self._current_chase_mode)
+                        self.controller.reset_target_state(
+                            mode=self._current_chase_mode, hard=False
+                        )
                     except TypeError:
                         self.controller.reset_target_state()
-                # ── 确认控制器 chase_mode 已生效 ──
+
                 ctrl_chase = getattr(self.controller, 'chase_mode', None)
                 if ctrl_chase is not None and ctrl_chase != self._current_chase_mode:
                     logger.error(
-                        "chase_mode 切换失败！agent=%s controller=%s",
+                        "chase_mode 切换失败！agent=%s controller=%s (alpha=%.2f)",
                         self._current_chase_mode, ctrl_chase,
+                        getattr(self.controller, 'alpha', -1.0),
                     )
                 else:
                     logger.info(
-                        "chase_mode 确认: agent=%s controller=%s (human_speed=%.0f px/s)",
-                        self._current_chase_mode, ctrl_chase, recent_speed,
+                        "alpha 接管: agent=%s alpha=%.2f (human_speed=%.0f px/s)",
+                        self._current_chase_mode, alpha_target, recent_speed,
                     )
                 self._n_target_acquire_logs += 1
                 _acq_n = self._n_target_acquire_logs
-                _msg = "Target acquired (mode=%s, human_speed_100ms=%.0f)" % (
-                    self._current_chase_mode, recent_speed
+                _msg = "Target acquired (alpha=%.2f, human_speed_100ms=%.0f)" % (
+                    alpha_target, recent_speed
                 )
                 if _acq_n == 1 or config.getbool("Debug", "aim_reacquire_log", False):
                     logger.info(_msg)
@@ -480,30 +710,44 @@ class AIAgent:
                     cls=self._ctx_best_cls(self.ctx),
                 )
 
-            # ── chase_mode 持续更新：人放手后自动切 pure_ai ──────────────────
-            # 原逻辑只在首帧判定一次。按人类速度连续调度：
-            #   human_flick 模式 + 人最近 80ms 速度 < FLICK_END_PX_S → 切 pure_ai
-            # warm_start 在 flick_end 侦测点统一处理，此处不再重复。
-            FLICK_END_PX_S = 450.0  # 唯一阈值，与 flick_end 侦测共用
-            if self._current_chase_mode == 'human_flick':
-                _recent_dx, _recent_dy = self._intent_delta(now - 0.08, now)
-                _recent_spd = math.hypot(_recent_dx, _recent_dy) / 0.08
-                # ── 3 帧滞回：连续满足条件才切换，防止人手在 450px/s 边界微操导致震荡 ──
-                if _recent_spd < FLICK_END_PX_S and (now - self.target_first_seen_time) > 0.15:
-                    self._mode_switch_confirm += 1
-                    if self._mode_switch_confirm >= 3:
-                        _prev_mode = self._current_chase_mode
-                        self._current_chase_mode = 'pure_ai'
-                        self._flick_end_time = now
-                        self._mode_switch_confirm = 0
-                        logger.info(
-                            "chase_mode 切换: %s → %s (human_speed=%.0f < %.0f px/s, age=%.0f ms)",
-                            _prev_mode, self._current_chase_mode,
-                            _recent_spd, FLICK_END_PX_S,
-                            (now - self.target_first_seen_time) * 1000.0,
-                        )
-                else:
-                    self._mode_switch_confirm = 0
+            # ── alpha 持续调度：速度基础 + 加速度触发的提前让位（v5.0 升级）────
+            # 原版（线性）: alpha = 1 - speed/500，斜率固定 → flick 启动也让位 0.6
+            # 新版（外科）: 速度部分保持线性（不破坏稳态 natural），
+            #               加速度触发额外的提前让位（最多 0.10，flick 启动时 α 急降）
+            #   - 慢动 (speed=100, acc=0)  → alpha=0.80 (与原版同)
+            #   - flick 启动 (speed=200, acc=800) → alpha=0.42 (从 0.60 提前让位 0.18)
+            #   - 强 flick (speed=500+)   → alpha=0.0 (与原版同)
+            # 物理意义：flick 启动瞬间 acc_proxy 暴涨（30ms 速度 >> 80ms 速度），
+            #           触发 alpha 提前下降 → AI 让位更早，避免"拉锯"
+            # 与 sim_agent.py 同步
+            FLICK_END_PX_S = 450.0
+            _recent_dx, _recent_dy = self._intent_delta(now - 0.08, now)
+            _recent_spd = math.hypot(_recent_dx, _recent_dy) / 0.08
+            _30ms_dx, _30ms_dy = self._intent_delta(now - 0.03, now)
+            _30ms_spd = math.hypot(_30ms_dx, _30ms_dy) / 0.03
+            _inst_dx, _inst_dy = self._intent_delta(now - dt, now)
+            _inst_spd = math.hypot(_inst_dx, _inst_dy) / max(dt, 1e-6)
+            _acc_proxy = max(0.0, _30ms_spd - _recent_spd)
+            _speed_alpha = 1.0 - min(1.0, _recent_spd / 500.0)
+            _speed_gate = 1.0 / (1.0 + math.exp(-(_recent_spd - 150.0) / 40.0))
+            _acc_drop = min(0.10, _acc_proxy / 2000.0) * _speed_gate
+            _new_alpha_target = float(np.clip(_speed_alpha - _acc_drop, 0.0, 1.0))
+            # 接管状态机：根据 alpha_target 和当前状态决定切换
+            _cur_state = getattr(self.controller, 'takeover_state', 'ACTIVE_LOCK')
+            _new_state = None
+            if (_new_alpha_target < 0.2 and _inst_spd > 100.0
+                    and _cur_state != 'HUMAN_LEAD'):
+                _new_state = 'HUMAN_LEAD'
+            elif _new_alpha_target > 0.8 and _cur_state == 'HUMAN_LEAD':
+                _new_state = 'POST_TAKEOVER'
+                self._flick_end_time = now
+            elif _new_alpha_target > 0.5 and _cur_state == 'POST_TAKEOVER':
+                _new_state = 'ACTIVE_LOCK'
+
+            if hasattr(self.controller, 'set_blend_alpha'):
+                self.controller.set_blend_alpha(_new_alpha_target, takeover_state=_new_state)
+            # 兼容旧字段
+            self._current_chase_mode = 'pure_ai' if _new_alpha_target > 0.5 else 'human_flick'
 
             # p_predict 须紧跟首帧/锁逻辑之后，避免 1kHz 在本帧里多跑上帧 arm_vel/OU
             p_x = self.ctx.p_predict[0]
@@ -528,23 +772,32 @@ class AIAgent:
             intent_x, intent_y = self.aim_strategy.calculate_mouse_move(p_x, p_y, bbox_w=bbox_w)
     
             v_real_pixels = self.ctx.v_real
+            # The crosshair/camera axis is fixed at screen center. Velocity
+            # commands are incremental camera rotations, so their Jacobian is
+            # center-anchored; target offset belongs only to position mapping.
             intent_vx, intent_vy = self.aim_strategy.calculate_velocity_move(
-                v_real_pixels[0], v_real_pixels[1], bbox_w=bbox_w
+                v_real_pixels[0], v_real_pixels[1],
+                px_x=0.0, px_y=0.0, bbox_w=bbox_w
             )
             a_real_pixels = getattr(self.ctx, 'a_real', (0.0, 0.0))
             intent_ax, intent_ay = self.aim_strategy.calculate_velocity_move(
-                a_real_pixels[0], a_real_pixels[1], bbox_w=bbox_w
+                a_real_pixels[0], a_real_pixels[1],
+                px_x=0.0, px_y=0.0, bbox_w=bbox_w
             )
     
             # ── spatial_factor: 越近目标越放权，越远越收敛 ──
             spatial_factor = float(np.clip(1.0 - (pixel_error_dist / 800.0) ** 2, 0.1, 1.0))
     
             # ── reaction_factor: AI 接管后的视觉反应斜坡 ──
-            if self._current_chase_mode == 'pure_ai':
+            # 重构：alpha=1 (pure_ai) → 1.0；alpha=0 (human) → 0.30~1.0 渐升
+            _alpha_now = getattr(self.controller, 'alpha', 1.0)
+            if _alpha_now > 0.95:
                 reaction_factor = 1.0
             else:
                 t_ref = self._flick_end_time if self._flick_end_time > 0.0 else self.target_first_seen_time
-                reaction_factor = float(np.clip((now - t_ref) / 0.03, 0.30, 1.0))
+                reaction_factor_full = float(np.clip((now - t_ref) / 0.03, 0.30, 1.0))
+                # alpha=1 → 1.0；alpha=0 → reaction_factor_full
+                reaction_factor = _alpha_now * 1.0 + (1.0 - _alpha_now) * reaction_factor_full
     
             # ── 人手意图 → AI 权重（唯一融合点：方向感知 + 非对称响应 + 紧急通道）──
             ai_weight = self._intent_tracker.update(
@@ -573,18 +826,83 @@ class AIAgent:
                         emergency=getattr(s, '_emergency_active', False),
                     )
     
-            # ── 人类甩枪结束沿检测 → 通知控制器清积分 ──────────────────────
-            # 固定门限 450px/s：低于此值即判定人已放手。
-            # 热启动速度 = 人速 × 0.7 + 目标速 × 0.3（人速为主，保证接管连续）
+            # ── 预测性 warm_start：人手速度导数 → 预测放手时刻 → 提前预热 ──
+            # 替代原 flick_end 事后检测，把接管延迟从 30-50ms → 5ms
+            # 检测条件：人手速度 EMA > 500 px/s + 减速度 < -2000 px/s²
+            #          → 预测 T_predict = speed / |accel| < 50ms 内会放手
             FLICK_END_PX_S = 450.0
             cur_human_flicking = human_speed_raw > FLICK_END_PX_S
+            # 计算人手速度的导数（减速度）
+            human_accel = (human_speed_raw - self._prev_human_speed_raw) / max(dt, 0.001)
+            # EMA 平滑减速度
+            self._human_accel_ema = 0.8 * self._human_accel_ema + 0.2 * human_accel
+            self._prev_human_speed_raw = human_speed_raw
+
+            # 预测性预热：人手强减速 + 高速 → 即将放手
+            if (human_speed_raw > 500.0
+                    and self._human_accel_ema < -2000.0
+                    and hasattr(self.controller, 'pre_warm')):
+                # 预测 T_predict 秒后放手
+                t_predict = human_speed_raw / max(abs(self._human_accel_ema), 1.0)
+                if t_predict < 0.05:  # 50ms 内放手
+                    # 提前预热：用 Kalman 目标速度作种子
+                    vr = self.ctx.v_real
+                    if vr is not None:
+                        try:
+                            k = getattr(self.aim_strategy, 'k_factor_x', 1.0)
+                            tgt_v_arr = np.array(
+                                [float(vr[0]) * k, float(vr[1]) * k],
+                                dtype=np.float64,
+                            )
+                            # 预热混合系数：t_predict 越小，预热越强
+                            blend = float(np.clip(1.0 - t_predict / 0.05, 0.0, 0.5))
+                            self.controller.pre_warm(tgt_v_arr, blend_factor=blend)
+                            if config.getbool("Debug", "pre_warm_log", False):
+                                logger.info(
+                                    "pre_warm: t_predict=%.0fms, blend=%.2f, tgt_v=[%.0f,%.0f]",
+                                    t_predict * 1000.0, blend,
+                                    tgt_v_arr[0], tgt_v_arr[1],
+                                )
+                        except Exception as e:
+                            logger.debug("pre_warm failed: %s", e)
+
+            # 实际放手检测：触发方向感知 warm_start（替代固定 0.7/0.3 系数）
             if self._prev_human_flicking and not cur_human_flicking:
                 self._flick_end_time = now  # reaction_factor 计时起点
-                if hasattr(self.controller, 'notify_flick_end'):
+                handoff_started = False
+                try:
+                    handoff_started = self._begin_controller_handoff(
+                        now, p_x, p_y, bbox_w
+                    )
+                except Exception as e:
+                    logger.debug("begin_handoff failed: %s", e)
+                if not handoff_started and hasattr(self.controller, 'notify_flick_end'):
                     self.controller.notify_flick_end()
-                if hasattr(self.controller, 'warm_start_from_velocity'):
+                # 优先用方向感知 warm_start
+                if (not handoff_started
+                        and hasattr(self.controller, 'warm_start_from_velocity_directional')):
                     try:
-                        # 人手残余速度（瞬时，20ms 窗口）
+                        _hdx, _hdy = self._intent_delta(now - 0.02, now)
+                        human_vx_inst = _hdx / 0.02
+                        human_vy_inst = _hdy / 0.02
+                        vr = self.ctx.v_real
+                        if vr is not None:
+                            k = getattr(self.aim_strategy, 'k_factor_x', 1.0)
+                            tgt_vx = float(vr[0]) * k
+                            tgt_vy = float(vr[1]) * k
+                        else:
+                            tgt_vx = tgt_vy = 0.0
+                        self.controller.warm_start_from_velocity_directional(
+                            human_vx_inst, human_vy_inst,
+                            tgt_vx, tgt_vy,
+                            p_x, p_y,
+                        )
+                    except Exception as e:
+                        logger.debug("warm_start_directional failed: %s", e)
+                elif (not handoff_started
+                      and hasattr(self.controller, 'warm_start_from_velocity')):
+                    # 老接口兜底
+                    try:
                         _hdx, _hdy = self._intent_delta(now - 0.02, now)
                         human_v_inst = np.array([_hdx / 0.02, _hdy / 0.02],
                                                 dtype=np.float64)
@@ -736,9 +1054,12 @@ class AIAgent:
             return
 
         # Bug C 修：异步 fire，主 tick 立即返回，不再被 30ms sleep 阻塞
-        raw_click = random.gauss(0.03, 0.005)
+        # P0 修复：原 random.gauss 未 import random，触发即 NameError。改用 np.random.normal
+        raw_click = float(np.random.normal(0.03, 0.005))
         self.trigger_worker.fire(raw_click)
         self.last_shot_time = now
+        # ── Fire-gate: 记录开枪事件 ──
+        self._on_fire_event(now, source="triggerbot")
 
     # ────────────────────────────────────────────────────────────────────
     def _print_stats(self):

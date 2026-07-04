@@ -97,10 +97,10 @@ class RingBuffer:
         """懒加载：判断是否需要 subtract_injected_ai。"""
         if not hasattr(self, '_sub_ai_checked'):
             from config import config
-            b = (config.getstr("General", "human_input_backend", "inputs") or "inputs").strip().lower()
+            b = (config.getstr("Input", "human_input_backend", "inputs") or "inputs").strip().lower()
             self._sub_ai_enabled = (
                 b in ("pyn", "pynput", "hook")
-                and config.getbool("General", "human_intent_subtract_ai", True)
+                and config.getbool("Input", "human_intent_subtract_ai", True)
             )
             self._sub_ai_checked = True
         return self._sub_ai_enabled

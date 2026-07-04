@@ -35,7 +35,7 @@ class HumanMouseListener(threading.Thread):
         super().__init__(name="RawInputListener", daemon=True)
         self.ring_buffer = ring_buffer
         self.shutdown_evt = shutdown_evt
-        b = (config.getstr("General", "human_input_backend", "inputs") or "inputs").strip().lower()
+        b = (config.getstr("Input", "human_input_backend", "inputs") or "inputs").strip().lower()
         if b in ("pyn", "pynput", "hook"):
             b = "pynput"
         else:

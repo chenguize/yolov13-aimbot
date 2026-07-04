@@ -16,11 +16,11 @@ class CaptureThread(threading.Thread):
         self.shutdown_event = shutdown_event
         self.frame_ready_event = frame_ready_event
 
-        self.target_fps = config.getint("General", "capture_fps_target", 240)
-        self.capture_size = config.getint("General", "capture_size", 256)
+        self.target_fps = config.getint("Hardware", "capture_fps_target", 240)
+        self.capture_size = config.getint("Hardware", "capture_size", 256)
 
-        sw = config.getint("General", "screen_width", 1920)
-        sh = config.getint("General", "screen_height", 1080)
+        sw = config.getint("Hardware", "screen_width", 1920)
+        sh = config.getint("Hardware", "screen_height", 1080)
         self.center_x, self.center_y = sw // 2, sh // 2
 
         half = self.capture_size // 2

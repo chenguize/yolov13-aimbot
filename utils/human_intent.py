@@ -72,6 +72,20 @@ class HumanIntentTracker:
             "General", "intent_emergency_speed_px_s",
             getattr(_rtd, "INTENT_EMERGENCY_SPEED_PX_S", 1500.0),
         )
+        # ── jerk² 快速触发（v5.0 升级，捕捉运动起步）─────────────────────────
+        # 检测加速度的导数（jerk²）来识别"刚启动"的人类输入。
+        # 速度触发有 EMA 平滑延迟（tau=45ms），jerk² 在 5-10ms 内就能识别急动量。
+        # 仅作为辅助通道，不替代速度触发（持续对抗仍走速度路径）。
+        self.jerk_emergency_enabled = config.getbool(
+            "General", "intent_jerk_emergency_enabled",
+            getattr(_rtd, "INTENT_JERK_EMERGENCY_ENABLED", True),
+        )
+        # jerk 阈值（px/s³）：人手 flick 起步时 acc 上升 → jerk 峰值 ~1-2e7
+        # 噪声 + 正常扫视的 jerk² 一般 < 5e6，所以 1e7 是个安全门槛
+        self.jerk_threshold = config.getfloat(
+            "General", "intent_jerk_threshold_px_s3",
+            getattr(_rtd, "INTENT_JERK_THRESHOLD_PX_S3", 10_000_000.0),
+        )
         # 退出速度：人手降到以下才允许退出紧急
         self.emergency_exit_speed = config.getfloat(
             "General", "intent_emergency_exit_speed_px_s",
@@ -129,6 +143,13 @@ class HumanIntentTracker:
         self._persist_dist: float = 0.0
         # 紧急入口判定用人速 EMA（与诊断 _speed_ema 分离：后者 30ms 偏快）
         self._emergency_spd_ema: float = 0.0
+        # ── jerk² 快速触发状态（v5.0 升级）────────────────────────────
+        # 跟踪上一帧的速度和加速度，用 (v_curr - v_prev)/dt = acc, (acc - acc_prev)/dt = jerk
+        self._last_human_vx: float = 0.0
+        self._last_human_vy: float = 0.0
+        self._last_acc_x: float = 0.0
+        self._last_acc_y: float = 0.0
+        self._jerk_init: bool = False  # 首帧保护：acc/jerk 需先有初值再算
 
     def _enter_emergency(self, now: float) -> None:
         """进入紧急通道。"""
@@ -219,9 +240,49 @@ class HumanIntentTracker:
         is_opposing = dot < self.oppose_cos
 
         if is_opposing:
+            # ── jerk² 快速触发（v5.0 升级，运动起步识别）─────────────────────
+            # 在速度 EMA 之前先看 jerk：人手 flick 起步时 acc 急升 → jerk 峰值
+            # 在 ~5-10ms 内就能识别，比 45ms EMA 速度快 20-30ms 触发紧急
+            if (self.jerk_emergency_enabled
+                    and self._jerk_init
+                    and dt > 1e-5
+                    and ai_dist <= self.skip_persist_emergency_dist):
+                # acc = (v_curr - v_prev) / dt
+                acc_x = (human_vx - self._last_human_vx) / dt
+                acc_y = (human_vy - self._last_human_vy) / dt
+                # jerk = (acc - acc_prev) / dt
+                jerk_x = (acc_x - self._last_acc_x) / dt
+                jerk_y = (acc_y - self._last_acc_y) / dt
+                jerk_mag = math.hypot(jerk_x, jerk_y)
+                if jerk_mag > self.jerk_threshold:
+                    # jerk 方向应该和 human_v 一致（acc 在上升）→ 真正急动量
+                    jerk_dir_x = jerk_x / jerk_mag if jerk_mag > 1e-6 else 0.0
+                    jerk_dir_y = jerk_y / jerk_mag if jerk_mag > 1e-6 else 0.0
+                    human_dir_x = human_vx / human_speed
+                    human_dir_y = human_vy / human_speed
+                    jerk_aligned = (jerk_dir_x * human_dir_x + jerk_dir_y * human_dir_y) > 0.5
+                    if jerk_aligned:
+                        self._enter_emergency(now)
+                        # 更新状态后返回（重要：避免被速度逻辑再次覆盖）
+                        self._last_human_vx = human_vx
+                        self._last_human_vy = human_vy
+                        self._last_acc_x = acc_x
+                        self._last_acc_y = acc_y
+                        return 0.0
+                # 更新 acc 状态供下帧计算 jerk
+                self._last_acc_x = acc_x
+                self._last_acc_y = acc_y
+            elif not self._jerk_init:
+                # 首帧：初始化 acc 为当前 v/dt
+                self._jerk_init = True
+                self._last_acc_x = human_vx / max(dt, 1e-3)
+                self._last_acc_y = human_vy / max(dt, 1e-3)
+
             # 速度触发：EMA 人速够快 + 方向对抗 → 紧急（抑单帧尖峰）
             if spd_emg > self.emergency_speed:
                 self._enter_emergency(now)
+                self._last_human_vx = human_vx
+                self._last_human_vy = human_vy
                 return 0.0
 
             # 持久化兜底：仅在小误差 + 明显人手对抗时启用；大误差时「对抗」多为扫视/减账残差
@@ -234,6 +295,8 @@ class HumanIntentTracker:
                 if (self._persist_frames >= self.emergency_persist_frames
                         and self._persist_dist > self.emergency_persist_dist):
                     self._enter_emergency(now)
+                    self._last_human_vx = human_vx
+                    self._last_human_vy = human_vy
                     return 0.0
             else:
                 self._persist_frames = 0
@@ -242,6 +305,10 @@ class HumanIntentTracker:
             # 非对抗方向 → 重置持久化计数器
             self._persist_frames = 0
             self._persist_dist = 0.0
+
+        # ── 更新 jerk 状态（无论是否触发，都为下帧准备）──
+        self._last_human_vx = human_vx
+        self._last_human_vy = human_vy
 
         # ═══════════════════════════════════════════════════════════════════
         # 正常层：连续 α 融合
@@ -275,3 +342,9 @@ class HumanIntentTracker:
         self._emergency_exit_until = 0.0
         self._persist_frames = 0
         self._persist_dist = 0.0
+        # jerk² 状态重置
+        self._last_human_vx = 0.0
+        self._last_human_vy = 0.0
+        self._last_acc_x = 0.0
+        self._last_acc_y = 0.0
+        self._jerk_init = False
