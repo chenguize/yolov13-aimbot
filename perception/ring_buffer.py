@@ -203,7 +203,9 @@ class RingBuffer:
                     ai_path += distance
                 else:
                     human_path += distance
-        if not self._check_sub_ai():
+        # pynput reconciled 模式：核销残余可能包含 AI 回显，用 path 减法兜底
+        # inputs 模式：人手事件是纯物理轴，不需要减法
+        if not self._check_sub_ai() and not self._observed_events_reconciled:
             return human_path
         return max(0.0, human_path - ai_path)
 
