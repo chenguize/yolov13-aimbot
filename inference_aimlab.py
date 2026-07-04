@@ -95,46 +95,66 @@ def detect_ball_bgr(
     if not significant:
         return None
 
-    def _centroid(ctr) -> Optional[Tuple[float, float]]:
-        m = cv2.moments(ctr)
-        d = float(m.get("m00", 0.0))
-        if d <= 1e-6:
-            return None
-        return float(m["m10"] / d), float(m["m01"] / d)
+    def _candidate(ctr):
+        area = float(cv2.contourArea(ctr))
+        perimeter = float(cv2.arcLength(ctr, True))
+        x, y, bw, bh = cv2.boundingRect(ctr)
+        hull_area = float(cv2.contourArea(cv2.convexHull(ctr)))
+        circularity = (
+            4.0 * np.pi * area / (perimeter * perimeter)
+            if perimeter > 1e-6 else 0.0
+        )
+        solidity = area / hull_area if hull_area > 1e-6 else 0.0
 
-    # 同色准星/中心点常与红球分不开：若最大连通域质心在准星附近，p_predict→0 鼠标不动
-    def _dist2_center(ctr) -> float:
-        g = _centroid(ctr)
-        if g is None:
-            return 1e9
-        return float(np.hypot(g[0] - cx0, g[1] - cy0))
+        # Fill the component before distance transform. This removes HSV holes
+        # from highlights while the maximum inscribed circle ignores thin
+        # same-colour crosshair arms attached to the ball.
+        component = np.zeros((bh + 2, bw + 2), dtype=np.uint8)
+        shifted = ctr.astype(np.int32).copy()
+        shifted[:, 0, 0] += 1 - x
+        shifted[:, 0, 1] += 1 - y
+        cv2.drawContours(component, [shifted], -1, 255, thickness=-1)
+        distance = cv2.distanceTransform(component, cv2.DIST_L2, 5)
+        _, radius, _, max_loc = cv2.minMaxLoc(distance)
+        center_x = float(x + max_loc[0] - 1)
+        center_y = float(y + max_loc[1] - 1)
+        near_center = np.hypot(center_x - cx0, center_y - cy0) < float(
+            ignore_center_margin_px
+        )
 
-    def _is_near_crosshair(ctr) -> bool:
-        return _dist2_center(ctr) < float(ignore_center_margin_px)
+        min_core = max(2.0, np.sqrt(float(min_area) / np.pi) * 0.75)
+        shape_like_ball = circularity >= 0.32 and solidity >= 0.62
+        strong_round_core = radius >= max(4.0, min_core * 1.5)
+        ball_like = radius >= min_core and (shape_like_ball or strong_round_core)
+        score = radius * 12.0 + np.sqrt(max(area, 0.0)) + 4.0 * circularity
+        return {
+            "contour": ctr,
+            "area": area,
+            "center": (center_x, center_y),
+            "radius": float(radius),
+            "near_center": bool(near_center),
+            "ball_like": bool(ball_like),
+            "score": float(score),
+        }
 
-    significant.sort(key=cv2.contourArea, reverse=True)
-    best = significant[0]
-    if _is_near_crosshair(best) and len(significant) >= 2:
-        # 有更大/或其它候选时，优先用「质心不在准星盘」的实例（通常是远处小球）
-        alt = next((c for c in significant[1:] if not _is_near_crosshair(c)), None)
-        if alt is not None and cv2.contourArea(alt) >= 0.35 * cv2.contourArea(best):
-            best = alt
-
-    # 所有连通域都挤在准星上（例如框里只有准星、球不在 ROI）：交给上层当「无球」
-    if (
-        reject_if_only_center_blobs
-        and len(significant) >= 1
-        and all(_is_near_crosshair(c) for c in significant)
-    ):
+    candidates = [_candidate(ctr) for ctr in significant]
+    if reject_if_only_center_blobs:
+        # Keep the old permissive behaviour away from the crosshair. At the
+        # center, require a round core instead of rejecting every observation.
+        candidates = [
+            c for c in candidates if not c["near_center"] or c["ball_like"]
+        ]
+    if not candidates:
         return None
 
-    area = float(cv2.contourArea(best))
-    if area < float(min_area):
-        return None
-
-    x, y, bw, bh = cv2.boundingRect(best)
-    x1, y1 = float(x), float(y)
-    x2, y2 = float(x + bw), float(y + bh)
+    best = max(candidates, key=lambda c: c["score"])
+    area = best["area"]
+    center_x, center_y = best["center"]
+    radius = max(best["radius"], 1.0)
+    x1 = float(np.clip(center_x - radius, 0.0, w - 1.0))
+    y1 = float(np.clip(center_y - radius, 0.0, h - 1.0))
+    x2 = float(np.clip(center_x + radius, x1 + 1.0, float(w)))
+    y2 = float(np.clip(center_y + radius, y1 + 1.0, float(h)))
     # 面积占画面比例高 → 置信略高；小球通常只占一小部分
     rel = (area / float(h * w)) if (h * w) > 0 else 0.0
     conf = float(np.clip(0.4 + 0.55 * min(1.0, rel * 50.0), 0.35, 0.99))
