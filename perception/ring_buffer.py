@@ -33,6 +33,10 @@ class RingBuffer:
         self._sub_ai_enabled: bool = False  # 由 use_subtract_ai() 延迟初始化
         self._observed_events_reconciled = False
         self._echo_match_window = 0.200
+        # AI 输出后此窗口内的 pynput 事件视为回显，直接丢弃
+        # SendInput mickeys 与 pynput 屏幕像素量纲不匹配，核销不可靠
+        self._ai_echo_suppress_until = 0.0
+        self._ai_echo_suppress_s = 0.030
 
     # ── 写入 ──────────────────────────────────────────────────────────────
 
@@ -47,6 +51,8 @@ class RingBuffer:
                 self._pending_ai_echo.append(
                     InputEvent(timestamp=now, dx=dx, dy=dy, is_ai=True)
                 )
+                # 标记抑制窗口：此期间 pynput 事件视为回显丢弃
+                self._ai_echo_suppress_until = now + self._ai_echo_suppress_s
             while self._buffer and (now - self._buffer[0].timestamp > self.max_duration):
                 self._buffer.popleft()
 
@@ -75,8 +81,11 @@ class RingBuffer:
         if dx == 0 and dy == 0:
             return
         now = time.perf_counter()
-        residual_x, residual_y = int(dx), int(dy)
         with self._lock:
+            # 抑制窗口内直接丢弃（量纲不匹配导致核销不可靠）
+            if now < self._ai_echo_suppress_until:
+                return
+            residual_x, residual_y = int(dx), int(dy)
             cutoff = now - self._echo_match_window
             while self._pending_ai_echo and self._pending_ai_echo[0].timestamp < cutoff:
                 self._pending_ai_echo.popleft()
