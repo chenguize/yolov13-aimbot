@@ -41,6 +41,10 @@ class HumanMouseListener(threading.Thread):
         else:
             b = "inputs"
         self._backend = b
+        if self._backend == "pynput" and hasattr(
+            self.ring_buffer, "enable_observed_echo_reconciliation"
+        ):
+            self.ring_buffer.enable_observed_echo_reconciliation(True)
 
     def _run_inputs(self) -> None:
         try:
@@ -99,12 +103,12 @@ class HumanMouseListener(threading.Thread):
             dx, dy = ix - lx, iy - ly
             last[0] = (ix, iy)
             if dx or dy:
-                self.ring_buffer.add_event(dx, dy, is_ai=False)
+                self.ring_buffer.add_observed_cursor_event(dx, dy)
 
         listener = Listener(on_move=on_move)
         listener.start()
         logger.info(
-            "RawInput: pynput 鼠标钩子已启动（屏幕坐标差分 -> RingBuffer；若仍 n_h=0 试管理员运行）"
+            "RawInput: pynput 鼠标钩子已启动（AI 回显核销后 -> RingBuffer；若仍 n_h=0 试管理员运行）"
         )
         self.shutdown_evt.wait()
         try:

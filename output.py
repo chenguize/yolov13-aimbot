@@ -89,6 +89,11 @@ class SystemMouse:
         if _AIM_MOVE_BLOCK or getattr(self, "_block_aimbot_move", False):
             return
 
+        # Register before SendInput so the asynchronous cursor hook can
+        # reconcile this injected event instead of classifying it as human.
+        if self.ring_buffer:
+            self.ring_buffer.add_event(int(x), int(y), is_ai=True)
+
         # === 极速发送 ===
         # 只修改变化的 dx, dy 和 flags
         self._inp.union.mi.dx = int(x)
@@ -97,9 +102,6 @@ class SystemMouse:
 
         # 直接调用，无需创建新对象
         self._send_input_func(1, byref(self._inp), self._sizeof_inp)
-
-        if self.ring_buffer:
-            self.ring_buffer.add_event(int(x), int(y), is_ai=True)
 
     def mouse_down(self, key=1):
         if key == 1:

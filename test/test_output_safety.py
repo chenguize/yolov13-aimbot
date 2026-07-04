@@ -63,6 +63,38 @@ class RingBufferActivityTests(unittest.TestCase):
         now = time.perf_counter()
         self.assertAlmostEqual(buffer.get_intent_activity(now - 0.1, now), 4.0)
 
+    def test_reconciled_ai_echo_is_not_human_or_double_counted(self):
+        buffer = RingBuffer()
+        buffer.enable_observed_echo_reconciliation(True)
+        buffer.add_event(7, -3, is_ai=True)
+        buffer.add_observed_cursor_event(7, -3)
+        now = time.perf_counter()
+
+        self.assertEqual(buffer.get_intent_delta(now - 0.1, now), (0, 0))
+        self.assertEqual(buffer.get_total_delta_sum(now - 0.1, now), (7, -3))
+        self.assertEqual(buffer.get_intent_activity(now - 0.1, now), 0.0)
+
+    def test_reconciled_event_preserves_physical_residual(self):
+        buffer = RingBuffer()
+        buffer.enable_observed_echo_reconciliation(True)
+        buffer.add_event(5, 0, is_ai=True)
+        buffer.add_observed_cursor_event(8, -2)
+        now = time.perf_counter()
+
+        self.assertEqual(buffer.get_intent_delta(now - 0.1, now), (3, -2))
+        self.assertEqual(buffer.get_total_delta_sum(now - 0.1, now), (8, -2))
+
+    def test_reconciliation_handles_coalesced_ai_callbacks(self):
+        buffer = RingBuffer()
+        buffer.enable_observed_echo_reconciliation(True)
+        buffer.add_event(2, 1, is_ai=True)
+        buffer.add_event(3, 2, is_ai=True)
+        buffer.add_observed_cursor_event(5, 3)
+        now = time.perf_counter()
+
+        self.assertEqual(buffer.get_intent_delta(now - 0.1, now), (0, 0))
+        self.assertEqual(buffer.get_total_delta_sum(now - 0.1, now), (5, 3))
+
 
 if __name__ == "__main__":
     unittest.main()
