@@ -32,7 +32,7 @@ class RingBuffer:
         self.max_duration = max_duration
         self._sub_ai_enabled: bool = False  # 由 use_subtract_ai() 延迟初始化
         self._observed_events_reconciled = False
-        self._echo_match_window = 0.050
+        self._echo_match_window = 0.200
 
     # ── 写入 ──────────────────────────────────────────────────────────────
 
