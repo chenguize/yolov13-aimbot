@@ -33,24 +33,28 @@ class CalibrationState:
             self.k_y = new_k
 
 
-# 各游戏 sens → cm/360° 换算（cm_360 = base_cm / sens）
-# 多数 FPS 游戏都是「sens 翻倍 → cm_360 减半」的反比关系，base_cm 因游戏而异
-_CM360_TABLE: dict[str, float] = {
-    "valorant":   25.0,   # 瓦 sens=1.0 → 25 cm/360，sens=0.4 → 62.5 cm/360
-    "cs2":        49.0,   # CS2 sens=1.0 (800dpi) → 49 cm/360
-    "csgo":       49.0,
-    "overwatch2": 13.27,  # OW2 sens=1.0 (800dpi) → 13.27 cm/360
-    "apex":       2.50,   # Apex sens 内部不同，base 近似 2.5（实际 sens 范围 0-1000 需实测）
-    "default":    50.0,   # 未知游戏的兜底（按瓦 sens=0.5 等效）
+# Game yaw in degrees per mouse count at sensitivity 1.0. SendInput emits
+# counts, so count-to-view-angle mapping is independent of physical mouse DPI.
+_YAW_DEG_PER_COUNT: dict[str, float] = {
+    "valorant": 0.070,
+    "cs2": 0.022,
+    "csgo": 0.022,
+    "overwatch2": 0.0066,
+    "apex": 0.022,
+    "default": 0.070,
 }
 
 
-def _cm_per_360(game: str, sens: float) -> float:
-    """游戏内 sens → cm/360° 转换（基线表查表，反比关系）"""
-    if sens <= 0 or sens > 1000:
-        return _CM360_TABLE["default"]
-    base = _CM360_TABLE.get(game.lower(), _CM360_TABLE["default"])
-    return base / sens
+def _degrees_per_count(game: str, sens: float) -> float:
+    safe_sens = sens if 0.0 < sens <= 1000.0 else 1.0
+    yaw = _YAW_DEG_PER_COUNT.get(game.lower(), _YAW_DEG_PER_COUNT["default"])
+    return yaw * safe_sens
+
+
+def _cm_per_360(game: str, sens: float, dpi: float) -> float:
+    """Diagnostic physical distance; not used for synthetic count mapping."""
+    safe_dpi = dpi if dpi > 0.0 else 800.0
+    return 2.54 * 360.0 / (_degrees_per_count(game, sens) * safe_dpi)
 
 
 class ValorantStrategy:
@@ -64,8 +68,8 @@ class ValorantStrategy:
         self.mouse_dpi   = config.getfloat("Input",   "mouse_dpi",      800.0)
         self.in_game_sens = config.getfloat("Input",  "in_game_sens",    0.4)
         self.k_yx_ratio  = config.getfloat("Input",   "k_yx_ratio",      1.0)
-        game             = config.getstr("Game",      "current_game",    "valorant")
-        self.cm_360      = _cm_per_360(game, self.in_game_sens)
+        self.game        = config.getstr("Game",      "current_game",    "valorant")
+        self.cm_360      = _cm_per_360(self.game, self.in_game_sens, self.mouse_dpi)
 
         # ── 屏幕/FOV ──────────────────────────────────────────────────────────
         # config.ini [Hardware].screen_width / screen_height 已由 Config.get 自动处理：
@@ -88,10 +92,7 @@ class ValorantStrategy:
             screen_source = "config.ini 显式"
         self.focal_length = (self.screen_width / 2) / math.tan(math.radians(self.game_fov / 2))
 
-        # ── 动态 k_factor：count/pixel，由 mouse_dpi × cm_360 × FOV 公式推导 ───
-        #   公式：k = (cm_360 × FOV × DPI) / (913.44 × screen_width)
-        #   物理意义：屏幕上 1 像素位移需要多少 mouse count
-        #   瓦 sens=0.4, DPI=800, FOV=103, W=1920 → k ≈ 2.94
+        # ── 动态 k_factor：count/pixel，由游戏 yaw × sens × 投影焦距推导 ───
         k = self._compute_k_factor()
         kx = k
         ky = k * self.k_yx_ratio
@@ -113,18 +114,26 @@ class ValorantStrategy:
 
     def _compute_k_factor(self) -> float:
         """
-        动态计算 k_factor = count / pixel
-        公式：k = (cm_360 × FOV × DPI) / (913.44 × screen_width)
-        推导：
-          - 1 inch 鼠标 = DPI counts
-          - 1 inch 鼠标 = 2.54 cm → 准星转 (2.54 / cm_360) × 360°
-          - 1° 视角 = screen_width / FOV 像素
-          - 1 count = (2.54 / cm_360) × 360 × (screen_width / FOV) / DPI 像素
-          - k = 1 / (pixel_per_count) = (cm_360 × FOV × DPI) / (913.44 × screen_width)
-        物理意义："屏幕上 1 像素位移需要多少 mouse count"，由硬件 DPI × 游戏 sens × FOV 三者唯一确定
+        Exact center Jacobian for perspective projection:
+
+            pixels/count = focal_length * radians/count
+            counts/pixel = 1 / (focal_length * radians/count)
+
+        DPI affects physical hand travel only. Including it here makes the
+        synthetic SendInput response disagree with the real game plant.
         """
-        W = self.screen_width
-        return (self.cm_360 * self.game_fov * self.mouse_dpi) / (913.44 * W)
+        radians_per_count = math.radians(
+            _degrees_per_count(self.game, self.in_game_sens)
+        )
+        return 1.0 / max(self.focal_length * radians_per_count, 1e-9)
+
+    @property
+    def k_factor_x(self) -> float:
+        return float(self.calib.k_x)
+
+    @property
+    def k_factor_y(self) -> float:
+        return float(self.calib.k_y)
 
     def apply_fov_distortion(self, dx: float, dy: float) -> Tuple[float, float]:
         angle_x = math.atan(dx / self.focal_length)

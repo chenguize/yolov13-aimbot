@@ -175,6 +175,12 @@ class WorldModel:
         self.strategy = create_aim_strategy()
         from controllers.controller_factory import get_controller
         self.controller = get_controller()
+        if hasattr(self.controller, "set_pixel_to_count_scale"):
+            calibration = getattr(self.strategy, "calib", None)
+            self.controller.set_pixel_to_count_scale(
+                getattr(calibration, "k_x", 1.0),
+                getattr(calibration, "k_y", 1.0),
+            )
 
         self.capture_size = config.getint("Hardware", "capture_size", 256)
         self.crop_center = self.capture_size / 2.0

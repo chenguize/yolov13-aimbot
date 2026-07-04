@@ -360,6 +360,20 @@ class PROController:
     def takeover_state(self):
         return self._takeover_state
 
+    def set_pixel_to_count_scale(self, kx, ky):
+        """Synchronize pixel-domain thresholds with the active aim strategy."""
+        with self._lock:
+            if config.getbool('Strategy', 'bypass_strategy_mapping', False):
+                self._px_to_ct = 1.0
+            else:
+                sx = abs(float(kx))
+                sy = abs(float(ky))
+                if sx > 1e-6 and sy > 1e-6:
+                    self._px_to_ct = 0.5 * (sx + sy)
+            _log_cipher.info(
+                'Controller mapping synchronized: px_to_ct=%.4f', self._px_to_ct
+            )
+
     def set_blend_alpha(self, alpha_target, takeover_state=None):
         with self._lock as __temp_157:
             self._alpha_target = float(np.clip(alpha_target, 0.0, 1.0))
