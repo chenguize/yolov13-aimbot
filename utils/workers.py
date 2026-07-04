@@ -15,6 +15,7 @@ import win32api
 from ctypes import windll
 
 from utils.logger import get_logger
+from utils.output_safety import OutputSafetyGate
 
 logger = get_logger("Workers")
 
@@ -47,15 +48,36 @@ class MouseWorker(threading.Thread):
     """1kHz 主 tick + 高斯抖动（±100μs 打破机器特征）。"""
 
     def __init__(self, controller, output_dev, shutdown_evt: threading.Event,
-                 ring_buffer=None):
+                 ring_buffer=None, safety_gate: OutputSafetyGate = None):
         super().__init__(name="MouseWorker", daemon=True)
         self.controller = controller
         self.output = output_dev
         self.shutdown_evt = shutdown_evt
         self.ring_buffer = ring_buffer
+        self.safety_gate = safety_gate
+        self._blocked_reason = None
+
+    def _apply_safety(self, allowed: bool, reason: str, title: str = "") -> None:
+        blocked = not allowed
+        self.output.set_block_aimbot_move(blocked)
+        if blocked and hasattr(self.controller, "set_mouse_emit"):
+            self.controller.set_mouse_emit(False)
+        if reason == self._blocked_reason:
+            return
+        previous = self._blocked_reason
+        self._blocked_reason = reason
+        if blocked:
+            if hasattr(self.controller, "freeze_output_integrators"):
+                self.controller.freeze_output_integrators()
+            logger.warning(
+                "Mouse output blocked | reason=%s | foreground=%r", reason, title
+            )
+        elif previous is not None:
+            logger.info("Mouse output safety gate opened | foreground=%r", title)
 
     def run(self):
         logger.info("MouseWorker (1000Hz) starting")
+        self.output.set_block_aimbot_move(True)
         try:
             windll.winmm.timeBeginPeriod(1)
         except Exception:
@@ -68,10 +90,19 @@ class MouseWorker(threading.Thread):
             target_period = max(0.0008, min(0.0012, base_period + jitter))
 
             try:
-                dx, dy = self.controller.tick_mouse()
-                if dx or dy:
-                    self.output.mouse_xy(dx, dy)
+                output_allowed = True
+                if self.safety_gate is not None:
+                    decision = self.safety_gate.evaluate(loop_start)
+                    self._apply_safety(
+                        decision.allowed, decision.reason, decision.foreground_title
+                    )
+                    output_allowed = decision.allowed
+                if output_allowed:
+                    dx, dy = self.controller.tick_mouse()
+                    if dx or dy:
+                        self.output.mouse_xy(dx, dy)
             except Exception as e:
+                self._apply_safety(False, "worker_error")
                 logger.debug("MouseWorker tick error: %s", e)
 
             elapsed = time.perf_counter() - loop_start
@@ -97,12 +128,14 @@ class TriggerWorker(threading.Thread):
     调用方只需 fire(click_duration_s)；类内保证 15~60ms 点击时长。
     """
 
-    def __init__(self, output_dev, shutdown_evt: threading.Event):
+    def __init__(self, output_dev, shutdown_evt: threading.Event,
+                 safety_gate: OutputSafetyGate = None):
         super().__init__(name="TriggerWorker", daemon=True)
         self.output = output_dev
         self.shutdown_evt = shutdown_evt
         self._fire_evt = threading.Event()
         self._click_duration = 0.03
+        self.safety_gate = safety_gate
 
     def fire(self, click_duration: float):
         self._click_duration = float(np.clip(click_duration, 0.015, 0.06))
@@ -115,6 +148,8 @@ class TriggerWorker(threading.Thread):
                 continue
             self._fire_evt.clear()
             try:
+                if self.safety_gate is not None and not self.safety_gate.evaluate().allowed:
+                    continue
                 self.output.mouse_down(1)
                 time.sleep(self._click_duration)
                 self.output.mouse_up(1)

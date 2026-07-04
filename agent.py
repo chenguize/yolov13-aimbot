@@ -38,6 +38,7 @@ from perception.ring_buffer import RingBuffer
 from utils import runtime_defaults as _rtd
 from utils.human_intent import HumanIntentTracker
 from utils.logger import get_logger
+from utils.output_safety import OutputSafetyGate
 from utils.recorder import TraceRecorder
 from utils.types import InferenceContext
 from utils.workers import MovementTracker, MouseWorker, TriggerWorker
@@ -90,13 +91,22 @@ class AIAgent:
                 self.frame_bus, self.world_model, self.shutdown_event, self.cap_to_inf_event
             )
             self._is_aimlab_backend = False
-        self.mouse_worker = MouseWorker(self.controller, output_device, self.shutdown_event)
+        self.output_safety = OutputSafetyGate(self.ring_buffer)
+        self.mouse_worker = MouseWorker(
+            self.controller,
+            output_device,
+            self.shutdown_event,
+            ring_buffer=self.ring_buffer,
+            safety_gate=self.output_safety,
+        )
         if id(self.mouse_worker.output) != id(output_device):
             logger.error(
                 "gHub 实例不一致: mouse_worker.output 与 from output gHub 不同 id"
             )
         self.human_mouse_listener = HumanMouseListener(self.ring_buffer, self.shutdown_event)
-        self.trigger_worker = TriggerWorker(output_device, self.shutdown_event)
+        self.trigger_worker = TriggerWorker(
+            output_device, self.shutdown_event, safety_gate=self.output_safety
+        )
 
         self.ctx = InferenceContext()
         self.crop_center = self.world_model.crop_center
@@ -172,8 +182,10 @@ class AIAgent:
             c.freeze_output_integrators()
 
     def _sync_aimbot_move_block(self) -> None:
-        """已废弃到点停手门控，恒不拦 aim 相对移动。保留调用点以免改 finally。"""
-        output_device.set_block_aimbot_move(False)
+        """Publish runtime state; only OutputSafetyGate may open the hard gate."""
+        self.output_safety.set_runtime_enabled(
+            self.enable_aimbot and not self.paused and not self.shutdown_event.is_set()
+        )
 
     def _intent_delta(self, t_start: float, t_end: float) -> Tuple[int, int]:
         """人手意图增量：委托 RingBuffer 自动处理后端差异。"""
@@ -433,6 +445,7 @@ class AIAgent:
 
     # ────────────────────────────────────────────────────────────────────
     def start(self):
+        self._sync_aimbot_move_block()
         self.capture_thread.start()
         self.inference_thread.start()
         self.mouse_worker.start()
@@ -441,6 +454,8 @@ class AIAgent:
         logger.info("All worker threads started (order: capture, inference, then mouse/listener/trigger)")
 
     def stop(self):
+        self.output_safety.set_runtime_enabled(False)
+        output_device.set_block_aimbot_move(True)
         self.shutdown_event.set()
         self.cap_to_inf_event.set()
         self.world_model.frame_ready_event.set()
@@ -1083,11 +1098,14 @@ class AIAgent:
 
     def toggle_pause(self):
         self.paused = not self.paused
+        self._sync_aimbot_move_block()
+        if self.paused:
+            self._freeze_mouse_motion()
         logger.warning("PAUSED: %s", self.paused)
 
     def toggle_aimbot(self):
         self.enable_aimbot = not self.enable_aimbot
+        self._sync_aimbot_move_block()
         if not self.enable_aimbot:
             self._freeze_mouse_motion()
-            self._sync_aimbot_move_block()
         logger.warning("AIMBOT: %s", self.enable_aimbot)

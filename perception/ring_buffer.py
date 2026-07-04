@@ -120,6 +120,33 @@ class RingBuffer:
         ax, ay = self.get_ai_delta_sum(t_start, t_end)
         return (hx - ax, hy - ay)
 
+    def get_intent_activity(self, t_start: float, t_end: float) -> float:
+        """Return direction-independent physical mouse activity.
+
+        With the pynput backend, injected movement is visible to the hook as if
+        it were human input. Comparing path lengths (rather than net vectors)
+        removes that echo while still detecting a human moving with, against,
+        or across the controller's direction.
+        """
+        if t_start >= t_end:
+            return 0.0
+        human_path = 0.0
+        ai_path = 0.0
+        with self._lock:
+            for event in reversed(self._buffer):
+                if event.timestamp > t_end:
+                    continue
+                if event.timestamp < t_start:
+                    break
+                distance = math.hypot(event.dx, event.dy)
+                if event.is_ai:
+                    ai_path += distance
+                else:
+                    human_path += distance
+        if not self._check_sub_ai():
+            return human_path
+        return max(0.0, human_path - ai_path)
+
     def get_intent_delta_sum(self, t_start: float, t_end: float,
                              *, subtract_injected_ai: bool) -> Tuple[int, int]:
         """
