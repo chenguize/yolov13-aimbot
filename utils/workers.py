@@ -57,7 +57,7 @@ class MouseWorker(threading.Thread):
         self.safety_gate = safety_gate
         self._blocked_reason = None
 
-    def _apply_safety(self, allowed: bool, reason: str, title: str = "") -> None:
+    def _apply_safety(self, allowed: bool, reason: str) -> None:
         blocked = not allowed
         self.output.set_block_aimbot_move(blocked)
         if blocked and hasattr(self.controller, "set_mouse_emit"):
@@ -69,11 +69,9 @@ class MouseWorker(threading.Thread):
         if blocked:
             if hasattr(self.controller, "freeze_output_integrators"):
                 self.controller.freeze_output_integrators()
-            logger.warning(
-                "Mouse output blocked | reason=%s | foreground=%r", reason, title
-            )
+            logger.warning("Mouse output blocked | reason=%s", reason)
         elif previous is not None:
-            logger.info("Mouse output safety gate opened | foreground=%r", title)
+            logger.info("Mouse output safety gate opened")
 
     def run(self):
         logger.info("MouseWorker (1000Hz) starting")
@@ -93,9 +91,7 @@ class MouseWorker(threading.Thread):
                 output_allowed = True
                 if self.safety_gate is not None:
                     decision = self.safety_gate.evaluate(loop_start)
-                    self._apply_safety(
-                        decision.allowed, decision.reason, decision.foreground_title
-                    )
+                    self._apply_safety(decision.allowed, decision.reason)
                     output_allowed = decision.allowed
                 if output_allowed:
                     dx, dy = self.controller.tick_mouse()

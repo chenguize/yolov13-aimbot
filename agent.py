@@ -183,9 +183,12 @@ class AIAgent:
 
     def _sync_aimbot_move_block(self) -> None:
         """Publish runtime state; only OutputSafetyGate may open the hard gate."""
-        self.output_safety.set_runtime_enabled(
+        enabled = (
             self.enable_aimbot and not self.paused and not self.shutdown_event.is_set()
         )
+        self.output_safety.set_runtime_enabled(enabled)
+        if not enabled:
+            output_device.set_block_aimbot_move(True)
 
     def _intent_delta(self, t_start: float, t_end: float) -> Tuple[int, int]:
         """人手意图增量：委托 RingBuffer 自动处理后端差异。"""

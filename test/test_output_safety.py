@@ -26,35 +26,18 @@ class OutputSafetyGateTests(unittest.TestCase):
         self.clock = _Clock()
         self.buffer = _ActivityBuffer()
 
-    def _gate(self, title_reader):
-        gate = OutputSafetyGate(
-            self.buffer,
-            foreground_reader=title_reader,
-            clock=self.clock,
-        )
+    def _gate(self):
+        gate = OutputSafetyGate(self.buffer, clock=self.clock)
         gate.set_runtime_enabled(True)
         return gate
 
-    def test_desktop_is_blocked_even_when_agent_is_enabled(self):
-        decision = self._gate(lambda: "Program Manager").evaluate()
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "foreground_blocked")
-
-    def test_allowed_game_window_opens_gate(self):
-        decision = self._gate(lambda: "VALORANT  ").evaluate()
+    def test_enabled_agent_opens_gate_without_window_checks(self):
+        decision = self._gate().evaluate()
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.reason, "allowed")
 
-    def test_foreground_reader_failure_fails_closed(self):
-        def broken_reader():
-            raise OSError("window API unavailable")
-
-        decision = self._gate(broken_reader).evaluate()
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "foreground_blocked")
-
     def test_human_activity_latches_override_without_direction_check(self):
-        gate = self._gate(lambda: "Aim Lab")
+        gate = self._gate()
         self.buffer.activity = 2.0
         self.assertEqual(gate.evaluate().reason, "human_override")
 
@@ -65,7 +48,7 @@ class OutputSafetyGateTests(unittest.TestCase):
         self.assertTrue(gate.evaluate().allowed)
 
     def test_disabled_agent_cannot_open_output(self):
-        gate = self._gate(lambda: "VALORANT")
+        gate = self._gate()
         gate.set_runtime_enabled(False)
         self.assertEqual(gate.evaluate().reason, "agent_disabled")
 
