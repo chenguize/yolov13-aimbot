@@ -36,7 +36,7 @@ class RingBuffer:
         # AI 输出后此窗口内的 pynput 事件视为回显，直接丢弃
         # SendInput mickeys 与 pynput 屏幕像素量纲不匹配，核销不可靠
         self._ai_echo_suppress_until = 0.0
-        self._ai_echo_suppress_s = 0.030
+        self._ai_echo_suppress_s = 0.080
 
     # ── 写入 ──────────────────────────────────────────────────────────────
 

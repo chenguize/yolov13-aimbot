@@ -107,9 +107,9 @@ class PROController:
         self._dz_base = config.getfloat('Controller', 'cipher_deadzone_scale', 0.035)
         self._K_pursuit = config.getfloat('Controller', 'cipher_k_pursuit', 135.0)
         self._K_flick = config.getfloat('Controller', 'cipher_k_flick', 460.0)
-        self._B_pursuit = config.getfloat('Controller', 'cipher_b_pursuit', 0.32)
+        self._B_pursuit = config.getfloat('Controller', 'cipher_b_pursuit', 0.70)
         self._K_correction = config.getfloat('Controller', 'cipher_k_correction', 55.0)
-        self._B_correction = config.getfloat('Controller', 'cipher_b_correction', 0.18)
+        self._B_correction = config.getfloat('Controller', 'cipher_b_correction', 0.70)
         self._ff_speed_knee = config.getfloat('Controller', 'cipher_ff_speed_knee',
             200.0)
         self._ff_speed_scale = config.getfloat('Controller',
@@ -1325,8 +1325,15 @@ class PROController:
                     control_error = self._pro_hold_error
                 d_norm = dist / max(head_r_gain_sched, 1e-06)
                 near_w = float(np.clip(1.0 - d_norm, 0.0, 1.0))
-                z = dist / (thresh_high_counts + 1e-09) - 1.0
-                w_flick = float(np.clip(0.5 + 0.5 * z / (1.0 + abs(z)), 0.0, 1.0))
+                # True hysteretic gain schedule: below thresh_low there must
+                # be no residual flick gain. The old rational curve retained
+                # 25% flick gain even at zero error, making 30px corrections
+                # behave like ballistic moves and repeatedly cross the target.
+                gain_span = max(thresh_high_counts - thresh_low_counts, 1e-6)
+                gain_u = float(np.clip(
+                    (dist - thresh_low_counts) / gain_span, 0.0, 1.0
+                ))
+                w_flick = gain_u * gain_u * (3.0 - 2.0 * gain_u)
                 K_mid = self._K_pursuit * (1.0 - w_flick) + self._K_flick * w_flick
                 K_eff = self._K_correction * near_w + K_mid * (1.0 - near_w)
                 B_eff = self._B_correction * near_w + self._B_pursuit * (1.0 - near_w)
@@ -1379,28 +1386,24 @@ class PROController:
             self._arm_vel[1] = (1.0 - alpha_arm) * self._arm_vel[1
                 ] + alpha_arm * v_cmd[1]
             if 0.001 < dist:
-                landing_radius = max(
-                    head_r_gain_sched * self._landing_radius_mul,
-                    anti_orbit_dist_counts,
+                unit = error / dist
+                relative_velocity = self._arm_vel - ff_vel_track
+                radial_closing = float(np.dot(relative_velocity, unit))
+                stopping_distance = max(dist - 0.35 * head_r_counts, 0.0)
+                safe_closing = math.sqrt(
+                    2.0 * self._landing_decel * stopping_distance
                 )
-                if dist < landing_radius:
-                    unit = error / dist
-                    relative_velocity = self._arm_vel - ff_vel_track
-                    radial_closing = float(np.dot(relative_velocity, unit))
-                    stopping_distance = max(
-                        dist - 0.35 * head_r_counts, 0.0
+                # The safe-speed test already encodes a dynamic braking
+                # radius v^2/(2a). Applying it globally starts deceleration at
+                # the physically correct distance instead of waiting for a
+                # fixed 35px landing circle that can be much too late.
+                if radial_closing > safe_closing:
+                    reduction = min(
+                        radial_closing - safe_closing,
+                        self._landing_decel * dt,
                     )
-                    safe_closing = math.sqrt(
-                        2.0 * self._landing_decel * stopping_distance
-                    )
-                    if radial_closing > safe_closing:
-                        reduction = min(
-                            radial_closing - safe_closing,
-                            self._landing_decel * dt,
-                        )
-                        self._arm_vel -= unit * reduction
+                    self._arm_vel -= unit * reduction
                 if dist < anti_orbit_dist_counts:
-                    unit = error / dist
                     radial_v = np.dot(self._arm_vel, unit) * unit
                     tangent_v = self._arm_vel - radial_v
                     t_damp = float(np.clip(dist / anti_orbit_dist_counts, 0.0, 1.0)
