@@ -262,6 +262,9 @@ class PROController:
         self._landing_radius_mul = config.getfloat(
             'Controller', 'cipher_landing_radius_mul', 3.0
         )
+        self._capture_static_speed = config.getfloat(
+            'Controller', 'cipher_capture_static_speed', 80.0
+        )
         _log_cipher.info('CIPHER v1.0 MPE: a=%.2fs b=%.2fs/bit T=[%.2f,%.2f]s',
             self._fitts_a, self._fitts_b, self._T_min, self._T_max)
         _log_cipher.info(
@@ -1206,8 +1209,30 @@ class PROController:
                     # choice: far targets launch a program below, near targets
                     # enter impedance tracking directly.
                     self._ic_state = 'hold'
+            tgt_speed = float(np.linalg.norm(tgt_vel))
             now = self._elapsed
             time_since_prog = now - self._last_prog_time
+            crossed_program_endpoint = False
+            if self._phase == self._BALLISTIC:
+                # A minimum-jerk primitive is only open-loop while the measured
+                # target remains ahead of its launch direction. Plant-gain
+                # error or an output stall can otherwise make the timed
+                # program keep accelerating after the crosshair has crossed.
+                along_program = float(np.dot(error, self._prog_dir))
+                if (
+                    self._prog_t > 0.0
+                    and tgt_speed < self._capture_static_speed
+                    and along_program <= 0.0
+                ):
+                    crossed_program_endpoint = True
+                    self._phase = self._TRACKING
+                    self._prog_t = 0.0
+                    self._pro_hold_error[:] = error
+                    self._pro_hold_target_velocity[:] = tgt_vel
+                    self._pro_last_event = self._elapsed
+                    _log_cipher.phase_switch(
+                        'BALLISTIC', 'TRACKING', reason='measured_endpoint_crossing'
+                    )
             if self._phase == self._BALLISTIC:
                 tau_now = self._prog_t / max(self._prog_T, 1e-06)
                 prog_remain = self._prog_D * (1.0 - _minjerk_pos(tau_now))
@@ -1235,7 +1260,7 @@ class PROController:
                     v_cmd = np.zeros(2, dtype=np.float64)
                 else:
                     v_cmd = np.zeros(2, dtype=np.float64)
-            elif dist > thresh_high_counts:
+            elif dist > thresh_high_counts and not crossed_program_endpoint:
                 if time_since_prog > self._min_prog_interval:
                     self._start_motor_program(dist, error, head_r_counts)
                     v_cmd = np.zeros(2, dtype=np.float64)
@@ -1243,7 +1268,6 @@ class PROController:
                     v_cmd = np.zeros(2, dtype=np.float64)
             else:
                 v_cmd = np.zeros(2, dtype=np.float64)
-            tgt_speed = float(np.linalg.norm(tgt_vel))
             if self._phase == self._BALLISTIC:
                 if eff_power < 0.02:
                     _log_cipher.phase_switch('BALLISTIC', 'TRACKING', reason=
@@ -1314,8 +1338,14 @@ class PROController:
                             self._arm_vel = self._arm_vel
             else:
                 smooth_pursuit = tgt_speed > 450.0
-                if smooth_pursuit:
+                capture_zone = (
+                    tgt_speed < self._capture_static_speed
+                    and dist <= anti_orbit_dist_counts
+                )
+                if smooth_pursuit or capture_zone or crossed_program_endpoint:
                     control_error = error
+                    self._pro_hold_error[:] = error
+                    self._pro_hold_target_velocity[:] = tgt_vel
                 else:
                     predicted_hold_error = self._pro_hold_error + (self.
                         _pro_hold_target_velocity - self._arm_vel) * dt
@@ -1417,10 +1447,13 @@ class PROController:
                 # the physically correct distance instead of waiting for a
                 # fixed 35px landing circle that can be much too late.
                 if radial_closing > safe_closing:
-                    reduction = min(
-                        radial_closing - safe_closing,
-                        self._landing_decel * dt,
-                    )
+                    if tgt_speed < self._capture_static_speed:
+                        reduction = radial_closing - safe_closing
+                    else:
+                        reduction = min(
+                            radial_closing - safe_closing,
+                            self._landing_decel * dt,
+                        )
                     self._arm_vel -= unit * reduction
                 if dist < anti_orbit_dist_counts:
                     radial_v = np.dot(self._arm_vel, unit) * unit
@@ -1474,18 +1507,21 @@ class PROController:
                 return vector * (max_norm / norm)
         return vector
 
-    def tick_mouse(self):
+    def tick_mouse(self, dt_override=None):
         with self._lock as __temp_637:
             now = time.perf_counter()
-            if self._last_mouse_time is None:
-                self._last_mouse_time = now
-                self._accum_emit_tick(0, 0, 0.0, 0.0)
-                return 0, 0
+            if dt_override is None:
+                if self._last_mouse_time is None:
+                    self._last_mouse_time = now
+                    self._accum_emit_tick(0, 0, 0.0, 0.0)
+                    return 0, 0
+                dt = now - self._last_mouse_time
+            else:
+                dt = float(dt_override)
             if not self._emit_mouse:
                 self._last_mouse_time = now
                 self._accum_emit_tick(0, 0, 0.0, 0.0)
                 return 0, 0
-            dt = now - self._last_mouse_time
             self._last_mouse_time = now
             if dt > 0.02:
                 _log_cipher.warning(

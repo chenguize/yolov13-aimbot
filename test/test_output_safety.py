@@ -148,6 +148,15 @@ class RingBufferActivityTests(unittest.TestCase):
         self.assertEqual(buffer.get_intent_delta(now - 0.1, now), (0, 0))
         self.assertEqual(buffer.get_total_delta_sum(now - 0.1, now), (5, 3))
 
+    def test_tagged_physical_input_is_not_swallowed_by_ai_echo_window(self):
+        buffer = RingBuffer()
+        buffer.enable_observed_echo_reconciliation(True)
+        buffer.add_event(20, 0, is_ai=True)
+        buffer.add_observed_cursor_event(3, -2, known_physical=True)
+        now = time.perf_counter()
+
+        self.assertEqual(buffer.get_intent_delta(now - 0.1, now), (3, -2))
+
 
 if __name__ == "__main__":
     unittest.main()

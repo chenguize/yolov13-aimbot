@@ -20,6 +20,9 @@ from utils.logger import get_logger
 
 logger = get_logger("HumanInput")
 
+_WM_MOUSEMOVE = 0x0200
+_AI_SIGNATURE = 0xFFC0FFEE
+
 
 class HumanMouseListener(threading.Thread):
     """
@@ -90,6 +93,17 @@ class HumanMouseListener(threading.Thread):
             return
 
         last: list = [None]
+        tagged_injected_move: list[bool] = [False]
+
+        def win32_event_filter(msg, data):
+            if int(msg) == _WM_MOUSEMOVE:
+                try:
+                    tagged_injected_move[0] = (
+                        int(data.dwExtraInfo) == _AI_SIGNATURE
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    tagged_injected_move[0] = False
+            return True
 
         def on_move(x, y) -> None:
             try:
@@ -102,13 +116,22 @@ class HumanMouseListener(threading.Thread):
             lx, ly = last[0]
             dx, dy = ix - lx, iy - ly
             last[0] = (ix, iy)
+            is_tagged_ai = tagged_injected_move[0]
+            tagged_injected_move[0] = False
+            if is_tagged_ai:
+                return
             if dx or dy:
-                self.ring_buffer.add_observed_cursor_event(dx, dy)
+                self.ring_buffer.add_observed_cursor_event(
+                    dx, dy, known_physical=True
+                )
 
-        listener = Listener(on_move=on_move)
+        listener = Listener(
+            on_move=on_move,
+            win32_event_filter=win32_event_filter,
+        )
         listener.start()
         logger.info(
-            "RawInput: pynput 鼠标钩子已启动（AI 回显核销后 -> RingBuffer；若仍 n_h=0 试管理员运行）"
+            "RawInput: pynput 鼠标钩子已启动（dwExtraInfo 标签分离 AI/物理输入）"
         )
         self.shutdown_evt.wait()
         try:

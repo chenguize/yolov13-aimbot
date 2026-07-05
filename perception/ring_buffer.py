@@ -70,7 +70,9 @@ class RingBuffer:
         sign = 1 if observed > 0 else -1
         return observed - sign * amount, injected - sign * amount
 
-    def add_observed_cursor_event(self, dx: int, dy: int) -> None:
+    def add_observed_cursor_event(
+        self, dx: int, dy: int, *, known_physical: bool = False
+    ) -> None:
         """Record a pynput event after removing matching SendInput echo.
 
         SendInput commands are registered before dispatch. Cursor-hook events
@@ -82,6 +84,21 @@ class RingBuffer:
             return
         now = time.perf_counter()
         with self._lock:
+            # WH_MOUSE_LL exposes our SendInput dwExtraInfo marker. Once the
+            # listener has checked that marker, this event is known physical
+            # and must not be swallowed by the heuristic echo window.
+            if known_physical:
+                self._buffer.append(InputEvent(
+                    timestamp=now,
+                    dx=int(dx),
+                    dy=int(dy),
+                    is_ai=False,
+                ))
+                while self._buffer and (
+                    now - self._buffer[0].timestamp > self.max_duration
+                ):
+                    self._buffer.popleft()
+                return
             # 抑制窗口内直接丢弃（量纲不匹配导致核销不可靠）
             if now < self._ai_echo_suppress_until:
                 return
