@@ -327,7 +327,7 @@ class PROController:
             'Controller', 'cipher_handoff_target_coast_gain', 0.85
         )
         self._handoff_cross_track_budget_px = config.getfloat(
-            'Controller', 'cipher_handoff_cross_track_budget_px', 6.0
+            'Controller', 'cipher_handoff_cross_track_budget_px', 3.0
         )
         self._handoff_tangent_speed_limit = 0.0
         self._handoff_residual_velocity = np.zeros(2, dtype=np.float64)

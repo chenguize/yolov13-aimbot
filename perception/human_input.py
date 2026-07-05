@@ -105,7 +105,7 @@ class HumanMouseListener(threading.Thread):
                     tagged_injected_move[0] = False
             return True
 
-        def on_move(x, y) -> None:
+        def on_move(x, y, injected=False) -> None:
             try:
                 ix, iy = int(round(x)), int(round(y))
             except (TypeError, ValueError, OverflowError):
@@ -118,7 +118,10 @@ class HumanMouseListener(threading.Thread):
             last[0] = (ix, iy)
             is_tagged_ai = tagged_injected_move[0]
             tagged_injected_move[0] = False
-            if is_tagged_ai:
+            # Games commonly recenter a locked cursor with injected events
+            # that do not preserve our dwExtraInfo marker. Neither those
+            # warps nor our SendInput commands are physical human intent.
+            if bool(injected) or is_tagged_ai:
                 return
             if dx or dy:
                 self.ring_buffer.add_observed_cursor_event(

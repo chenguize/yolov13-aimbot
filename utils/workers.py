@@ -56,8 +56,17 @@ class MouseWorker(threading.Thread):
         self.ring_buffer = ring_buffer
         self.safety_gate = safety_gate
         self._blocked_reason = None
+        self._handoff_resume_started_at = None
+        self._handoff_stop_to_gate_ms = 0.0
 
-    def _apply_safety(self, allowed: bool, reason: str) -> None:
+    def _apply_safety(
+        self,
+        allowed: bool,
+        reason: str,
+        *,
+        now: float = None,
+        physical_idle_ms: float = float("inf"),
+    ) -> None:
         blocked = not allowed
         self.output.set_block_aimbot_move(blocked)
         if (
@@ -71,6 +80,7 @@ class MouseWorker(threading.Thread):
         previous = self._blocked_reason
         self._blocked_reason = reason
         if blocked:
+            self._handoff_resume_started_at = None
             if (
                 reason == "human_override"
                 and hasattr(self.controller, "yield_output_to_human")
@@ -80,7 +90,15 @@ class MouseWorker(threading.Thread):
                 self.controller.freeze_output_integrators()
             logger.warning("Mouse output blocked | reason=%s", reason)
         elif previous is not None:
-            logger.info("Mouse output safety gate opened")
+            logger.info(
+                "Mouse output safety gate opened | physical_idle=%.1fms",
+                physical_idle_ms,
+            )
+            if previous == "human_override":
+                self._handoff_resume_started_at = (
+                    time.perf_counter() if now is None else float(now)
+                )
+                self._handoff_stop_to_gate_ms = float(physical_idle_ms)
 
     def run(self):
         logger.info("MouseWorker (1000Hz) starting")
@@ -100,12 +118,31 @@ class MouseWorker(threading.Thread):
                 output_allowed = True
                 if self.safety_gate is not None:
                     decision = self.safety_gate.evaluate(loop_start)
-                    self._apply_safety(decision.allowed, decision.reason)
+                    self._apply_safety(
+                        decision.allowed,
+                        decision.reason,
+                        now=loop_start,
+                        physical_idle_ms=decision.physical_idle_ms,
+                    )
                     output_allowed = decision.allowed
                 if output_allowed:
                     dx, dy = self.controller.tick_mouse()
                     if dx or dy:
                         self.output.mouse_xy(dx, dy)
+                        if self._handoff_resume_started_at is not None:
+                            gate_to_emit_ms = max(
+                                0.0,
+                                loop_start - self._handoff_resume_started_at,
+                            ) * 1000.0
+                            logger.info(
+                                "Handoff output resumed | stop_to_emit=%.1fms "
+                                "gate_to_emit=%.1fms delta=(%d,%d)",
+                                self._handoff_stop_to_gate_ms + gate_to_emit_ms,
+                                gate_to_emit_ms,
+                                dx,
+                                dy,
+                            )
+                            self._handoff_resume_started_at = None
             except Exception as e:
                 self._apply_safety(False, "worker_error")
                 logger.debug("MouseWorker tick error: %s", e)

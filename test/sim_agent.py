@@ -584,15 +584,19 @@ class SimAIAgent:
 
         # ── 首次见到目标：决定 alpha_target ──
         first_frame = (self.target_first_seen_time == 0.0)
+        scenario_has_release = hasattr(self.scenario, '_human_released')
+        physical_human_active = (
+            not bool(getattr(self.scenario, '_human_released', False))
+            if scenario_has_release
+            else False
+        )
         if first_frame:
             self._intent_tracker.reset()
             self.target_first_seen_time = now
             # 按最近 100ms 人类速度计算 alpha_target
             dx_100, dy_100 = self._intent_delta(now - 0.1, now)
             recent_speed = math.hypot(dx_100, dy_100) / 0.1
-            alpha_target = float(np.clip(
-                1.0 - (recent_speed - 100.0) / 400.0, 0.0, 1.0
-            ))
+            alpha_target = 0.0 if physical_human_active else 1.0
             handoff_in_progress = (
                 getattr(ctrl, '_handoff_reason', '') == 'human_release'
                 and bool(getattr(self.scenario, '_human_released', False))
@@ -615,46 +619,14 @@ class SimAIAgent:
                 except TypeError:
                     ctrl.reset_target_state()
 
-        # ── alpha 持续调度：速度基础 + 加速度触发的提前让位（v5.0 升级）────
-        # 原版（线性）: alpha = 1 - speed/500，斜率固定 → flick 启动也让位 0.6
-        # 新版（外科）: 速度部分保持线性（不破坏稳态 natural），
-        #               加速度触发额外的提前让位（最多 0.40，flick 启动时 α 急降）
-        #   - 慢动 (speed=100, acc=0)  → alpha=0.80 (与原版同)
-        #   - flick 启动 (speed=200, acc=800) → alpha=0.20 (从 0.60 提前让位)
-        #   - 强 flick (speed=500+)   → alpha=0.0 (与原版同)
-        # 物理意义：flick 启动瞬间 acc_proxy 暴涨（30ms 速度 >> 80ms 速度），
-        #           触发 alpha 提前下降 → AI 让位更早，避免"拉锯"
-        FLICK_END_PX_S = 450.0
-        _recent_dx, _recent_dy = self._intent_delta(now - 0.08, now)
-        _recent_spd = math.hypot(_recent_dx, _recent_dy) / 0.08
-        _30ms_dx, _30ms_dy = self._intent_delta(now - 0.03, now)
-        _30ms_spd = math.hypot(_30ms_dx, _30ms_dy) / 0.03
-        _inst_dx, _inst_dy = self._intent_delta(now - dt, now)
-        _inst_spd = math.hypot(_inst_dx, _inst_dy) / max(dt, 1e-6)
-        # 加速度代理：flick 启动时 30ms 速度比 80ms 速度大
-        _acc_proxy = max(0.0, _30ms_spd - _recent_spd)
-        # 速度基础（保持原线性，稳态 natural 不破坏）
-        _speed_alpha = 1.0 - min(1.0, _recent_spd / 500.0)
-        # 加速度触发的额外让位（flick 启动时 α 急降）
-        # speed gate：仅在中等以上速度（speed>150）才允许 acc_drop 生效，
-        #            避免低速小噪声时 acc_drop 误触发导致 natural 下降
-        # acc_drop 上限 0.10：只让 flick 最尖锐的启动瞬间生效，影响小
-        _speed_gate = 1.0 / (1.0 + math.exp(-(_recent_spd - 150.0) / 40.0))  # spd=150→0.5, 250→0.93
-        _acc_drop = min(0.10, _acc_proxy / 2000.0) * _speed_gate
-        _new_alpha_target = float(np.clip(_speed_alpha - _acc_drop, 0.0, 1.0))
+        # Mirror production: physical activity, not speed, owns authority.
+        _new_alpha_target = 0.0 if physical_human_active else 1.0
 
         # 接管状态机
         _cur_state = getattr(ctrl, 'takeover_state', 'ACTIVE_LOCK')
         _new_state = None
-        if (_new_alpha_target < 0.2 and _inst_spd > 100.0
-                and not bool(getattr(self.scenario, '_human_released', False))
-                and _cur_state != 'HUMAN_LEAD'):
+        if physical_human_active and _cur_state != 'HUMAN_LEAD':
             _new_state = 'HUMAN_LEAD'
-        elif _new_alpha_target > 0.8 and _cur_state == 'HUMAN_LEAD':
-            _new_state = 'POST_TAKEOVER'
-            self._flick_end_time = now
-        elif _new_alpha_target > 0.5 and _cur_state == 'POST_TAKEOVER':
-            _new_state = 'ACTIVE_LOCK'
 
         if hasattr(ctrl, 'set_blend_alpha'):
             ctrl.set_blend_alpha(_new_alpha_target, takeover_state=_new_state)
@@ -680,8 +652,11 @@ class SimAIAgent:
         self._prev_human_speed_raw = human_speed_raw
 
         # ── 预测性预热：人手强减速 + 高速 → 即将放手 ──
-        FLICK_END_PX_S = 450.0
-        cur_human_flicking = human_speed_raw > FLICK_END_PX_S
+        cur_human_flicking = (
+            not bool(getattr(self.scenario, '_human_released', False))
+            if hasattr(self.scenario, '_human_released')
+            else human_speed_raw > 0.0
+        )
 
         if (human_speed_raw > 500.0
                 and self._human_accel_ema < -2000.0

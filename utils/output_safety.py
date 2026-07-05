@@ -15,6 +15,7 @@ class SafetyDecision:
     allowed: bool
     reason: str
     human_activity: float = 0.0
+    physical_idle_ms: float = float("inf")
 
 
 class OutputSafetyGate:
@@ -41,7 +42,7 @@ class OutputSafetyGate:
             0.0, config.getfloat("Safety", "human_override_settle_ms", 4.0) / 1000.0
         )
         self._activity_threshold = max(
-            0.1, config.getfloat("Safety", "human_override_threshold", 1.5)
+            0.1, config.getfloat("Safety", "human_override_threshold", 0.5)
         )
         self._override_hold_s = max(
             0.0, config.getfloat("Safety", "human_override_hold_ms", 250.0) / 1000.0
@@ -58,7 +59,12 @@ class OutputSafetyGate:
         now = self._clock() if now is None else float(now)
         with self._lock:
             activity = 0.0
+            physical_idle_ms = float("inf")
             if self._ring_buffer is not None:
+                if hasattr(self._ring_buffer, "get_last_physical_event_time"):
+                    last_physical = self._ring_buffer.get_last_physical_event_time()
+                    if last_physical > 0.0:
+                        physical_idle_ms = max(0.0, now - last_physical) * 1000.0
                 settled_end = now - self._activity_settle_s
                 settled_start = settled_end - self._activity_window_s
                 activity = self._ring_buffer.get_intent_activity(
@@ -70,7 +76,11 @@ class OutputSafetyGate:
                     )
 
             if not self._runtime_enabled:
-                return SafetyDecision(False, "agent_disabled", activity)
+                return SafetyDecision(
+                    False, "agent_disabled", activity, physical_idle_ms
+                )
             if now < self._override_until:
-                return SafetyDecision(False, "human_override", activity)
-            return SafetyDecision(True, "allowed", activity)
+                return SafetyDecision(
+                    False, "human_override", activity, physical_idle_ms
+                )
+            return SafetyDecision(True, "allowed", activity, physical_idle_ms)

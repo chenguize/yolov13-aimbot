@@ -37,6 +37,7 @@ class RingBuffer:
         # SendInput mickeys 与 pynput 屏幕像素量纲不匹配，核销不可靠
         self._ai_echo_suppress_until = 0.0
         self._ai_echo_suppress_s = 0.080
+        self._last_physical_event_time = 0.0
 
     # ── 写入 ──────────────────────────────────────────────────────────────
 
@@ -47,6 +48,8 @@ class RingBuffer:
         ev = InputEvent(timestamp=now, dx=dx, dy=dy, is_ai=is_ai)
         with self._lock:
             self._buffer.append(ev)
+            if not is_ai:
+                self._last_physical_event_time = now
             if is_ai and self._observed_events_reconciled:
                 self._pending_ai_echo.append(
                     InputEvent(timestamp=now, dx=dx, dy=dy, is_ai=True)
@@ -88,6 +91,7 @@ class RingBuffer:
             # listener has checked that marker, this event is known physical
             # and must not be swallowed by the heuristic echo window.
             if known_physical:
+                self._last_physical_event_time = now
                 self._buffer.append(InputEvent(
                     timestamp=now,
                     dx=int(dx),
@@ -117,6 +121,7 @@ class RingBuffer:
             )
 
             if residual_x or residual_y:
+                self._last_physical_event_time = now
                 self._buffer.append(InputEvent(
                     timestamp=now,
                     dx=residual_x,
@@ -125,6 +130,10 @@ class RingBuffer:
                 ))
             while self._buffer and (now - self._buffer[0].timestamp > self.max_duration):
                 self._buffer.popleft()
+
+    def get_last_physical_event_time(self) -> float:
+        with self._lock:
+            return float(self._last_physical_event_time)
 
     # ── 读数：基础通道 ────────────────────────────────────────────────────
 

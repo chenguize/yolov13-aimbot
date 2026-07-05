@@ -13,9 +13,7 @@
 #
 # 与 sim_agent 的对应：
 #   实战 tick() ≈ sim_agent.step()
-#   实战 agent 遵循同样的 chase_mode 判定：
-#     · 最近 100ms 人类速度 > 500 px/s → human_flick (人拉枪，AI 补枪微调)
-#     · 否则 → pure_ai (目标自己进 FOV，AI 独立瞄准)
+#   权限边沿由带注入标记的真实硬件事件决定，与人手速度无关。
 
 import math
 import threading
@@ -148,6 +146,10 @@ class AIAgent:
 
         # ── 人机 Flick 状态检测 ──
         self._prev_human_flicking = False
+        self._human_release_idle_s = max(
+            0.008,
+            config.getfloat("Safety", "human_release_idle_ms", 40.0) / 1000.0,
+        )
         # 重构新增：预测性 warm_start 状态（人手速度导数 → 预测放手时刻）
         self._prev_human_speed_raw: float = 0.0
         self._human_accel_ema: float = 0.0
@@ -194,6 +196,12 @@ class AIAgent:
         """人手意图增量：委托 RingBuffer 自动处理后端差异。"""
         return self.ring_buffer.get_intent_delta(t_start, t_end)
 
+    def _physical_human_active(self, now: float) -> bool:
+        if not hasattr(self.ring_buffer, "get_last_physical_event_time"):
+            return False
+        last_event = self.ring_buffer.get_last_physical_event_time()
+        return last_event > 0.0 and now - last_event <= self._human_release_idle_s
+
     def _target_velocity_counts(self, bbox_w: float = 60.0) -> np.ndarray:
         vr = self.ctx.v_real
         if vr is None:
@@ -215,9 +223,15 @@ class AIAgent:
                                   bbox_w: float) -> bool:
         if not hasattr(self.controller, 'begin_handoff'):
             return False
-        hdx, hdy = self._intent_delta(now - 0.02, now)
+        last_event = self.ring_buffer.get_last_physical_event_time()
+        velocity_end = last_event if 0.0 < last_event <= now else now
+        velocity_window = 0.040
+        hdx, hdy = self._intent_delta(
+            velocity_end - velocity_window,
+            velocity_end + 1e-6,
+        )
         hvx, hvy = self.aim_strategy.calculate_velocity_move(
-            hdx / 0.02, hdy / 0.02,
+            hdx / velocity_window, hdy / velocity_window,
             px_x=0.0, px_y=0.0, bbox_w=bbox_w,
         )
         ex, ey = self.aim_strategy.calculate_mouse_move(p_x, p_y, bbox_w=bbox_w)
@@ -653,21 +667,17 @@ class AIAgent:
                     return
     
             c = self.controller
+            physical_human_active = self._physical_human_active(now)
             # ── 首次见到目标：决定 alpha_target 并 reset controller ───────────
             # 重构：原 chase_mode 二值判定 → alpha 连续调度
             first_frame = (self.target_first_seen_time == 0.0)
             if first_frame:
                 self._intent_tracker.reset()
                 self.target_first_seen_time = now
-                # 按最近 100ms 人类速度计算 alpha_target
-                #   speed > 500 px/s → 人拉枪中 → alpha=0.0 (human_flick)
-                #   speed < 100 px/s → AI 独立瞄准 → alpha=1.0 (pure_ai)
-                #   中间值线性插值
+                # Physical activity owns authority regardless of hand speed.
                 dx_100, dy_100 = self._intent_delta(now - 0.1, now)
                 recent_speed = math.hypot(dx_100, dy_100) / 0.1
-                alpha_target = float(np.clip(
-                    1.0 - (recent_speed - 100.0) / 400.0, 0.0, 1.0
-                ))
+                alpha_target = 0.0 if physical_human_active else 1.0
                 handoff_in_progress = (
                     getattr(self.controller, '_handoff_reason', '') == 'human_release'
                     and getattr(self.controller, 'takeover_state', '') in (
@@ -728,39 +738,13 @@ class AIAgent:
                     cls=self._ctx_best_cls(self.ctx),
                 )
 
-            # ── alpha 持续调度：速度基础 + 加速度触发的提前让位（v5.0 升级）────
-            # 原版（线性）: alpha = 1 - speed/500，斜率固定 → flick 启动也让位 0.6
-            # 新版（外科）: 速度部分保持线性（不破坏稳态 natural），
-            #               加速度触发额外的提前让位（最多 0.10，flick 启动时 α 急降）
-            #   - 慢动 (speed=100, acc=0)  → alpha=0.80 (与原版同)
-            #   - flick 启动 (speed=200, acc=800) → alpha=0.42 (从 0.60 提前让位 0.18)
-            #   - 强 flick (speed=500+)   → alpha=0.0 (与原版同)
-            # 物理意义：flick 启动瞬间 acc_proxy 暴涨（30ms 速度 >> 80ms 速度），
-            #           触发 alpha 提前下降 → AI 让位更早，避免"拉锯"
-            # 与 sim_agent.py 同步
-            FLICK_END_PX_S = 450.0
-            _recent_dx, _recent_dy = self._intent_delta(now - 0.08, now)
-            _recent_spd = math.hypot(_recent_dx, _recent_dy) / 0.08
-            _30ms_dx, _30ms_dy = self._intent_delta(now - 0.03, now)
-            _30ms_spd = math.hypot(_30ms_dx, _30ms_dy) / 0.03
-            _inst_dx, _inst_dy = self._intent_delta(now - dt, now)
-            _inst_spd = math.hypot(_inst_dx, _inst_dy) / max(dt, 1e-6)
-            _acc_proxy = max(0.0, _30ms_spd - _recent_spd)
-            _speed_alpha = 1.0 - min(1.0, _recent_spd / 500.0)
-            _speed_gate = 1.0 / (1.0 + math.exp(-(_recent_spd - 150.0) / 40.0))
-            _acc_drop = min(0.10, _acc_proxy / 2000.0) * _speed_gate
-            _new_alpha_target = float(np.clip(_speed_alpha - _acc_drop, 0.0, 1.0))
+            # One authority source: tagged physical-input activity.
+            _new_alpha_target = 0.0 if physical_human_active else 1.0
             # 接管状态机：根据 alpha_target 和当前状态决定切换
             _cur_state = getattr(self.controller, 'takeover_state', 'ACTIVE_LOCK')
             _new_state = None
-            if (_new_alpha_target < 0.2 and _inst_spd > 100.0
-                    and _cur_state != 'HUMAN_LEAD'):
+            if physical_human_active and _cur_state != 'HUMAN_LEAD':
                 _new_state = 'HUMAN_LEAD'
-            elif _new_alpha_target > 0.8 and _cur_state == 'HUMAN_LEAD':
-                _new_state = 'POST_TAKEOVER'
-                self._flick_end_time = now
-            elif _new_alpha_target > 0.5 and _cur_state == 'POST_TAKEOVER':
-                _new_state = 'ACTIVE_LOCK'
 
             if hasattr(self.controller, 'set_blend_alpha'):
                 self.controller.set_blend_alpha(_new_alpha_target, takeover_state=_new_state)
@@ -848,8 +832,13 @@ class AIAgent:
             # 替代原 flick_end 事后检测，把接管延迟从 30-50ms → 5ms
             # 检测条件：人手速度 EMA > 500 px/s + 减速度 < -2000 px/s²
             #          → 预测 T_predict = speed / |accel| < 50ms 内会放手
-            FLICK_END_PX_S = 450.0
-            cur_human_flicking = human_speed_raw > FLICK_END_PX_S
+            cur_human_flicking = physical_human_active
+            if cur_human_flicking != self._prev_human_flicking:
+                logger.info(
+                    "Physical authority edge: %s | idle_threshold=%.0fms",
+                    "HUMAN_ACTIVE" if cur_human_flicking else "HUMAN_RELEASE",
+                    self._human_release_idle_s * 1000.0,
+                )
             # 计算人手速度的导数（减速度）
             human_accel = (human_speed_raw - self._prev_human_speed_raw) / max(dt, 0.001)
             # EMA 平滑减速度

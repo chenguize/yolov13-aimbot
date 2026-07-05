@@ -254,6 +254,72 @@ class TakeoverControllerTests(unittest.TestCase):
         self.assertLessEqual(np.max(np.abs(path[:, 1])), 8.0)
         self.assertGreater(path[30, 0], 110.0)
 
+    def test_random_handoff_geometry_is_bounded(self):
+        peaks = []
+        rebounds = []
+        final_errors = []
+        for seed in range(64):
+            rng = np.random.RandomState(seed)
+            c = PROController()
+            c._rng = np.random.RandomState(seed + 1000)
+            c.set_pixel_to_count_scale(2.0, 2.0)
+            c._ou_sigma_ball = 0.0
+            c._ou_sigma_track = 0.0
+            c._drift_sigma = 0.0
+            c._noise_hand[:] = 0.0
+            c._noise_fatigue[:] = 0.0
+            c._ic_reaction_delay = rng.uniform(0.095, 0.150)
+            c._ic_reaction_elapsed = 0.0
+
+            angle = rng.uniform(-np.pi, np.pi)
+            distance = rng.uniform(25.0, 150.0)
+            error_px = np.array([np.cos(angle), np.sin(angle)]) * distance
+            radial = error_px / distance
+            tangent = np.array([-radial[1], radial[0]])
+            human_angle = rng.uniform(-np.pi, np.pi)
+            human_speed = rng.uniform(0.0, 2400.0)
+            human_velocity = np.array([
+                np.cos(human_angle), np.sin(human_angle)
+            ]) * human_speed * 2.0
+            transverse_spike = tangent * rng.uniform(-900.0, 900.0)
+
+            c.begin_handoff(
+                human_velocity=human_velocity,
+                target_velocity=transverse_spike,
+                error=error_px * 2.0,
+                reason="human_release",
+            )
+            c.set_mouse_emit(True)
+            plant_scale = rng.uniform(0.9, 2.5)
+            position_px = np.zeros(2)
+            cross_track = []
+            for frame in range(70):
+                target_velocity = (
+                    transverse_spike if frame < 12 else np.zeros(2)
+                )
+                c.compute(
+                    *(error_px * 2.0), 0.010,
+                    v_real=target_velocity,
+                    a_real=np.zeros(2),
+                    bbox_w=20.0,
+                )
+                for _ in range(10):
+                    dx, dy = c.tick_mouse(dt_override=0.001)
+                    movement = np.array([dx, dy]) / plant_scale
+                    position_px += movement
+                    error_px -= movement
+                cross_track.append(float(np.dot(position_px, tangent)))
+
+            early_cross = np.abs(np.asarray(cross_track[:15]))
+            peak = float(np.max(early_cross))
+            peaks.append(peak)
+            rebounds.append(peak - float(early_cross[-1]))
+            final_errors.append(float(np.linalg.norm(error_px)))
+
+        self.assertLessEqual(float(np.percentile(peaks, 95)), 12.0)
+        self.assertLessEqual(max(rebounds), 5.0)
+        self.assertLessEqual(max(final_errors), 5.0)
+
 
 if __name__ == '__main__':
     unittest.main()

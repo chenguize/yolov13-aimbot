@@ -2,6 +2,7 @@ import threading
 import time
 import unittest
 
+from agent import AIAgent
 from perception.ring_buffer import RingBuffer
 from utils.output_safety import OutputSafetyGate
 from utils.workers import MouseWorker
@@ -18,9 +19,13 @@ class _Clock:
 class _ActivityBuffer:
     def __init__(self):
         self.activity = 0.0
+        self.last_physical = 0.0
 
     def get_intent_activity(self, _start, _end):
         return self.activity
+
+    def get_last_physical_event_time(self):
+        return self.last_physical
 
 
 class _SafetyController:
@@ -72,6 +77,17 @@ class OutputSafetyGateTests(unittest.TestCase):
         self.assertEqual(gate.evaluate().reason, "human_override")
         self.clock.value += 0.010
         self.assertTrue(gate.evaluate().allowed)
+
+    def test_single_pixel_physical_activity_immediately_blocks(self):
+        gate = self._gate()
+        self.buffer.activity = 1.0
+        self.assertEqual(gate.evaluate().reason, "human_override")
+
+    def test_decision_reports_physical_idle_age(self):
+        gate = self._gate()
+        self.buffer.last_physical = self.clock.value - 0.031
+        decision = gate.evaluate()
+        self.assertAlmostEqual(decision.physical_idle_ms, 31.0, places=6)
 
     def test_disabled_agent_cannot_open_output(self):
         gate = self._gate()
@@ -156,6 +172,18 @@ class RingBufferActivityTests(unittest.TestCase):
         now = time.perf_counter()
 
         self.assertEqual(buffer.get_intent_delta(now - 0.1, now), (3, -2))
+        self.assertGreater(buffer.get_last_physical_event_time(), 0.0)
+
+    def test_physical_activity_edge_depends_on_time_not_speed(self):
+        buffer = RingBuffer()
+        buffer.add_event(1, 0, is_ai=False)
+        last = buffer.get_last_physical_event_time()
+        agent = object.__new__(AIAgent)
+        agent.ring_buffer = buffer
+        agent._human_release_idle_s = 0.040
+
+        self.assertTrue(agent._physical_human_active(last + 0.039))
+        self.assertFalse(agent._physical_human_active(last + 0.041))
 
 
 if __name__ == "__main__":
