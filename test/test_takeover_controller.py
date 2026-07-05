@@ -210,6 +210,50 @@ class TakeoverControllerTests(unittest.TestCase):
         self.assertAlmostEqual(c._prog_init_dx, 500.0)
         self.assertAlmostEqual(c._prog_init_dy, 40.0)
 
+    def test_transverse_velocity_spike_does_not_create_checkmark_path(self):
+        c = self.controller
+        c.set_pixel_to_count_scale(2.0, 2.0)
+        c._ic_reaction_delay = 0.120
+        c._ic_reaction_elapsed = 0.0
+        c._ou_sigma_ball = 0.0
+        c._ou_sigma_track = 0.0
+        c._drift_sigma = 0.0
+        c._noise_hand[:] = 0.0
+        c._noise_fatigue[:] = 0.0
+
+        error_px = np.array([120.0, 0.0])
+        position_px = np.zeros(2)
+        false_target_velocity = np.array([0.0, 600.0])
+        c.begin_handoff(
+            human_velocity=np.array([500.0, 300.0]),
+            target_velocity=false_target_velocity,
+            error=error_px * 2.0,
+            reason="human_release",
+        )
+        c.set_mouse_emit(True)
+
+        path = []
+        for frame in range(60):
+            target_velocity = (
+                false_target_velocity if frame < 12 else np.zeros(2)
+            )
+            c.compute(
+                *(error_px * 2.0), 0.010,
+                v_real=target_velocity,
+                a_real=np.zeros(2),
+                bbox_w=20.0,
+            )
+            for _ in range(10):
+                dx, dy = c.tick_mouse(dt_override=0.001)
+                movement_px = np.array([dx, dy], dtype=np.float64) / 2.0
+                position_px += movement_px
+                error_px -= movement_px
+            path.append(position_px.copy())
+
+        path = np.asarray(path)
+        self.assertLessEqual(np.max(np.abs(path[:, 1])), 8.0)
+        self.assertGreater(path[30, 0], 110.0)
+
 
 if __name__ == '__main__':
     unittest.main()

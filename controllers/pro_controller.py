@@ -326,6 +326,10 @@ class PROController:
         self._handoff_target_coast_gain = config.getfloat(
             'Controller', 'cipher_handoff_target_coast_gain', 0.85
         )
+        self._handoff_cross_track_budget_px = config.getfloat(
+            'Controller', 'cipher_handoff_cross_track_budget_px', 6.0
+        )
+        self._handoff_tangent_speed_limit = 0.0
         self._handoff_residual_velocity = np.zeros(2, dtype=np.float64)
         self._handoff_target_velocity = np.zeros(2, dtype=np.float64)
         self._handoff_seed_target_velocity = np.zeros(2, dtype=np.float64)
@@ -531,8 +535,21 @@ class PROController:
                     open_loop_max,
                     budget_speed,
                 )
+                target_coast = target * self._handoff_target_coast_gain
+                target_coast_radial = radial * float(np.dot(target_coast, radial))
+                target_coast_tangent = target_coast - target_coast_radial
+                self._handoff_tangent_speed_limit = (
+                    self._handoff_cross_track_budget_px
+                    * self._px_to_ct
+                    / reaction_left
+                )
+                target_coast_tangent = self._clip_vector_norm(
+                    target_coast_tangent,
+                    self._handoff_tangent_speed_limit,
+                )
                 residual = (
-                    target * self._handoff_target_coast_gain
+                    target_coast_radial
+                    + target_coast_tangent
                     + radial * closing_speed
                 )
                 self._handoff_seed_radial[:] = radial
@@ -541,6 +558,7 @@ class PROController:
                 residual = target.copy()
                 self._handoff_seed_radial.fill(0.0)
                 self._handoff_closing_speed = 0.0
+                self._handoff_tangent_speed_limit = 0.0
             residual = self._clip_vector_norm(residual, self._handoff_residual_limit)
             self._handoff_residual_velocity[:] = residual
             self._handoff_seed_target_velocity[:] = target
@@ -804,6 +822,7 @@ class PROController:
             self._handoff_seed_target_velocity.fill(0.0)
             self._handoff_seed_radial.fill(0.0)
             self._handoff_closing_speed = 0.0
+            self._handoff_tangent_speed_limit = 0.0
             self._handoff_last_output.fill(0.0)
             self._handoff_last_final_velocity.fill(0.0)
             self._ou_state *= 0.25
@@ -1162,6 +1181,18 @@ class PROController:
                             + radial_revision,
                             self._handoff_residual_limit,
                         )
+                        if dist > 1e-6 and self._handoff_tangent_speed_limit > 0.0:
+                            radial_part = current_radial * float(
+                                np.dot(reaction_velocity, current_radial)
+                            )
+                            tangent_part = reaction_velocity - radial_part
+                            reaction_velocity = (
+                                radial_part
+                                + self._clip_vector_norm(
+                                    tangent_part,
+                                    self._handoff_tangent_speed_limit,
+                                )
+                            )
                     else:
                         reaction_velocity = self._arm_vel * math.exp(-dt / 0.018)
                     reaction_guarded = (

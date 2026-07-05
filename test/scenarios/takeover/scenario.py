@@ -102,6 +102,12 @@ class TakeoverScenario(BaseScenario):
         self._error_50ms: float = 0.0
         self._error_50ms_recorded: bool = False
         self._last_controller_velocity = np.zeros(2, dtype=np.float64)
+        self._release_origin = np.zeros(2, dtype=np.float64)
+        self._release_line = np.array([1.0, 0.0], dtype=np.float64)
+        self._cross_track_peak: float = 0.0
+        self._cross_track_rebound: float = 0.0
+        self._cross_track_last: float = 0.0
+        self._transverse_probe_px_s: float = 0.0
 
         # ── 接管指标历史 (所有 kill) ──
         self.metrics_history: list = []
@@ -229,6 +235,14 @@ class TakeoverScenario(BaseScenario):
         self._error_50ms = 0.0
         self._error_50ms_recorded = False
         self._last_controller_velocity.fill(0.0)
+        self._release_origin.fill(0.0)
+        self._release_line[:] = (1.0, 0.0)
+        self._cross_track_peak = 0.0
+        self._cross_track_rebound = 0.0
+        self._cross_track_last = 0.0
+        self._transverse_probe_px_s = float(
+            np.random.choice([-1.0, 1.0]) * np.random.uniform(180.0, 320.0)
+        )
         agent.takeover_release_time = 0.0   # 每 kill 独立, 防止跨 kill 泄露
 
         agent.chase_mode = "human_flick"
@@ -272,6 +286,19 @@ class TakeoverScenario(BaseScenario):
 
         if self._release_time > 0.0:
             elapsed = agent.sim_time - self._release_time
+            if elapsed <= 0.150:
+                travel = agent.crosshair_pos - self._release_origin
+                cross_track = float(
+                    self._release_line[0] * travel[1]
+                    - self._release_line[1] * travel[0]
+                )
+                cross_abs = abs(cross_track)
+                self._cross_track_peak = max(self._cross_track_peak, cross_abs)
+                self._cross_track_rebound = max(
+                    self._cross_track_rebound,
+                    self._cross_track_peak - cross_abs,
+                )
+                self._cross_track_last = cross_track
             controller_velocity = np.asarray(
                 getattr(agent.world_model.controller, 'crosshair_velocity', (0.0, 0.0)),
                 dtype=np.float64,
@@ -324,6 +351,13 @@ class TakeoverScenario(BaseScenario):
             "takeover_dur":     self._takeover_duration,
             "handoff_accel_peak": self._handoff_accel_peak,
             "error_50ms":       self._error_50ms,
+            "cross_track_peak": self._cross_track_peak,
+            "cross_track_rebound": self._cross_track_rebound,
+            "checkmark_violation": (
+                self._cross_track_peak > 10.0
+                and self._cross_track_rebound > 8.0
+            ),
+            "transverse_probe_px_s": self._transverse_probe_px_s,
             "visibility_entry": self._takeover_mode == MODE_VISIBILITY,
             "final_dist":       final_dist,
             "phase":            self._takeover_phase,
@@ -399,6 +433,11 @@ class TakeoverScenario(BaseScenario):
             )
             self._release_time = max(agent.sim_time, 1e-6)
             agent.takeover_release_time = self._release_time  # 告知评分系统: AI 时钟从此开始
+            self._release_origin[:] = agent.crosshair_pos
+            release_error = agent.enemy_pos - agent.crosshair_pos
+            release_error_norm = float(np.linalg.norm(release_error))
+            if release_error_norm > 1e-6:
+                self._release_line[:] = release_error / release_error_norm
             # 准星速率 = 最后一帧位移 / 帧间隔 (px/s)
             self._release_vel = float(
                 np.linalg.norm(self._last_flick_delta) / max(dt, 1e-6)
@@ -420,8 +459,16 @@ class TakeoverScenario(BaseScenario):
             self._last_controller_velocity[:] = (hvx, hvy)
             ctrl = agent.world_model.controller
             if hasattr(ctrl, 'begin_handoff'):
+                tangent = np.array(
+                    [-self._release_line[1], self._release_line[0]],
+                    dtype=np.float64,
+                )
+                probe_velocity = (
+                    agent.enemy_vel
+                    + tangent * self._transverse_probe_px_s
+                )
                 tvx, tvy = strategy.calculate_velocity_move(
-                    float(agent.enemy_vel[0]), float(agent.enemy_vel[1]),
+                    float(probe_velocity[0]), float(probe_velocity[1]),
                     px_x=0.0, px_y=0.0, bbox_w=bbox_w,
                 )
                 error_px = agent.enemy_pos - agent.crosshair_pos
@@ -488,6 +535,10 @@ class TakeoverScenario(BaseScenario):
             vals = [m[key] for m in arr if m.get(key, 0) > 0]
             return np.mean(vals) if vals else 0.0
 
+        def _shape_stats(key):
+            vals = [float(m.get(key, 0.0)) for m in arr]
+            return np.mean(vals), np.percentile(vals, 95), max(vals)
+
         by_mode = {}
         for m in arr:
             by_mode.setdefault(m["mode"], []).append(m)
@@ -501,6 +552,17 @@ class TakeoverScenario(BaseScenario):
         print(f"  平均接管耗时: {_m('takeover_dur'):.4f} s")
         print(f"  平均松手速率: {_m('release_vel'):.0f} px/s (准星甩枪速度)")
         print(f"  最终精度:     {_m('final_dist'):.2f} px")
+        peak_mean, peak_p95, peak_max = _shape_stats("cross_track_peak")
+        rebound_mean, rebound_p95, rebound_max = _shape_stats("cross_track_rebound")
+        violations = sum(bool(m.get("checkmark_violation", False)) for m in arr)
+        print(
+            f"  横向峰值150ms: mean={peak_mean:.2f}px P95={peak_p95:.2f}px "
+            f"max={peak_max:.2f}px"
+        )
+        print(
+            f"  √回折量150ms: mean={rebound_mean:.2f}px P95={rebound_p95:.2f}px "
+            f"max={rebound_max:.2f}px | violations={violations}/{len(arr)}"
+        )
         print("-" * 78)
 
         for mode in TAKEOVER_MODES:
