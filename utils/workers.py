@@ -60,14 +60,23 @@ class MouseWorker(threading.Thread):
     def _apply_safety(self, allowed: bool, reason: str) -> None:
         blocked = not allowed
         self.output.set_block_aimbot_move(blocked)
-        if blocked and hasattr(self.controller, "set_mouse_emit"):
+        if (
+            blocked
+            and reason != "human_override"
+            and hasattr(self.controller, "set_mouse_emit")
+        ):
             self.controller.set_mouse_emit(False)
         if reason == self._blocked_reason:
             return
         previous = self._blocked_reason
         self._blocked_reason = reason
         if blocked:
-            if hasattr(self.controller, "freeze_output_integrators"):
+            if (
+                reason == "human_override"
+                and hasattr(self.controller, "yield_output_to_human")
+            ):
+                self.controller.yield_output_to_human()
+            elif hasattr(self.controller, "freeze_output_integrators"):
                 self.controller.freeze_output_integrators()
             logger.warning("Mouse output blocked | reason=%s", reason)
         elif previous is not None:

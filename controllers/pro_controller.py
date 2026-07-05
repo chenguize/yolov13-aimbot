@@ -898,6 +898,25 @@ class PROController:
             self._emit_mouse = False
             return None
 
+    def yield_output_to_human(self):
+        """Stop the actuator without restarting the cognitive controller.
+
+        The safety gate still blocks every synthetic event.  Keeping the
+        reaction and trajectory state alive lets perception continue planning
+        while the human is moving, so release does not pay a second reaction
+        delay.
+        """
+        with self._lock:
+            self._arm_vel[:] = 0.0
+            self._wrist_vel[:] = 0.0
+            self._servo_accel[:] = 0.0
+            self.crosshair_velocity[:] = 0.0
+            self._ou_state[:] = 0.0
+            self._drift_state[:] = 0.0
+            self._subpixel[:] = 0.0
+            self._last_delta_float = 0.0, 0.0
+            self._last_mouse_time = None
+
     def set_mouse_emit(self, enable):
         with self._lock as __temp_312:
             self._emit_mouse = bool(enable)
